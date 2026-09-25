@@ -1,0 +1,248 @@
+/* libdispatch: queues, and the blocks a program puts on them.
+ *
+ * It lives beside the run loop rather than in libSystem because the main
+ * queue *is* the main run loop: a block sent there has to run on the
+ * thread that owns the event loop, between events, and that loop is the
+ * one in Foundation/AppKit. A dispatch_async whose block never runs is
+ * invisible — the work simply does not happen — and an app that schedules
+ * showing its window that way (Ableton Live does) waits forever.
+ *
+ * Blocks are guest objects, so they are invoked through libobjc rather
+ * than called as host code. Serial queues get a thread each and the
+ * global queues share a small pool, which is what the API promises:
+ * ordering within a serial queue, concurrency between queues. */
+#include "foundation.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace fnd {
+
+namespace {
+
+struct work_item {
+    void *block = nullptr;                 /* retained guest block, or */
+    void *function = nullptr;              /* a plain function... */
+    void *context = nullptr;               /* ...with this context */
+};
+
+/* The queue traffic is part of the window-system trace: a block that is
+ * queued and never run is invisible otherwise. */
+bool dispatch_trace() {
+    static const bool on = std::getenv("MACHOMAN_TRACE") || std::getenv("MACHOMAN_APPKIT_TRACE");
+    return on;
+}
+
+/* A function pointer from the guest has to go through the runtime. */
+void call_function(void *fn, const std::uint64_t *args, int n) {
+    if (!fn || !api()) return;
+    const auto va = reinterpret_cast<std::uintptr_t>(fn);
+    if (api()->is_guest_code(va)) api()->call_guest(va, args, n);
+    else reinterpret_cast<void (*)(std::uint64_t)>(fn)(args && n ? args[0] : 0);
+}
+
+void run_item(const work_item &item) {
+    if (item.block) {
+        mm_objc_block_invoke(item.block, 0, nullptr);
+        release(reinterpret_cast<id>(item.block));
+    } else if (item.function) {
+        const std::uint64_t arg = reinterpret_cast<std::uintptr_t>(item.context);
+        call_function(item.function, &arg, 1);
+    }
+}
+
+/* A queue is either the main one (drained by the run loop), a serial one
+ * with a thread of its own, or a global one served by a shared pool. */
+struct dispatch_queue {
+    std::string label;
+    bool is_main = false;
+    bool concurrent = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<work_item> items;
+    std::vector<std::thread> workers;
+    std::atomic<bool> stop{false};
+
+    void push(const work_item &item) {
+        {
+            std::lock_guard lock(mu);
+            items.push_back(item);
+        }
+        cv.notify_one();
+    }
+    bool pop(work_item &out) {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return stop || !items.empty(); });
+        if (items.empty()) return false;
+        out = items.front();
+        items.pop_front();
+        return true;
+    }
+    void serve() {
+        for (;;) {
+            work_item item;
+            if (!pop(item)) return;
+            run_item(item);
+        }
+    }
+    void start(int threads) {
+        for (int i = 0; i < threads; i++) workers.emplace_back([this] { serve(); });
+    }
+};
+
+dispatch_queue &main_queue() {
+    static auto *q = [] {
+        auto *queue = new dispatch_queue;
+        queue->label = "com.apple.main-thread";
+        queue->is_main = true;
+        return queue;
+    }();
+    return *q;
+}
+
+dispatch_queue &global_queue() {
+    static auto *q = [] {
+        auto *queue = new dispatch_queue;
+        queue->label = "com.apple.root.default-qos";
+        queue->concurrent = true;
+        queue->start(4);
+        return queue;
+    }();
+    return *q;
+}
+
+std::vector<std::unique_ptr<dispatch_queue>> &created_queues() {
+    static auto *v = new std::vector<std::unique_ptr<dispatch_queue>>;
+    return *v;
+}
+std::mutex &created_mutex() { static auto *m = new std::mutex; return *m; }
+
+} // namespace
+
+/* Called by the run loop once per turn: the main queue's blocks run on
+ * whichever thread is running the loop, as they do on macOS. */
+void dispatch_drain_main_queue() {
+    dispatch_queue &q = main_queue();
+    for (;;) {
+        work_item item;
+        {
+            std::lock_guard lock(q.mu);
+            if (q.items.empty()) return;
+            item = q.items.front();
+            q.items.pop_front();
+        }
+        run_item(item);
+    }
+}
+
+} // namespace fnd
+
+using namespace fnd;
+
+extern "C" {
+
+/* dispatch_get_main_queue() is a macro over this symbol, so the guest
+ * binds to the object itself rather than calling anything. */
+EXPORT dispatch_queue *mm_dispatch_main_q __asm__("__dispatch_main_q") = &main_queue();
+
+dispatch_queue *darwin_dispatch_get_main_queue() DARWIN(dispatch_get_main_queue);
+dispatch_queue *darwin_dispatch_get_main_queue() { return &main_queue(); }
+
+dispatch_queue *darwin_dispatch_get_global_queue(long, unsigned long) DARWIN(dispatch_get_global_queue);
+dispatch_queue *darwin_dispatch_get_global_queue(long, unsigned long) { return &global_queue(); }
+
+dispatch_queue *darwin_dispatch_queue_create(const char *label, void *attr) DARWIN(dispatch_queue_create);
+dispatch_queue *darwin_dispatch_queue_create(const char *label, void *attr) {
+    auto queue = std::make_unique<dispatch_queue>();
+    queue->label = label ? label : "";
+    /* A null attribute means serial; anything else is treated as
+     * concurrent, which only relaxes ordering the caller said it did not
+     * need. */
+    queue->concurrent = attr != nullptr;
+    queue->start(queue->concurrent ? 2 : 1);
+    dispatch_queue *raw = queue.get();
+    std::lock_guard lock(created_mutex());
+    created_queues().push_back(std::move(queue));
+    return raw;
+}
+
+const char *darwin_dispatch_queue_get_label(dispatch_queue *queue) DARWIN(dispatch_queue_get_label);
+const char *darwin_dispatch_queue_get_label(dispatch_queue *queue) {
+    return queue ? queue->label.c_str() : "";
+}
+
+void darwin_dispatch_async(dispatch_queue *queue, void *block) DARWIN(dispatch_async);
+void darwin_dispatch_async(dispatch_queue *queue, void *block) {
+    if (!block) return;
+    if (dispatch_trace())
+        std::fprintf(stderr, "dispatch: async on %s\n", (queue ? *queue : main_queue()).label.c_str());
+    work_item item{retain(reinterpret_cast<id>(block)), nullptr, nullptr};
+    (queue ? *queue : main_queue()).push(item);
+}
+
+void darwin_dispatch_async_f(dispatch_queue *queue, void *context, void *function) DARWIN(dispatch_async_f);
+void darwin_dispatch_async_f(dispatch_queue *queue, void *context, void *function) {
+    if (!function) return;
+    (queue ? *queue : main_queue()).push({nullptr, function, context});
+}
+
+/* dispatch_sync runs the block where the caller is: the work has to be
+ * finished when it returns, and running it here is both the simplest way
+ * to guarantee that and the one that cannot deadlock against the main
+ * queue (which is drained by the caller's own run loop). */
+void darwin_dispatch_sync(dispatch_queue *, void *block) DARWIN(dispatch_sync);
+void darwin_dispatch_sync(dispatch_queue *, void *block) {
+    if (block) mm_objc_block_invoke(block, 0, nullptr);
+}
+
+void darwin_dispatch_sync_f(dispatch_queue *, void *context, void *function) DARWIN(dispatch_sync_f);
+void darwin_dispatch_sync_f(dispatch_queue *, void *context, void *function) {
+    if (!function) return;
+    const std::uint64_t arg = reinterpret_cast<std::uintptr_t>(context);
+    call_function(function, &arg, 1);
+}
+
+/* dispatch_after: the delay is honoured by a thread that waits and then
+ * hands the block to the queue, so ordering on that queue still holds. */
+void darwin_dispatch_after(std::uint64_t when, dispatch_queue *queue, void *block) DARWIN(dispatch_after);
+void darwin_dispatch_after(std::uint64_t when, dispatch_queue *queue, void *block) {
+    if (!block) return;
+    /* `when` is a dispatch_time_t: nanoseconds since boot, as
+     * libSystem's dispatch_time builds it. */
+    id retained = retain(reinterpret_cast<id>(block));
+    dispatch_queue *target = queue ? queue : &main_queue();
+    std::thread([when, target, retained] {
+        const auto now = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (when > now) std::this_thread::sleep_for(std::chrono::nanoseconds(when - now));
+        target->push({retained, nullptr, nullptr});
+    }).detach();
+}
+
+/* An assertion a program makes about which queue it is on; there is one
+ * main thread here and the loop drains the main queue on it, so it holds. */
+void darwin_dispatch_assert_queue(dispatch_queue *) DARWIN(dispatch_assert_queue$V2);
+void darwin_dispatch_assert_queue(dispatch_queue *) {}
+
+void darwin_dispatch_apply(std::size_t iterations, dispatch_queue *, void *block) DARWIN(dispatch_apply);
+void darwin_dispatch_apply(std::size_t iterations, dispatch_queue *, void *block) {
+    /* Run in order on this thread: dispatch_apply must not return before
+     * every iteration has finished, and the iterations are independent. */
+    for (std::size_t i = 0; i < iterations; i++) {
+        const std::uint64_t index = i;
+        if (block) mm_objc_block_invoke(block, 1, &index);
+    }
+}
+
+} // extern "C"

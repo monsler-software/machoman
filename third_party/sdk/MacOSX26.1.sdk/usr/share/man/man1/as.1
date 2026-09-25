@@ -1,0 +1,19 @@
+.TH AS 1 "August 23, 2023" "Apple Inc."
+.SH NAME
+as \- assembler
+.SH SYNOPSIS
+.B as
+[
+.I "option \&..."
+] [
+.I "file \&..."
+]
+.SH DESCRIPTION
+The
+.I as
+command is deprecated.  It is now calls clang to use clang's "intergated assembler".
+.PP
+Clang will automatically run its assembler on files with a .s extension. 
+So you can replace: "as -arch arm64 foo.s -o foo.o" with "clang -arch arm64 foo.s -o foo.o"
+.SH "SEE ALSO"
+cc(1), ld(1), nm(1), otool(1), arch(3), Mach-O(5)

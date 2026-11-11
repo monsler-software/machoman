@@ -10,12 +10,14 @@
 #include "machoman/objc_framework.h"
 #include "machoman/runtime.h"
 #include "synthesise.h"
+#include "file_types.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <utility>
 
 #define DARWIN(name) __attribute__((visibility("default"))) __asm__("_" #name)
 
@@ -63,6 +65,33 @@ bool is_layout_key(id key) {
 } // namespace
 
 extern "C" {
+
+/* ---- CoreServices file type descriptions ---------------------------------- */
+
+id UTTypeCopyDescription_(id identifier) DARWIN(UTTypeCopyDescription);
+id UTTypeCopyDescription_(id identifier) {
+    if (!identifier || !is_kind(identifier, cls("NSString"))) return nullptr;
+    const char *text = reinterpret_cast<const char *>(send(identifier, "UTF8String"));
+    if (!text) return nullptr;
+    std::string_view description;
+    for (const auto &type : mm_av_file_types)
+        if (type.identifier == text) { description = type.description; break; }
+    if (description.empty()) {
+        constexpr std::pair<std::string_view, std::string_view> types[] = {
+            {"public.data", "Data"}, {"public.content", "Content"}, {"public.item", "Item"},
+            {"public.directory", "Directory"}, {"public.folder", "Folder"},
+            {"public.text", "Text"}, {"public.plain-text", "Plain text"},
+            {"public.audio", "Audio"}, {"public.movie", "Movie"}, {"public.video", "Video"},
+            {"public.image", "Image"}, {"public.png", "PNG image"}, {"public.avi", "AVI movie"},
+            {"public.mpeg", "MPEG movie"}, {"public.midi-audio", "MIDI audio"},
+        };
+        for (const auto &[uti, value] : types)
+            if (uti == text) { description = value; break; }
+    }
+    if (description.empty()) return nullptr;
+    return retain(obj(send(reinterpret_cast<id>(cls("NSString")), "stringWithUTF8String:",
+                           reinterpret_cast<std::uintptr_t>(description.data()))));
+}
 
 /* ---- text input sources --------------------------------------------------- */
 
@@ -121,21 +150,29 @@ std::uint16_t LMGetKeyRepThresh_() { return 6; }
 
 /* ---- Carbon event loop ------------------------------------------------------ */
 
-/* One event loop per process, identified by a token; its timers are not
- * run, because a Carbon timer would have to drive the same run loop AppKit
- * already owns. A program that only installs an idle timer keeps working. */
+/* Carbon timers run on the same thread and loop as Cocoa events. */
+id CFRunLoopGetCurrent_() __asm__("_CFRunLoopGetCurrent");
+id CFRunLoopGetMain_() __asm__("_CFRunLoopGetMain");
+void *machoman_runloop_timer_create(id, double, double, void *, void *);
+int machoman_runloop_timer_remove(void *);
+int machoman_runloop_timer_reschedule(void *, double);
 void *GetCurrentEventLoop_() DARWIN(GetCurrentEventLoop);
-void *GetCurrentEventLoop_() { static int loop = 0; return &loop; }
+void *GetCurrentEventLoop_() { return CFRunLoopGetCurrent_(); }
 void *GetMainEventLoop_() DARWIN(GetMainEventLoop);
-void *GetMainEventLoop_() { return GetCurrentEventLoop_(); }
+void *GetMainEventLoop_() { return CFRunLoopGetMain_(); }
 std::int32_t InstallEventLoopTimer_(void *, double, double, void *, void *, void **out) DARWIN(InstallEventLoopTimer);
-std::int32_t InstallEventLoopTimer_(void *, double, double, void *, void *, void **out) {
-    static int timer = 0;
-    if (out) *out = &timer;
+std::int32_t InstallEventLoopTimer_(void *loop, double delay, double interval, void *callback, void *info, void **out) {
+    if (!out) return -50;
+    *out = machoman_runloop_timer_create(reinterpret_cast<id>(loop), delay, interval, callback, info);
+    if (!*out) return -50;
+    if (std::getenv("MACHOMAN_APPKIT_TRACE"))
+        std::fprintf(stderr, "Carbon: timer %p installed, delay=%g interval=%g callback=%p\n", *out, delay, interval, callback);
     return 0;
 }
 std::int32_t RemoveEventLoopTimer_(void *) DARWIN(RemoveEventLoopTimer);
-std::int32_t RemoveEventLoopTimer_(void *) { return 0; }
+std::int32_t RemoveEventLoopTimer_(void *timer) { return machoman_runloop_timer_remove(timer); }
+std::int32_t SetEventLoopTimerNextFireTime_(void *, double) DARWIN(SetEventLoopTimerNextFireTime);
+std::int32_t SetEventLoopTimerNextFireTime_(void *timer, double delay) { return machoman_runloop_timer_reschedule(timer, delay); }
 std::int32_t SetSystemUIMode_(std::uint32_t, std::uint32_t) DARWIN(SetSystemUIMode);
 std::int32_t SetSystemUIMode_(std::uint32_t, std::uint32_t) { return 0; }
 

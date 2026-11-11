@@ -1,5 +1,0 @@
-framework module IOBluetooth [system] {
-    umbrella header "IOBluetooth.h"
-    export *
-    module * { export * }
-}

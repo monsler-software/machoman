@@ -2,6 +2,7 @@
 #include "emit.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <string>
 #if defined(__linux__)
@@ -11,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <mutex>
+#include <unordered_map>
 
 namespace mm_emit {
 
@@ -43,12 +46,15 @@ void store(mm_x64_buf &buf, std::uint8_t guest, int host, bool is64, reg31 kind)
 void load_rm_operand(mm_x64_buf &buf, const mm_a64_insn &insn) {
     load(buf, B, insn.rm, reg31::xzr);
     if (insn.shift_amount != 0) {
+        /* Reading Wm truncates Xm even if its last write was 64-bit.
+         * Otherwise an LSR/ROR shifts upper Xm bits into the W result. */
+        if (!insn.is64) mm_x64_emit_mov_reg32(buf, B, B);
         switch (insn.shift) {
         case mm_a64_shift::lsl:
             mm_x64_emit_shl_imm(buf, B, insn.shift_amount);
             break;
         case mm_a64_shift::lsr:
-            mm_x64_emit_shr_imm(buf, B, insn.shift_amount); /* w: upper half is already zero */
+            mm_x64_emit_shr_imm(buf, B, insn.shift_amount);
             break;
         case mm_a64_shift::asr:
             if (!insn.is64)
@@ -142,6 +148,14 @@ void store_v_zero_high(mm_x64_buf &buf, std::uint8_t n) {
 }
 
 void vload(mm_x64_buf &buf, int xmm, std::uint8_t vreg) {
+    auto &cache = buf.vectors;
+    if (cache.active) {
+        for (unsigned slot = 0; slot < 2; ++slot) {
+            if (cache.guest[slot] != vreg) continue;
+            mm_x64_emit_sse_rr(buf, mm_x64_sse::movdqa, xmm, 4 + static_cast<int>(slot));
+            return;
+        }
+    }
     mm_x64_emit_movdqu_load(buf, xmm, CTX, voff(vreg, 0));
 }
 
@@ -151,6 +165,19 @@ void vstore(mm_x64_buf &buf, std::uint8_t vreg, int xmm, bool q) {
     } else {
         mm_x64_emit_movq_store(buf, CTX, voff(vreg, 0), xmm);
         store_v_zero_high(buf, vreg);
+    }
+    auto &cache = buf.vectors;
+    if (cache.active) {
+        unsigned slot = 0;
+        while (slot < 2 && cache.guest[slot] != vreg) ++slot;
+        if (slot == 2) {
+            slot = cache.guest[0] < 0 ? 0u : cache.guest[1] < 0 ? 1u : cache.replace++ % 2;
+        }
+        cache.guest[slot] = vreg;
+        cache.written |= 1u << vreg;
+        const int resident = 4 + static_cast<int>(slot);
+        if (q) mm_x64_emit_sse_rr(buf, mm_x64_sse::movdqa, resident, xmm);
+        else mm_x64_emit_movq_rr(buf, resident, xmm);
     }
 }
 
@@ -166,10 +193,8 @@ void vconst(mm_x64_buf &buf, int xmm, std::uint64_t lo, std::uint64_t hi) {
 void emit_load_to(mm_x64_buf &buf, const mm_a64_insn &insn, std::uint8_t rt, std::int32_t disp) {
     if (insn.simd) {
         if (insn.mem_size == 16) {
-            mm_x64_emit_mov_load(buf, A, B, disp);
-            mm_x64_emit_mov_store(buf, CTX, voff(rt, 0), A);
-            mm_x64_emit_mov_load(buf, A, B, disp + 8);
-            mm_x64_emit_mov_store(buf, CTX, voff(rt, 1), A);
+            mm_x64_emit_movdqu_load(buf, X0, B, disp);
+            vstore(buf, rt, X0, true);
         } else {
             mm_x64_emit_load(buf, A, B, disp, unsigned_kind(insn.mem_size));
             mm_x64_emit_mov_store(buf, CTX, voff(rt, 0), A);
@@ -183,12 +208,11 @@ void emit_load_to(mm_x64_buf &buf, const mm_a64_insn &insn, std::uint8_t rt, std
 
 void emit_store_from(mm_x64_buf &buf, const mm_a64_insn &insn, std::uint8_t rt, std::int32_t disp) {
     if (insn.simd) {
-        mm_x64_emit_mov_load(buf, A, CTX, voff(rt, 0));
         if (insn.mem_size == 16) {
-            mm_x64_emit_mov_store(buf, B, disp, A);
-            mm_x64_emit_mov_load(buf, A, CTX, voff(rt, 1));
-            mm_x64_emit_mov_store(buf, B, disp + 8, A);
+            vload(buf, X0, rt);
+            mm_x64_emit_movdqu_store(buf, B, disp, X0);
         } else {
+            mm_x64_emit_mov_load(buf, A, CTX, voff(rt, 0));
             mm_x64_emit_store(buf, B, disp, A, insn.mem_size);
         }
         return;
@@ -252,10 +276,16 @@ void emit_simd_gpr(mm_x64_buf &buf, const mm_a64_insn &insn) {
         else store_v_zero_high(buf, insn.rd);
         return;
     case mm_a64_opcode::movi:
-        mm_x64_emit_mov_imm(buf, A, static_cast<std::uint64_t>(insn.imm));
-        mm_x64_emit_mov_store(buf, CTX, voff(insn.rd, 0), A);
-        if (insn.q) mm_x64_emit_mov_store(buf, CTX, voff(insn.rd, 1), A);
-        else store_v_zero_high(buf, insn.rd);
+        for (int h = 0; h < (insn.q ? 2 : 1); ++h) {
+            mm_x64_emit_mov_imm(buf, A, static_cast<std::uint64_t>(insn.imm));
+            if (insn.simd_imm_merge) {
+                mm_x64_emit_mov_load(buf, B, CTX, voff(insn.rd, h));
+                if (insn.raw & (1u << 29)) mm_x64_emit_and_reg(buf, A, B); /* BIC: immediate already inverted */
+                else mm_x64_emit_or_reg(buf, A, B);
+            }
+            mm_x64_emit_mov_store(buf, CTX, voff(insn.rd, h), A);
+        }
+        if (!insn.q) store_v_zero_high(buf, insn.rd);
         return;
     case mm_a64_opcode::vlogic:
         for (int h = 0; h < (insn.q ? 2 : 1); h++) {
@@ -343,6 +373,34 @@ mm_x64_cc host_cc(std::uint8_t cond) {
 
 mm_x64_cc invert(mm_x64_cc cc) { return static_cast<mm_x64_cc>(static_cast<std::uint8_t>(cc) ^ 1); }
 
+/* Evaluate B.cond from the materialized NZCV image rather than restoring
+ * host RFLAGS with POPF. Every guest boundary still has current context
+ * flags, including an independent entry into the branch instruction. */
+mm_x64_cc test_branch_condition(mm_x64_buf &buf, std::uint8_t cond) {
+    if (cond < 10) {
+        static constexpr std::uint32_t masks[] = {
+            EFL_ZF, EFL_ZF, EFL_CF, EFL_CF, EFL_SF, EFL_SF,
+            EFL_OF, EFL_OF, EFL_CF | EFL_ZF, EFL_CF | EFL_ZF,
+        };
+        static constexpr mm_x64_cc conditions[] = {
+            mm_x64_cc::ne, mm_x64_cc::e, mm_x64_cc::e, mm_x64_cc::ne,
+            mm_x64_cc::ne, mm_x64_cc::e, mm_x64_cc::ne, mm_x64_cc::e,
+            mm_x64_cc::e, mm_x64_cc::ne,
+        };
+        mm_x64_emit_test_mem_imm32(buf, CTX, OFF_EFLAGS, masks[cond]);
+        return conditions[cond];
+    }
+    // Fold OF into SF: (N != V) at bit 7, retaining Z at bit 6.
+    // Mask OF before shifting so unrelated RFLAGS bits cannot affect Z.
+    mm_x64_emit_mov_load(buf, A, CTX, OFF_EFLAGS);
+    mm_x64_emit_mov_reg(buf, B, A);
+    mm_x64_emit_alu_imm32(buf, mm_x64_alu::and_, B, EFL_OF, false);
+    mm_x64_emit_shr_imm(buf, B, 4);
+    mm_x64_emit_xor_reg(buf, A, B);
+    mm_x64_emit_alu_imm32(buf, mm_x64_alu::and_, A, EFL_SF | (cond >= 12 ? EFL_ZF : 0), false);
+    return (cond & 1) ? mm_x64_cc::ne : mm_x64_cc::e;
+}
+
 std::uint64_t nzcv_to_eflags(std::uint8_t nzcv) {
     std::uint64_t e = 0x2; /* reserved bit 1 is always set */
     if (nzcv & 8) e |= EFL_SF;
@@ -390,8 +448,6 @@ stubs emit_stubs(mm_x64_buf &buf, std::uint64_t text_base, std::uint64_t text_si
      * pages without code, or misaligned exit with bad_target. */
     (void)text_base; (void)text_size;
     st.dispatch = buf.size();
-    mm_x64_emit_test_rr(buf, A, A, true);
-    mm_x64_patch_rel32(buf, mm_x64_emit_jcc_rel32(buf, mm_x64_cc::e), st.exit);
     mm_x64_emit_mov_reg(buf, B, A);
     mm_x64_emit_shr_imm(buf, B, MM_CODE_MAP_VA_BITS);
     mm_x64_patch_rel32(buf, mm_x64_emit_jcc_rel32(buf, mm_x64_cc::ne), st.bad_target);
@@ -880,7 +936,7 @@ bool translate_one(emit_ctx &e, const mm_a64_insn &insn) {
         mm_x64_emit_mov_reg(buf, MM_RBP, MM_RSP);
         mm_x64_emit_alu_imm32(buf, mm_x64_alu::and_, MM_RSP, -16, true);
         mm_x64_emit_mov_imm(buf, MM_RDX, static_cast<std::uint64_t>(size));
-        mm_x64_emit_mov_imm(buf, MM_RAX, reinterpret_cast<std::uintptr_t>(&mm_crc32_ethernet));
+        mm_x64_emit_host_address(buf, MM_RAX, reinterpret_cast<std::uintptr_t>(&mm_crc32_ethernet));
         mm_x64_emit_call_reg(buf, MM_RAX);
         mm_x64_emit_mov_reg(buf, MM_RSP, MM_RBP);
         mm_x64_emit_pop_reg(buf, MM_RBP);
@@ -1232,8 +1288,8 @@ bool translate_one(emit_ctx &e, const mm_a64_insn &insn) {
         if (insn.cond >= 14) {
             e.jump_to(static_cast<std::uint64_t>(insn.imm), mm_x64_cc::e, false);
         } else {
-            load_flags(buf);
-            e.jump_to(static_cast<std::uint64_t>(insn.imm), host_cc(insn.cond), true);
+            const auto condition = test_branch_condition(buf, insn.cond);
+            e.jump_to(static_cast<std::uint64_t>(insn.imm), condition, true);
         }
         return true;
     case mm_a64_opcode::cbz:
@@ -1249,8 +1305,15 @@ bool translate_one(emit_ctx &e, const mm_a64_insn &insn) {
         e.jump_to(static_cast<std::uint64_t>(insn.imm), insn.op == mm_a64_opcode::tbz ? mm_x64_cc::ae : mm_x64_cc::b, true);
         return true;
     case mm_a64_opcode::br:
+        load(buf, A, insn.rn, reg31::xzr);
+        mm_x64_patch_rel32(buf, mm_x64_emit_jmp_rel32(buf), e.st.dispatch);
+        return true;
     case mm_a64_opcode::ret:
         load(buf, A, insn.rn, reg31::xzr);
+        /* Zero is the runtime's top-level return sentinel. An indirect
+         * call/jump to a missing weak import must report bad_target. */
+        mm_x64_emit_test_rr(buf, A, A, true);
+        mm_x64_patch_rel32(buf, mm_x64_emit_jcc_rel32(buf, mm_x64_cc::e), e.st.exit);
         mm_x64_patch_rel32(buf, mm_x64_emit_jmp_rel32(buf), e.st.dispatch);
         return true;
     case mm_a64_opcode::blr:
@@ -1271,6 +1334,10 @@ bool translate_one(emit_ctx &e, const mm_a64_insn &insn) {
         return true;
     case mm_a64_opcode::vop:
         return emit_vector_op(buf, insn);
+    case mm_a64_opcode::crypto:
+        return emit_crypto_op(buf, insn);
+    case mm_a64_opcode::simd_helper:
+        return emit_simd_helper(buf, insn);
     case mm_a64_opcode::fop:
         return emit_fp_op(buf, insn);
     case mm_a64_opcode::unknown:
@@ -1325,6 +1392,13 @@ bool describe_string(std::uint64_t addr, std::string &out) {
             return true;
         }
     }
+    for (int off : {0, 8, 16}) {
+        std::uint64_t data = 0;
+        if (peek(addr + static_cast<unsigned>(off), &data, sizeof data) && string_at(data, out)) {
+            out = "*+" + std::to_string(off) + ":" + out;
+            return true;
+        }
+    }
     return false;
 }
 
@@ -1336,18 +1410,30 @@ bool string_at(std::uint64_t addr, std::string &out) {
     std::size_t n = 0;
     while (n < sizeof buf - 2 && printable(static_cast<unsigned char>(buf[n]))) n++;
     if (n >= 3 && buf[n] == '\0') { out.assign(buf, n); return true; }
+    if (n == sizeof buf - 2) { out.assign(buf, n); out += "..."; return true; }
     /* UTF-16: ASCII characters have a zero high byte. */
     n = 0;
-    while (n + 1 < sizeof buf - 2 && printable(static_cast<unsigned char>(buf[n * 2])) && buf[n * 2 + 1] == '\0') n++;
+    while (n * 2 + 1 < sizeof buf - 2 && printable(static_cast<unsigned char>(buf[n * 2])) && buf[n * 2 + 1] == '\0') n++;
     if (n >= 3) {
         out.clear();
         for (std::size_t i = 0; i < n; i++) out.push_back(buf[i * 2]);
+        if (n * 2 + 1 >= sizeof buf - 2) out += "...";
         return true;
     }
     return false;
 }
 
 extern "C" void mm_watch_hit(const mm_cpu_context *ctx, std::uint64_t va) {
+    static const auto limit = [] {
+        const char *value = std::getenv("MACHOMAN_WATCH_LIMIT");
+        return value ? std::strtoull(value, nullptr, 10) : 0;
+    }();
+    if (limit) {
+        static std::mutex mutex;
+        static std::unordered_map<std::uint64_t, unsigned long long> hits;
+        std::lock_guard lock(mutex);
+        if (++hits[va] > limit) return;
+    }
     std::fprintf(stderr, "watch 0x%llx:", static_cast<unsigned long long>(va));
     for (int i = 0; i < 9; i++) {
         std::fprintf(stderr, " x%d=0x%llx", i, static_cast<unsigned long long>(ctx->x[i]));
@@ -1356,6 +1442,58 @@ extern "C" void mm_watch_hit(const mm_cpu_context *ctx, std::uint64_t va) {
     }
     std::fprintf(stderr, " sp=0x%llx x30=0x%llx\n", static_cast<unsigned long long>(ctx->x[31]),
                  static_cast<unsigned long long>(ctx->x[30]));
+    /* Optional bounded memory snapshots: VA:register:bytes[:pointer-offset[:data-offset]].
+     * The optional offsets follow a pointer held in the watched object. Read
+     * through process_vm_readv so inaccessible pointers remain harmless. */
+    static const char *dump_spec = std::getenv("MACHOMAN_WATCH_DUMP");
+    static const char *dump_dir = std::getenv("MACHOMAN_WATCH_DUMP_DIR");
+    if (dump_spec && dump_dir) {
+        for (const char *p = dump_spec; *p;) {
+            char *end = nullptr;
+            const auto address = std::strtoull(p, &end, 0);
+            if (end == p || *end != ':') break;
+            p = end + 1;
+            const auto reg = std::strtoul(p, &end, 0);
+            if (end == p || *end != ':') break;
+            p = end + 1;
+            const auto bytes = std::strtoul(p, &end, 0);
+            if (end == p) break;
+            bool indirect = false;
+            std::uint64_t pointer_offset = 0, data_offset = 0;
+            if (*end == ':') {
+                p = end + 1;
+                pointer_offset = std::strtoull(p, &end, 0);
+                if (end == p) break;
+                indirect = true;
+                if (*end == ':') {
+                    p = end + 1;
+                    data_offset = std::strtoull(p, &end, 0);
+                    if (end == p) break;
+                }
+            }
+            if (*end && *end != ',') break;
+            p = *end == ',' ? end + 1 : end;
+            if (address != va || reg >= 32 || bytes == 0 || bytes > 1024 * 1024) continue;
+            auto source = ctx->x[reg];
+            if (indirect) {
+                if (source + pointer_offset < source || !peek(source + pointer_offset, &source, sizeof source)) continue;
+                if (!source || source + data_offset < source) continue;
+                source += data_offset;
+            }
+            std::vector<unsigned char> memory(bytes);
+            if (!peek(source, memory.data(), memory.size())) continue;
+            static std::atomic<unsigned> sequence{0};
+            char path[4096];
+            std::snprintf(path, sizeof path, "%s/watch-%llx-x%lu-%u.bin", dump_dir,
+                          static_cast<unsigned long long>(va), reg, sequence.fetch_add(1));
+            if (auto *file = std::fopen(path, "wb")) {
+                std::fwrite(memory.data(), 1, memory.size(), file);
+                std::fclose(file);
+                std::fprintf(stderr, "watch dump: %s address=0x%llx bytes=%lu\n", path,
+                             static_cast<unsigned long long>(source), bytes);
+            }
+        }
+    }
 }
 
 /* AArch64's CRC32 (as opposed to CRC32C) uses the Ethernet polynomial,
@@ -1393,7 +1531,7 @@ void emit_watch(mm_x64_buf &buf, std::uint64_t va) {
     mm_x64_emit_alu_imm32(buf, mm_x64_alu::and_, MM_RSP, -16, true);
     mm_x64_emit_mov_reg(buf, MM_RDI, MM_R15);
     mm_x64_emit_mov_imm(buf, MM_RSI, va);
-    mm_x64_emit_mov_imm(buf, MM_RAX, reinterpret_cast<std::uintptr_t>(&mm_watch_hit));
+    mm_x64_emit_host_address(buf, MM_RAX, reinterpret_cast<std::uintptr_t>(&mm_watch_hit));
     mm_x64_emit_call_reg(buf, MM_RAX);
     mm_x64_emit_mov_reg(buf, MM_RSP, MM_RBP);
     mm_x64_emit_pop_reg(buf, MM_RBP);
@@ -1407,13 +1545,28 @@ std::size_t mm_translate_buffer(std::span<const std::uint8_t> arm64_code, std::u
     result.dispatch_stub = st.dispatch;
     std::vector<fixup> fixups;
     std::size_t count = 0;
+    struct cold_entry { std::size_t index; int guest[2]; unsigned reads; };
+    std::vector<cold_entry> entries;
+    const bool residency = mm_register_cache_enabled();
+    auto &cache = result.code.vectors;
+    cache = {};
 
     for (std::size_t off = 0; off + 4 <= arm64_code.size(); off += 4, count++) {
         const std::uint64_t pc = base_va + off;
         const mm_a64_insn insn = mm_a64_decode(arm64_code.subspan(off, 4), pc);
         const std::uint64_t out_off = result.code.size();
-        if (!watch_points().empty() &&
-            std::find(watch_points().begin(), watch_points().end(), pc) != watch_points().end())
+        const bool watched = !watch_points().empty() &&
+            std::find(watch_points().begin(), watch_points().end(), pc) != watch_points().end();
+        // Limit the first allocator to native FP emission. Other opcodes
+        // may write V through scalar/lane stores or call native helpers.
+        const bool native_fp = insn.op == mm_a64_opcode::fop && insn.elem_size >= 4 &&
+            !(insn.fop == mm_a64_fop::fcvt && insn.imm == 2);
+        if (!residency || !native_fp || watched) cache = {};
+        cache.active = residency && native_fp;
+        const int entry_guests[2] = {cache.guest[0], cache.guest[1]};
+        const auto entry_live = (cache.guest[0] >= 0 ? 1u : 0u) | (cache.guest[1] >= 0 ? 2u : 0u);
+        cache.written = 0;
+        if (watched)
             emit_watch(result.code, pc);
 
         emit_ctx e{result.code, st, base_va, text_size, pc, fixups};
@@ -1423,13 +1576,48 @@ std::size_t mm_translate_buffer(std::span<const std::uint8_t> arm64_code, std::u
             result.unsupported_count++;
         }
 
-        result.notes.push_back({off, out_off, insn.op, supported});
+        const auto index = result.notes.size();
+        result.notes.push_back({off, out_off, insn.op, supported, out_off});
+        // An entry also needs copies that this instruction preserves for
+        // later fallthrough consumers, even if it does not read them itself.
+        if (entry_live) entries.push_back({index, {entry_guests[0], entry_guests[1]}, entry_live});
+        // Some conversions/FCSEL store lanes directly instead of vstore.
+        // Those results remain materialized but cannot reuse an old copy.
+        const bool flags_only = insn.fop == mm_a64_fop::fcmp || insn.fop == mm_a64_fop::fcmp0 ||
+            insn.fop == mm_a64_fop::fccmp;
+        if (native_fp && !flags_only && !(cache.written & (1u << insn.rd))) {
+            for (int &guest : cache.guest) if (guest == insn.rd) guest = -1;
+        }
+        if (!supported) cache = {};
     }
 
+    cache = {};
+    if (!entries.empty()) {
+        // Independent entries are out of line: ordinary fallthrough pays
+        // no jump/preload. Prevent falling off text into the entry stubs.
+        mm_x64_emit_mov_imm(result.code, A, base_va + text_size);
+        mm_x64_patch_rel32(result.code, mm_x64_emit_jmp_rel32(result.code), st.dispatch);
+        for (const auto &entry : entries) {
+            auto &note = result.notes[entry.index];
+            note.entry_offset = result.code.size();
+            for (unsigned slot = 0; slot < 2; ++slot) {
+                if (!(entry.reads & (1u << slot))) continue;
+                mm_x64_emit_movdqu_load(result.code, 4 + static_cast<int>(slot), CTX,
+                    voff(static_cast<std::uint8_t>(entry.guest[slot]), 0));
+            }
+            mm_x64_patch_rel32(result.code, mm_x64_emit_jmp_rel32(result.code), note.output_offset);
+        }
+    }
     for (const fixup &f : fixups) {
         const std::size_t idx = static_cast<std::size_t>((f.target_va - base_va) / 4);
-        mm_x64_patch_rel32(result.code, f.rel32_at, result.notes[idx].output_offset);
+        const auto &note = result.notes[idx];
+        mm_x64_patch_rel32(result.code, f.rel32_at, note.entry_offset);
     }
 
     return count;
+}
+
+bool mm_register_cache_enabled() {
+    const auto *setting = std::getenv("MACHOMAN_REGISTER_CACHE");
+    return !setting || *setting != '0';
 }

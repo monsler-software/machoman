@@ -1,7 +1,0 @@
-framework module InstallerPlugins {
-  umbrella header "InstallerPlugins.h"
-  requires !swift
-  export *
-  module * { export * }
-}
-

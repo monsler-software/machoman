@@ -1,5 +1,0 @@
-framework module ScriptingBridge [system] {
-	umbrella header "ScriptingBridge.h"
-	export *
-	module * { export * }
-}

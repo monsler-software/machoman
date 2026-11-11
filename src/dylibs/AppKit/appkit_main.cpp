@@ -5,6 +5,7 @@
 #include "appkit.h"
 #include "synthesise.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -56,7 +57,10 @@ static void appkit_ctor() {
     ak::register_responder();
     ak::register_views();
     ak::register_application();
+    ak::register_file_panels();
+    ak::register_window_controller();
     ak::register_opengl();
+    ak::register_layers();
 }
 
 } // extern "C"
@@ -65,4 +69,33 @@ static void appkit_ctor() {
  * to; those are synthesised from their names (see symbol-synthesis). */
 extern "C" __attribute__((visibility("default"))) void *machoman_resolve_symbol(const char *name, unsigned flags) {
     return mm_synthesise_symbol(name, flags);
+}
+
+/* The public application entry point belongs to AppKit and is re-exported
+ * by the Cocoa and Quartz umbrellas. Bundle metadata selects the application
+ * class and main nib; -run delivers the launch notifications and event loop. */
+extern "C" int NSApplicationMain_(int, const char **) DARWIN(NSApplicationMain);
+extern "C" int NSApplicationMain_(int, const char **) {
+    using namespace ak;
+    autorelease_pool pool;
+    id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")), "mainBundle"));
+    auto info = [&](const char *key) { return obj(send(bundle, "objectForInfoDictionaryKey:", ret(string(key)))); };
+    auto principal = to_utf8(info("NSPrincipalClass"));
+    Class application = principal.empty() ? cls("NSApplication") : cls(principal.c_str());
+    if (!application) {
+        std::fprintf(stderr, "AppKit: NSApplicationMain: unknown principal class %s\n", principal.c_str());
+        return 1;
+    }
+    id app = obj(send(reinterpret_cast<id>(application), "sharedApplication"));
+    const auto nib = to_utf8(info("NSMainNibFile"));
+    std::vector<id> top_level;
+    if (!nib.empty() && !load_nib(nib, app, &top_level)) {
+        std::fprintf(stderr, "AppKit: NSApplicationMain: unable to load %s\n", nib.c_str());
+        return 1;
+    }
+    // Top-level objects must outlive the autorelease pool of nib decoding.
+    for (id object : top_level) retain(object);
+    send(app, "run");
+    for (id object : top_level) release(object);
+    return 0;
 }

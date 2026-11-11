@@ -1,4 +1,5 @@
 #include "machoman/arch/arm64_decoder.h"
+#include "simd_helpers.h"
 
 #include <cstring>
 
@@ -222,6 +223,10 @@ std::uint64_t vfp_expand_imm(std::uint32_t imm8, int width) {
         const std::uint64_t exp = ((b6 ^ 1) << 10) | (b6 ? 0x3FCu : 0u) | exp_lsb3;
         return (sign << 63) | (exp << 52) | ((frac & 0xF) << 48);
     }
+    if (width == 2) {
+        const std::uint64_t exp = ((b6 ^ 1) << 4) | (b6 ? 0xcu : 0u) | exp_lsb3;
+        return (sign << 15) | (exp << 10) | ((frac & 0xF) << 6);
+    }
     const std::uint64_t exp = ((b6 ^ 1) << 7) | (b6 ? 0x7Cu : 0u) | exp_lsb3; /* NOT(b6):Rep(b6,5):imm8<5:4> */
     return (sign << 31) | (exp << 23) | ((frac & 0xF) << 19);
 }
@@ -233,12 +238,12 @@ void decode_fp_scalar(std::uint32_t insn, mm_a64_insn &out) {
     if (bit(insn, 31) && bits(insn, 28, 21) != 0xF1u) {
         /* sf=1 is only valid for int<->fp conversions (handled below) */
     }
-    if (type != 0 && type != 1)
+    if (type != 0 && type != 1 && type != 3)
         return; /* half precision, etc. */
     out.rd = static_cast<std::uint8_t>(bits(insn, 4, 0));
     out.rn = static_cast<std::uint8_t>(bits(insn, 9, 5));
     out.rm = static_cast<std::uint8_t>(bits(insn, 20, 16));
-    out.elem_size = type == 0 ? 4 : 8;
+    out.elem_size = type == 0 ? 4 : type == 1 ? 8 : 2;
     auto set = [&](mm_a64_fop f) { out.op = mm_a64_opcode::fop; out.fop = f; };
 
     if (bits(insn, 28, 24) == 0x1Fu) { /* 3-source: M 0 S 11111 type o1 Rm o0 Ra Rn Rd */
@@ -294,8 +299,9 @@ void decode_fp_scalar(std::uint32_t insn, mm_a64_insn &out) {
         case 0x01: set(mm_a64_fop::fabs); return;
         case 0x02: set(mm_a64_fop::fneg); return;
         case 0x03: set(mm_a64_fop::fsqrt); return;
-        case 0x04: if (type == 1) { set(mm_a64_fop::fcvt); out.imm = 4; } return; /* fcvt s, d */
-        case 0x05: if (type == 0) { set(mm_a64_fop::fcvt); out.imm = 8; } return; /* fcvt d, s */
+        case 0x04: if (type != 0) { set(mm_a64_fop::fcvt); out.imm = 4; } return;
+        case 0x05: if (type != 1) { set(mm_a64_fop::fcvt); out.imm = 8; } return;
+        case 0x07: if (type != 3) { set(mm_a64_fop::fcvt); out.imm = 2; } return;
         case 0x08: set(mm_a64_fop::frintn); return;
         case 0x09: set(mm_a64_fop::frintp); return;
         case 0x0A: set(mm_a64_fop::frintm); return;
@@ -497,6 +503,42 @@ void decode_simd(std::uint32_t insn, mm_a64_insn &out) {
         out.vop = v;
         out.elem_size = static_cast<std::uint8_t>(esize_bytes);
     };
+    auto set_crypto = [&](mm_a64_crypto c) {
+        out.op = mm_a64_opcode::crypto;
+        out.crypto = c;
+        out.q = true; /* every crypto instruction is a whole-register form */
+    };
+
+    /* Advanced SIMD crypto: the AES two-register group and the SHA1/SHA256
+     * two-register group share one shape (bit 21, Rm field 01000, size 00,
+     * bit 10 clear — three-same opcodes have it set) and differ only by the
+     * scalar prefix bit 28; the six-bit opcode in bits 15:10 has bit 1 set
+     * for every member. The SHA three-register
+     * group is the scalar prefix with bit 21 clear. */
+    if (q && !u && size == 0 && bit(insn, 21) && bits(insn, 20, 16) == 8 && !bit(insn, 10)) {
+        switch (bits(insn, 15, 10)) {
+        case 0x02: if (scalar) { set_crypto(mm_a64_crypto::sha1h); return; } break;
+        case 0x06: if (scalar) { set_crypto(mm_a64_crypto::sha1su1); return; } break;
+        case 0x0A: if (scalar) { set_crypto(mm_a64_crypto::sha256su0); return; } break;
+        case 0x12: if (!scalar) { set_crypto(mm_a64_crypto::aese); return; } break;
+        case 0x16: if (!scalar) { set_crypto(mm_a64_crypto::aesd); return; } break;
+        case 0x1A: if (!scalar) { set_crypto(mm_a64_crypto::aesmc); return; } break;
+        case 0x1E: if (!scalar) { set_crypto(mm_a64_crypto::aesimc); return; } break;
+        }
+        return; /* the group shape with an unallocated opcode */
+    }
+    if (scalar && q && !u && size == 0 && !bit(insn, 21) && bits(insn, 11, 10) == 0) {
+        switch (bits(insn, 15, 10)) {
+        case 0x00: set_crypto(mm_a64_crypto::sha1c); return;
+        case 0x04: set_crypto(mm_a64_crypto::sha1p); return;
+        case 0x08: set_crypto(mm_a64_crypto::sha1m); return;
+        case 0x0C: set_crypto(mm_a64_crypto::sha1su0); return;
+        case 0x10: set_crypto(mm_a64_crypto::sha256h); return;
+        case 0x14: set_crypto(mm_a64_crypto::sha256h2); return;
+        case 0x18: set_crypto(mm_a64_crypto::sha256su1); return;
+        }
+        return; /* the group shape with an unallocated opcode */
+    }
 
     /* Shift by immediate: 0 Q U 011110 immh immb opcode 1 Rn Rd (immh != 0) */
     if (bits(insn, 27, 23) == 0x1Eu && bit(insn, 10) && bits(insn, 22, 19) != 0) {
@@ -532,6 +574,8 @@ void decode_simd(std::uint32_t insn, mm_a64_insn &out) {
         case 0x14: if (scalar || lg == 3) return; set(q ? mm_a64_vop::sshll2 : mm_a64_vop::sshll, esize / 8); out.imm = left; return;
         case 0x20: set(mm_a64_vop::ushr, esize / 8); out.imm = right; return;
         case 0x22: set(mm_a64_vop::usra, esize / 8); out.imm = right; return;
+        case 0x28: if (!scalar && lg == 3 && !q) return; set(mm_a64_vop::sri, esize / 8); out.imm = right; return;
+        case 0x2A: if (!scalar && lg == 3 && !q) return; set(mm_a64_vop::sli, esize / 8); out.imm = left; return;
         case 0x34: if (scalar || lg == 3) return; set(q ? mm_a64_vop::ushll2 : mm_a64_vop::ushll, esize / 8); out.imm = left; return;
         default: return;
         }
@@ -620,6 +664,17 @@ void decode_simd(std::uint32_t insn, mm_a64_insn &out) {
             return; /* the rest of three-different is not modelled */
         const std::uint32_t opcode = bits(insn, 16, 12);
         if (bits(insn, 20, 17) == 0x0) { /* two-register misc */
+            /* Saturating narrow: size describes the destination width.
+             * Scalar Q is fixed at 1; only vector Q selects the "2" form. */
+            if (opcode == 0x14 || (u && opcode == 0x12)) {
+                if (size == 3) return;
+                out.simd_scalar = scalar;
+                const bool high = !scalar && q;
+                if (opcode == 0x12) set(high ? mm_a64_vop::sqxtun2 : mm_a64_vop::sqxtun, 2 * esize);
+                else if (u) set(high ? mm_a64_vop::uqxtn2 : mm_a64_vop::uqxtn, 2 * esize);
+                else set(high ? mm_a64_vop::sqxtn2 : mm_a64_vop::sqxtn, 2 * esize);
+                return;
+            }
             if (scalar && size != 3) return;
             switch ((u ? 32u : 0u) | opcode) {
             case 0x00: if (scalar) return; set(mm_a64_vop::rev64, esize); return;
@@ -845,6 +900,10 @@ mm_a64_insn mm_a64_decode(std::span<const std::uint8_t> bytes, std::uint64_t pc)
 
     mm_a64_insn out;
     out.raw = insn;
+    if (mm_decode_simd_helper(insn) != mm_simd_helper::none) {
+        out.op = mm_a64_opcode::simd_helper;
+        return out;
+    }
 
     auto target = [pc](std::int64_t off) { return static_cast<std::int64_t>(pc + static_cast<std::uint64_t>(off)); };
 
@@ -1294,6 +1353,7 @@ mm_a64_insn mm_a64_decode(std::span<const std::uint8_t> bytes, std::uint64_t pc)
         /* MVNI (op=1 for cmode 0xx0/10x0/110x) inverts; for cmode=1110 op=1 is the byte-mask form */
         const bool mvni = op == 1 && (cmode >> 1) != 7;
         out.op = mm_a64_opcode::movi;
+        out.simd_imm_merge = cmode < 12 && (cmode & 1);
         out.q = bit(insn, 30);
         out.rd = static_cast<std::uint8_t>(bits(insn, 4, 0));
         out.imm = static_cast<std::int64_t>(mvni ? ~imm : imm);
@@ -1335,6 +1395,7 @@ mm_a64_insn mm_a64_decode(std::span<const std::uint8_t> bytes, std::uint64_t pc)
 const char *mm_a64_opcode_name(mm_a64_opcode op) {
     switch (op) {
     case mm_a64_opcode::unknown: return "unknown";
+    case mm_a64_opcode::simd_helper: return "simd.helper";
     case mm_a64_opcode::movz:    return "movz";
     case mm_a64_opcode::movk:    return "movk";
     case mm_a64_opcode::movn:    return "movn";
@@ -1400,6 +1461,7 @@ const char *mm_a64_opcode_name(mm_a64_opcode op) {
     case mm_a64_opcode::ldnr:      return "ldNr";
     case mm_a64_opcode::eor3:      return "eor3";
     case mm_a64_opcode::bcax:      return "bcax";
+    case mm_a64_opcode::crypto:    return "crypto";
     case mm_a64_opcode::ldar:    return "ldar";
     case mm_a64_opcode::stlr:    return "stlr";
     case mm_a64_opcode::ldxr:    return "ldxr";

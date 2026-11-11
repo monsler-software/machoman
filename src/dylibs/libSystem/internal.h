@@ -11,6 +11,7 @@
 
 /* The runtime's callbacks, set by machoman_dylib_init. */
 const mm_host_api *mm_libsystem_api();
+int mm_darwin_errno(int error);
 
 /* Calls `fn` with `n` integer arguments; guest function pointers (a
  * comparator handed to qsort, a callback handed to a dispatch API) go

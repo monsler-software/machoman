@@ -6,6 +6,8 @@
  * NSEvents, sends them to the window they belong to, and redraws windows
  * that asked for it. */
 #include "appkit.h"
+#include "native_menu.h"
+#include "native_dialog.h"
 
 #include <chrono>
 
@@ -13,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <ctime>
 #include <unistd.h>
 #include <string>
@@ -26,8 +29,6 @@ MM_FW_CLASS(NSWorkspace);
 MM_FW_CLASS(NSWorkspaceOpenConfiguration);
 MM_FW_CLASS(NSRunningApplication);
 MM_FW_CLASS(NSAlert);
-MM_FW_CLASS(NSSavePanel);
-MM_FW_CLASS(NSOpenPanel);
 
 /* NSApp is a variable the guest reads directly, so the exported symbol is
  * the storage and everything here refers to it. */
@@ -46,26 +47,45 @@ extern "C" std::int32_t CFRunLoopRunInMode_(id mode, double seconds, int return_
 namespace {
 
 Class g_application, g_screen, g_menu, g_menu_item;
+void poll_alerts();
+
+constexpr std::int64_t modal_stop = -1000, modal_abort = -1001, modal_continue = -1002;
+struct modal_session { id window; std::int64_t response = modal_continue; };
 
 struct app_object {
     mm_objc_object base;
     id next = nullptr;
-    id delegate = nullptr, main_menu = nullptr;
+    id delegate = nullptr, main_menu = nullptr, services_provider = nullptr;
+    id current_event = nullptr;
     std::vector<id> windows;      /* not retained: windows outlive the list */
-    bool running = false, active = false;
+    std::vector<id> ordered_windows; /* visible windows, front to back; not retained */
+    std::vector<modal_session *> modals; /* nested calls own their sessions */
+    bool running = false, active = false, finished_launching = false;
     int termination_reply = 1;
+    bool last_window_close_pending=false, user_close_pending=false;
 };
 app_object *app(id o) { return as<app_object>(o); }
 
-struct menu_object { mm_objc_object base; std::string title; std::vector<id> items; };
+std::uint64_t menu_generation = 1;
+struct menu_object {
+    mm_objc_object base; std::string title; std::vector<id> items;
+    id delegate = nullptr;
+    bool autoenables = true;
+    ~menu_object();
+};
 struct menu_item_object {
     mm_objc_object base;
     std::string title, key_equivalent;
-    id target = nullptr, submenu = nullptr, represented = nullptr;
+    id target = nullptr, submenu = nullptr, represented = nullptr, owner_menu = nullptr;
     SEL action = nullptr;
     std::uint64_t tag = 0, state = 0;
-    bool enabled = true, hidden = false;
+    std::uint64_t key_modifiers = 1ull << 20;
+    bool enabled = true, hidden = false, separator = false;
+    ~menu_item_object() { release(submenu); release(represented); }
 };
+menu_object::~menu_object() {
+    for (id item : items) { as<menu_item_object>(item)->owner_menu = nullptr; release(item); }
+}
 
 double now_seconds() {
     struct timespec ts;
@@ -95,8 +115,14 @@ std::uint64_t app_setDelegate(id self, SEL, id d) {
     app(self)->delegate = d;
     return 0;
 }
+std::uint64_t app_setServicesProvider(id self, SEL, id provider) { app(self)->services_provider = provider; return 0; }
 std::uint64_t app_mainMenu(id self, SEL) { return ret(app(self)->main_menu); }
-std::uint64_t app_setMainMenu(id self, SEL, id m) { app(self)->main_menu = m ? retain(m) : nullptr; return 0; }
+std::uint64_t app_setMainMenu(id self, SEL, id m) {
+    if (m == app(self)->main_menu) return 0;
+    const auto previous = app(self)->main_menu;
+    app(self)->main_menu = m ? retain(m) : nullptr;
+    release(previous); ++menu_generation; return 0;
+}
 std::uint64_t app_isRunning(id self, SEL) { return app(self)->running; }
 std::uint64_t app_isActive(id self, SEL) { return app(self)->active; }
 std::uint64_t app_setActivationPolicy(id, SEL, std::uint64_t) { return 1; }
@@ -109,6 +135,11 @@ std::uint64_t app_windows(id self, SEL) {
     for (id window : app(self)->windows) send(array, "addObject:", ret(window));
     return ret(array);
 }
+std::uint64_t app_orderedWindows(id self, SEL) {
+    id array = obj(send(reinterpret_cast<id>(cls("NSMutableArray")), "array"));
+    for (id window : app(self)->ordered_windows) send(array, "addObject:", ret(window));
+    return ret(array);
+}
 std::uint64_t app_keyWindow(id self, SEL) {
     for (id window : app(self)->windows)
         if (send(window, "isKeyWindow")) return ret(window);
@@ -117,22 +148,63 @@ std::uint64_t app_keyWindow(id self, SEL) {
 std::uint64_t app_mainWindow(id self, SEL) { return app_keyWindow(self, nullptr); }
 std::uint64_t app_windowWithWindowNumber(id, SEL, std::uint64_t) { return 0; }
 
-/* The event loop. One iteration: wait for a platform event (or a timeout so
- * timers and redraws still happen), deliver it, then redraw. */
+void set_current_event(id self, id event) {
+    if (app(self)->current_event == event) return;
+    id previous = app(self)->current_event;
+    app(self)->current_event = retain(event);
+    release(previous);
+}
+void dispatch_event(id event) {
+    set_current_event(g_NSApp, event);
+    // Native dragging owns pointer tracking even if an application overrides
+    // sendEvent: without calling super.
+    if (dragging_session_event(event)) return;
+    /* Applications can override sendEvent: to manage their own responder
+     * state. In particular Live switches its text-input view here. */
+    send(g_NSApp, "sendEvent:", ret(event));
+}
+
+void invalidate_view_tree(id view) {
+    if (!view) return;
+    auto *o = as<view_object>(view);
+    o->needs_display = true;
+    for (id child : o->subviews) invalidate_view_tree(child);
+}
+
+void invalidate_window(id window) {
+    if (!window) return;
+    auto *o = as<window_object>(window);
+    o->needs_display = true;
+    invalidate_view_tree(o->content_view);
+}
+
+/* Deliver state/input first; the loop draws after its bounded event burst. */
 void deliver(const platform_event &pe) {
     id window = pe.window ? platform_window_owner(pe.window) : nullptr;
     switch (pe.kind) {
+    case event_kind::menu_action:
+        application_menu_activate(pe.menu_token);
+        break;
+    case event_kind::menu_open:
+        application_menu_open(pe.menu_token);
+        break;
     case event_kind::mouse_down:
     case event_kind::mouse_up:
     case event_kind::mouse_moved:
     case event_kind::mouse_dragged:
     case event_kind::scroll: {
+        if (pe.kind == event_kind::mouse_moved || pe.kind == event_kind::mouse_dragged) application_cursor_moved();
         std::uint64_t type = ev_mouse_moved;
         if (pe.kind == event_kind::mouse_down) type = pe.button == 1 ? ev_right_mouse_down : pe.button == 0 ? ev_left_mouse_down : ev_other_mouse_down;
         else if (pe.kind == event_kind::mouse_up) type = pe.button == 1 ? ev_right_mouse_up : pe.button == 0 ? ev_left_mouse_up : ev_other_mouse_up;
         else if (pe.kind == event_kind::mouse_dragged) type = pe.button == 1 ? ev_right_mouse_dragged : pe.button == 0 ? ev_left_mouse_dragged : ev_other_mouse_dragged;
         else if (pe.kind == event_kind::scroll) type = ev_scroll_wheel;
-        g_mouse = pe.where;
+        const rect frame = window ? as<window_object>(window)->frame : rect{};
+        g_mouse = {pe.where.x + frame.x, pe.where.y + frame.y};
+        if (trace() && (pe.kind == event_kind::mouse_down || pe.kind == event_kind::mouse_up))
+            std::fprintf(stderr, "AppKit: pointer %s window=%p local={%g,%g} screen={%g,%g}\n",
+                         pe.kind == event_kind::mouse_down ? "down" : "up", static_cast<void *>(window),
+                         pe.where.x, pe.where.y, g_mouse.x, g_mouse.y);
         if (pe.kind == event_kind::mouse_down) g_pressed_buttons |= 1ull << pe.button;
         if (pe.kind == event_kind::mouse_up) g_pressed_buttons &= ~(1ull << pe.button);
         id event = make_event(type, window, pe.where, pe.modifiers);
@@ -141,7 +213,7 @@ void deliver(const platform_event &pe) {
         e->click_count = pe.kind == event_kind::mouse_down ? 1 : 0;
         e->dx = pe.dx;
         e->dy = pe.dy;
-        if (window) send(window, "sendEvent:", ret(event));
+        if (window) dispatch_event(event);
         break;
     }
     case event_kind::key_down:
@@ -150,13 +222,18 @@ void deliver(const platform_event &pe) {
         auto *e = as<event_object>(event);
         e->keycode = pe.keycode;
         e->characters = pe.characters;
-        if (window) send(window, "sendEvent:", ret(event));
+        e->characters_ignoring_modifiers = pe.characters_ignoring_modifiers;
+        if (trace()) std::fprintf(stderr, "AppKit: key %s window=%p macCode=%u modifiers=0x%x text=%s\n",
+            pe.kind == event_kind::key_down ? "down" : "up", static_cast<void *>(window), pe.keycode,
+            pe.modifiers, pe.characters_ignoring_modifiers.c_str());
+        if (window) dispatch_event(event);
         break;
     }
     case event_kind::flags_changed: {
         g_modifiers = pe.modifiers;
         id event = make_event(ev_flags_changed, window, pe.where, pe.modifiers);
-        if (window) send(window, "sendEvent:", ret(event));
+        as<event_object>(event)->keycode = pe.keycode;
+        if (window) dispatch_event(event);
         break;
     }
     case event_kind::resized:
@@ -164,14 +241,16 @@ void deliver(const platform_event &pe) {
             const std::uint64_t args[1] = {0};
             (void)args;
             mm_cpu_context *ctx = api()->current_context();
-            const rect f{0, 0, pe.new_size.w, pe.new_size.h};
+            const rect previous = as<window_object>(window)->frame;
+            const rect f{previous.x, previous.y, pe.new_size.w, pe.new_size.h};
             if (ctx) {
                 std::memcpy(&ctx->v[0][0], &f.x, 8);
                 std::memcpy(&ctx->v[1][0], &f.y, 8);
                 std::memcpy(&ctx->v[2][0], &f.w, 8);
                 std::memcpy(&ctx->v[3][0], &f.h, 8);
             }
-            send(window, "setFrame:display:", 1);
+            send(window, "setFrame:display:", 0);
+            invalidate_window(window);
             id delegate = obj(send(window, "delegate"));
             if (responds(delegate, "windowDidResize:")) send(delegate, "windowDidResize:", ret(window));
         }
@@ -181,19 +260,63 @@ void deliver(const platform_event &pe) {
             id delegate = obj(send(window, "delegate"));
             bool close = true;
             if (responds(delegate, "windowShouldClose:")) close = send(delegate, "windowShouldClose:", ret(window)) != 0;
-            if (close) send(window, "close");
+            if (close) {
+                send(window,"close");
+                if(g_NSApp)app(g_NSApp)->user_close_pending=true;
+            }
         }
         break;
     case event_kind::exposed:
-        if (window) send(window, "display");
+        invalidate_window(window);
         break;
     case event_kind::focus_in:
     case event_kind::focus_out:
+        if (pe.kind == event_kind::focus_out && window) cancel_dragging_session(window);
         if (window) send(window, pe.kind == event_kind::focus_in ? "becomeKeyWindow" : "resignKeyWindow");
         break;
     case event_kind::none:
         break;
     }
+}
+
+void redraw_windows(id self) {
+    layer_display_pass pass;
+    static std::uint64_t last_menu_generation = 0;
+    static std::vector<native_menu_item> menu_snapshot;
+    if (last_menu_generation != menu_generation) {
+        menu_snapshot = application_menu_snapshot();
+        last_menu_generation = menu_generation;
+    }
+    /* Guest display callbacks can create or close a window. Keep a retained
+     * snapshot so neither vector mutation nor deallocation breaks the pass. */
+    const auto windows = app(self)->windows;
+    for (id window : windows) retain(window);
+    for (id window : windows) {
+        if (send(window, "isVisible")) {
+            const auto started = std::chrono::steady_clock::now();
+            auto *wo = as<window_object>(window);
+            if (wo->platform) platform::set_menu(wo->platform, menu_snapshot);
+            if (wo->pending_configure_notification && wo->content_view) {
+                wo->pending_configure_notification = false;
+                auto *view = as<view_object>(wo->content_view);
+                if (view->posts_frame_notifications) {
+                    id center = obj(send(reinterpret_cast<id>(cls("NSNotificationCenter")), "defaultCenter"));
+                    send(center, "postNotificationName:object:", ret(string("NSViewFrameDidChangeNotification")), ret(wo->content_view));
+                }
+            }
+            send(window, "displayIfNeeded");
+            if (wo->content_view) draw_layers(wo->content_view);
+#ifdef MM_APPKIT_EVILCOCOA
+            render_cocoa_window(window);
+#endif
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            if (trace() && elapsed > std::chrono::milliseconds(200))
+                std::fprintf(stderr, "AppKit: slow redraw window=%p size=%gx%g took %.1f ms\n",
+                             static_cast<void *>(window), wo->frame.w, wo->frame.h,
+                             std::chrono::duration<double, std::milli>(elapsed).count());
+        }
+    }
+    for (id window : windows) release(window);
 }
 
 /* AppKit's notifications go through the one NSNotificationCenter, because
@@ -210,6 +333,8 @@ void post_app_notification(id self, const char *name) {
 }
 
 std::uint64_t app_finishLaunching(id self, SEL) {
+    if (app(self)->finished_launching) return 0;
+    app(self)->finished_launching = true;
     id delegate = app(self)->delegate;
     if (trace())
         std::fprintf(stderr, "AppKit: -[NSApplication finishLaunching], delegate is a %s\n",
@@ -275,8 +400,14 @@ std::uint64_t app_run(id self, SEL) {
      * the guest and silence from the loop look identical otherwise. */
     auto last_idle = std::chrono::steady_clock::now();
     while (o->running) {
+        autorelease_pool pool;
         platform_event pe;
-        if (platform::next_event(pe, 0.016)) deliver(pe);
+        if (platform::next_event(pe, 0.016)) {
+            deliver(pe);
+            /* Consume a bounded burst before drawing another expensive
+             * guest frame, while still giving timers and redraw a turn. */
+            for (int i = 1; i < 64 && platform::next_event(pe, 0); ++i) deliver(pe);
+        }
         if (trace()) {
             const auto now = std::chrono::steady_clock::now();
             if (now - last_idle > std::chrono::seconds(1)) {
@@ -288,9 +419,22 @@ std::uint64_t app_run(id self, SEL) {
         }
         /* Redraw what asked for it, then let CoreFoundation's run loop run
          * the blocks and sources the app queued. */
-        for (id window : o->windows)
-            if (send(window, "isVisible")) send(window, "displayIfNeeded");
+        dispatch_native_dialogs();
+        poll_file_panels();
+        poll_alerts();
+        redraw_windows(self);
         CFRunLoopRunInMode_(nullptr, 0, 0); /* run whatever the app queued */
+        if(o->last_window_close_pending) {
+            o->last_window_close_pending=false;
+            bool visible=false;for(id window:o->windows)if(as<window_object>(window)->visible){visible=true;break;}
+            if(!visible) {
+                const bool has_policy=responds(o->delegate,"applicationShouldTerminateAfterLastWindowClosed:");
+                bool quit=has_policy?send(o->delegate,"applicationShouldTerminateAfterLastWindowClosed:",ret(self))!=0:o->user_close_pending;
+                if(!has_policy&&std::getenv("MACHOMAN_APPKIT_KEEP_ALIVE"))quit=false;
+                if(quit)send(self,"terminate:",ret(self));
+            }
+            o->user_close_pending=false;
+        }
     }
     return 0;
 }
@@ -298,10 +442,10 @@ std::uint64_t app_stop(id self, SEL, id) { app(self)->running = false; platform:
 std::uint64_t app_terminate(id self, SEL, id sender) {
     id delegate = app(self)->delegate;
     if (responds(delegate, "applicationShouldTerminate:")) {
-        const std::uint64_t reply = send(delegate, "applicationShouldTerminate:", ret(sender));
-        if (reply == 0) return 0; /* NSTerminateCancel */
+        const std::uint64_t reply = send(delegate, "applicationShouldTerminate:", ret(self));
+        if (reply == 0 || reply == 2) return 0; /* NSTerminateCancel */
     }
-    if (responds(delegate, "applicationWillTerminate:")) send(delegate, "applicationWillTerminate:", 0);
+    if (responds(delegate, "applicationWillTerminate:")) send(delegate, "applicationWillTerminate:", ret(self));
     app(self)->running = false;
     std::exit(0);
 }
@@ -315,19 +459,68 @@ std::uint64_t app_nextEventMatchingMask(id, SEL, std::uint64_t mask, id, id, std
     deliver(pe);
     return 0;
 }
-std::uint64_t app_sendEvent(id, SEL, id event) {
+std::uint64_t app_sendEvent(id self, SEL, id event) {
+    set_current_event(self, event);
+    if (dragging_session_event(event)) return 0;
     id window = obj(send(event, "window"));
+    if (file_panel_blocks_window(window)) return 0;
+    if (send(event, "type") == ev_key_down && !text_input_has_priority(window, event) && app(self)->modals.empty() && app(self)->main_menu &&
+        send(app(self)->main_menu, "performKeyEquivalent:", ret(event))) return 0;
     if (window) send(window, "sendEvent:", ret(event));
     return 0;
 }
 std::uint64_t app_postEvent(id, SEL, id, std::uint64_t) { return 0; }
 std::uint64_t app_noop(id, SEL, ...) { return 0; }
-std::uint64_t app_currentEvent(id, SEL) { return 0; }
-std::uint64_t app_runModalForWindow(id, SEL, id window) {
-    /* A modal session with no nesting: show the window and let the main
-     * loop keep running until it goes away. */
-    send(window, "makeKeyAndOrderFront:", 0);
+std::uint64_t app_currentEvent(id self, SEL) { return ret(app(self)->current_event); }
+std::uint64_t app_modalWindow(id self, SEL) {
+    const auto &sessions = app(self)->modals;
+    return sessions.empty() ? 0 : ret(sessions.back()->window);
+}
+std::uint64_t app_stopModalWithCode(id self, SEL, std::int64_t code) {
+    auto &sessions = app(self)->modals;
+    if (!sessions.empty()) sessions.back()->response = code;
+    platform::wake();
     return 0;
+}
+std::uint64_t app_stopModal(id self, SEL) { return app_stopModalWithCode(self, nullptr, modal_stop); }
+std::uint64_t app_abortModal(id self, SEL) { return app_stopModalWithCode(self, nullptr, modal_abort); }
+std::uint64_t app_runModalForWindow(id self, SEL, id window) {
+    if (!window) return static_cast<std::uint64_t>(modal_abort);
+    modal_session session{retain(window)};
+    auto *o = app(self);
+    o->modals.push_back(&session);
+    if (trace()) std::fprintf(stderr, "AppKit: modal begin window=%p depth=%zu\n", static_cast<void *>(window), o->modals.size());
+    send(window, "makeKeyAndOrderFront:", 0);
+    id mode = string("NSModalPanelRunLoopMode");
+    while (session.response == modal_continue) {
+        autorelease_pool pool;
+        platform_event pe;
+        for (int i = 0; i < 64 && session.response == modal_continue &&
+             platform::next_event(pe, i == 0 ? 0.016 : 0); ++i) {
+            bool input = false;
+            switch (pe.kind) {
+            case event_kind::mouse_down: case event_kind::mouse_up:
+            case event_kind::mouse_moved: case event_kind::mouse_dragged:
+            case event_kind::scroll: case event_kind::key_down:
+            case event_kind::key_up: case event_kind::flags_changed:
+            case event_kind::menu_action: case event_kind::menu_open:
+                input = true;
+                break;
+            default: break;
+            }
+            if (!input || (pe.window && platform_window_owner(pe.window) == window)) deliver(pe);
+        }
+        dispatch_native_dialogs();
+        poll_file_panels();
+        poll_alerts();
+        redraw_windows(self);
+        CFRunLoopRunInMode_(mode, 0, 0);
+        if (session.response == modal_continue && !send(window, "isVisible")) session.response = modal_abort;
+    }
+    o->modals.pop_back();
+    if (trace()) std::fprintf(stderr, "AppKit: modal end window=%p response=%lld depth=%zu\n", static_cast<void *>(window), static_cast<long long>(session.response), o->modals.size());
+    release(session.window);
+    return static_cast<std::uint64_t>(session.response);
 }
 
 /* ---- NSScreen -------------------------------------------------------------- */
@@ -357,57 +550,167 @@ std::uint64_t screen_deviceDescription(id, SEL) {
 
 /* ---- NSMenu / NSMenuItem ---------------------------------------------------- */
 
-std::uint64_t menu_initWithTitle(id self, SEL, id title) { as<menu_object>(self)->title = to_utf8(title); return ret(self); }
+std::uint64_t menu_initWithTitle(id self, SEL, id title) { as<menu_object>(self)->title = to_utf8(title); ++menu_generation; return ret(self); }
 std::uint64_t menu_init(id self, SEL) { return ret(self); }
-std::uint64_t menu_addItem(id self, SEL, id item) { as<menu_object>(self)->items.push_back(retain(item)); return 0; }
+std::uint64_t menu_addItem(id self, SEL, id item) {
+    if (item) { as<menu_object>(self)->items.push_back(retain(item)); as<menu_item_object>(item)->owner_menu = self; }
+    ++menu_generation; return 0;
+}
 std::uint64_t menu_numberOfItems(id self, SEL) { return as<menu_object>(self)->items.size(); }
 std::uint64_t menu_itemAtIndex(id self, SEL, std::uint64_t i) {
-    auto &items = as<menu_object>(self)->items;
-    return i < items.size() ? ret(items[i]) : 0;
+    auto &items = as<menu_object>(self)->items; return i < items.size() ? ret(items[i]) : 0;
 }
 std::uint64_t menu_title(id self, SEL) { return ret(string(as<menu_object>(self)->title)); }
-std::uint64_t menu_setTitle(id self, SEL, id t) { as<menu_object>(self)->title = to_utf8(t); return 0; }
+std::uint64_t menu_setTitle(id self, SEL, id t) { as<menu_object>(self)->title = to_utf8(t); ++menu_generation; return 0; }
 std::uint64_t menu_addItemWithTitle(id self, SEL, id title, SEL action, id key) {
     id item = obj(send(reinterpret_cast<id>(g_menu_item), "alloc"));
     const std::uint64_t args[3] = {ret(title), ret(action), ret(key)};
     item = obj(mm_objc_send(item, mm_objc_sel("initWithTitle:action:keyEquivalent:"), 3, args));
-    menu_addItem(self, nullptr, item);
-    return ret(item);
+    menu_addItem(self, nullptr, item); return ret(autorelease(item));
 }
 std::uint64_t menu_removeAllItems(id self, SEL) {
-    auto &items = as<menu_object>(self)->items;
-    for (id i : items) release(i);
-    items.clear();
-    return 0;
+    auto &items = as<menu_object>(self)->items; const auto old = std::move(items); items.clear();
+    ++menu_generation; for (id i : old) { as<menu_item_object>(i)->owner_menu = nullptr; release(i); } return 0;
 }
+std::uint64_t menu_insertItem(id self, SEL, id item, std::uint64_t index) {
+    auto &items = as<menu_object>(self)->items;
+    if (item && index <= items.size()) { items.insert(items.begin() + index, retain(item)); as<menu_item_object>(item)->owner_menu = self; }
+    ++menu_generation; return 0;
+}
+std::uint64_t menu_removeItem(id self, SEL, id item) {
+    auto &items = as<menu_object>(self)->items; const auto it = std::find(items.begin(), items.end(), item);
+    if (it != items.end()) { items.erase(it); as<menu_item_object>(item)->owner_menu = nullptr; ++menu_generation; release(item); } return 0;
+}
+std::uint64_t menu_removeItemAtIndex(id self, SEL, std::uint64_t index) {
+    auto &items = as<menu_object>(self)->items; return index < items.size() ? menu_removeItem(self, nullptr, items[index]) : 0;
+}
+std::uint64_t menu_itemWithTag(id self, SEL, std::uint64_t tag) {
+    for (id item : as<menu_object>(self)->items) if (send(item, "tag") == tag) return ret(item); return 0;
+}
+std::uint64_t menu_setDelegate(id self, SEL, id delegate) { as<menu_object>(self)->delegate = delegate; return 0; }
+std::uint64_t menu_delegate(id self, SEL) { return ret(as<menu_object>(self)->delegate); }
+std::uint64_t menu_autoenables(id self, SEL) { return as<menu_object>(self)->autoenables; }
+std::uint64_t menu_setAutoenables(id self, SEL, std::uint64_t value) { as<menu_object>(self)->autoenables = value & 255; ++menu_generation; return 0; }
 
+id action_target(SEL action, id target) {
+    if (target) return target;
+    if (!g_NSApp || !action) return nullptr;
+    id window = obj(app_keyWindow(g_NSApp, nullptr));
+    id responder = window ? obj(send(window, "firstResponder")) : nullptr;
+    for (int n = 0; responder && n < 128; ++n) {
+        if (send(responder, "respondsToSelector:", ret(action))) return responder;
+        responder = obj(send(responder, "nextResponder"));
+    }
+    for (id candidate : {window, window ? obj(send(window, "delegate")) : nullptr, g_NSApp, app(g_NSApp)->delegate})
+        if (candidate && send(candidate, "respondsToSelector:", ret(action))) return candidate;
+    return nullptr;
+}
+std::uint64_t app_sendAction(id, SEL, SEL action, id target, id sender) {
+    target = action_target(action, target); if (!target || !action) return 0;
+    const auto argument = ret(sender); mm_objc_send(target, action, 1, &argument); return 1;
+}
+void update_menu(id menu, unsigned depth = 0) {
+    if (!menu || depth >= 32) return;
+    auto *m = as<menu_object>(menu);
+    if (responds(m->delegate, "menuNeedsUpdate:")) send(m->delegate, "menuNeedsUpdate:", ret(menu));
+    auto items = m->items; for (id item : items) retain(item);
+    for (id item : items) {
+        auto *i = as<menu_item_object>(item);
+        if (m->autoenables && i->action && !i->submenu) {
+            id target = action_target(i->action, i->target);
+            bool enabled = target != nullptr;
+            if (enabled && responds(target, "validateMenuItem:")) enabled = send(target, "validateMenuItem:", ret(item)) & 255;
+            else if (enabled && responds(target, "validateUserInterfaceItem:")) enabled = send(target, "validateUserInterfaceItem:", ret(item)) & 255;
+            if (i->enabled != enabled) { i->enabled = enabled; ++menu_generation; }
+        }
+        release(item);
+    }
+}
+std::uint64_t menu_update(id self, SEL) { update_menu(self); return 0; }
 std::uint64_t item_initWithTitle(id self, SEL, id title, SEL action, id key) {
-    auto *o = as<menu_item_object>(self);
-    o->title = to_utf8(title);
-    o->action = action;
-    o->key_equivalent = key ? to_utf8(key) : "";
-    return ret(self);
+    auto *o = as<menu_item_object>(self); o->title = to_utf8(title); o->action = action; o->key_equivalent = key ? to_utf8(key) : ""; ++menu_generation; return ret(self);
 }
 std::uint64_t item_init(id self, SEL) { return ret(self); }
 std::uint64_t item_title(id self, SEL) { return ret(string(as<menu_item_object>(self)->title)); }
-std::uint64_t item_setTitle(id self, SEL, id t) { as<menu_item_object>(self)->title = to_utf8(t); return 0; }
-std::uint64_t item_setTarget(id self, SEL, id t) { as<menu_item_object>(self)->target = t; return 0; }
+std::uint64_t item_setTitle(id self, SEL, id t) { as<menu_item_object>(self)->title = to_utf8(t); ++menu_generation; return 0; }
+std::uint64_t item_setTarget(id self, SEL, id t) { as<menu_item_object>(self)->target = t; ++menu_generation; return 0; }
 std::uint64_t item_target(id self, SEL) { return ret(as<menu_item_object>(self)->target); }
-std::uint64_t item_setAction(id self, SEL, SEL a) { as<menu_item_object>(self)->action = a; return 0; }
+std::uint64_t item_menu(id self, SEL) { return ret(as<menu_item_object>(self)->owner_menu); }
+std::uint64_t item_setAction(id self, SEL, SEL a) { as<menu_item_object>(self)->action = a; ++menu_generation; return 0; }
 std::uint64_t item_action(id self, SEL) { return ret(as<menu_item_object>(self)->action); }
-std::uint64_t item_setSubmenu(id self, SEL, id m) { as<menu_item_object>(self)->submenu = m ? retain(m) : nullptr; return 0; }
+std::uint64_t item_setSubmenu(id self, SEL, id m) {
+    auto *o = as<menu_item_object>(self); if (o->submenu == m) return 0;
+    const auto old = o->submenu; o->submenu = retain(m); ++menu_generation; release(old); return 0;
+}
+std::uint64_t menu_setSubmenu(id, SEL, id submenu, id item) { return item ? item_setSubmenu(item, nullptr, submenu) : 0; }
 std::uint64_t item_submenu(id self, SEL) { return ret(as<menu_item_object>(self)->submenu); }
-std::uint64_t item_setEnabled(id self, SEL, std::uint64_t e) { as<menu_item_object>(self)->enabled = (e & 0xFF) != 0; return 0; }
+std::uint64_t item_setEnabled(id self, SEL, std::uint64_t e) { as<menu_item_object>(self)->enabled = (e & 255) != 0; ++menu_generation; return 0; }
 std::uint64_t item_isEnabled(id self, SEL) { return as<menu_item_object>(self)->enabled; }
-std::uint64_t item_setState(id self, SEL, std::uint64_t s) { as<menu_item_object>(self)->state = s; return 0; }
+std::uint64_t item_setHidden(id self, SEL, std::uint64_t e) { as<menu_item_object>(self)->hidden = (e & 255) != 0; ++menu_generation; return 0; }
+std::uint64_t item_isHidden(id self, SEL) { return as<menu_item_object>(self)->hidden; }
+std::uint64_t item_isSeparator(id self, SEL) { return as<menu_item_object>(self)->separator; }
+std::uint64_t item_setState(id self, SEL, std::uint64_t s) { as<menu_item_object>(self)->state = s; ++menu_generation; return 0; }
 std::uint64_t item_state(id self, SEL) { return as<menu_item_object>(self)->state; }
-std::uint64_t item_setTag(id self, SEL, std::uint64_t t) { as<menu_item_object>(self)->tag = t; return 0; }
+std::uint64_t item_setTag(id self, SEL, std::uint64_t t) { as<menu_item_object>(self)->tag = t; ++menu_generation; return 0; }
 std::uint64_t item_tag(id self, SEL) { return as<menu_item_object>(self)->tag; }
-std::uint64_t item_setRepresentedObject(id self, SEL, id o) { as<menu_item_object>(self)->represented = o; return 0; }
+std::uint64_t item_setRepresentedObject(id self, SEL, id value) {
+    auto *o = as<menu_item_object>(self); const auto old = o->represented; o->represented = retain(value); release(old); return 0;
+}
 std::uint64_t item_representedObject(id self, SEL) { return ret(as<menu_item_object>(self)->represented); }
+std::uint64_t item_keyEquivalent(id self, SEL) { return ret(string(as<menu_item_object>(self)->key_equivalent)); }
+std::uint64_t item_setKeyEquivalent(id self, SEL, id key) { as<menu_item_object>(self)->key_equivalent = to_utf8(key); ++menu_generation; return 0; }
+std::uint64_t item_keyModifiers(id self, SEL) { return as<menu_item_object>(self)->key_modifiers; }
+std::uint64_t item_setKeyModifiers(id self, SEL, std::uint64_t mask) { as<menu_item_object>(self)->key_modifiers = mask; ++menu_generation; return 0; }
 std::uint64_t item_separatorItem(id, SEL) {
-    id item = obj(send(reinterpret_cast<id>(g_menu_item), "alloc"));
-    return ret(autorelease(obj(send(item, "init"))));
+    id item = obj(send(reinterpret_cast<id>(g_menu_item), "alloc")); item = obj(send(item, "init"));
+    as<menu_item_object>(item)->separator = true; as<menu_item_object>(item)->enabled = false; return ret(autorelease(item));
+}
+id find_menu_item(id menu, std::uintptr_t token, unsigned depth = 0) {
+    if (!menu || depth >= 32) return nullptr;
+    for (id item : as<menu_object>(menu)->items) {
+        if (ret(item) == token) return item;
+        if (id found = find_menu_item(as<menu_item_object>(item)->submenu, token, depth + 1)) return found;
+    }
+    return nullptr;
+}
+std::vector<native_menu_item> snapshot_menu(id menu, unsigned depth = 0) {
+    std::vector<native_menu_item> out; if (!menu || depth >= 32) return out;
+    for (id item : as<menu_object>(menu)->items) {
+        const auto *i = as<menu_item_object>(item); if (i->hidden) continue;
+        native_menu_item entry; entry.token = ret(item); entry.title = i->title; entry.enabled = i->enabled;
+        entry.separator = i->separator; entry.state = static_cast<std::int64_t>(i->state);
+        if (!i->key_equivalent.empty()) {
+            if (i->key_modifiers & (1ull << 20)) entry.shortcut += "Ctrl+";
+            else if (i->key_modifiers & (1ull << 18)) entry.shortcut += "Ctrl+";
+            if (i->key_modifiers & (1ull << 19)) entry.shortcut += "Alt+";
+            if (i->key_modifiers & (1ull << 17)) entry.shortcut += "Shift+";
+            entry.shortcut += i->key_equivalent;
+        }
+        entry.children = snapshot_menu(i->submenu, depth + 1);
+        if (entry.title.empty() && i->submenu) entry.title = as<menu_object>(i->submenu)->title;
+        out.push_back(std::move(entry));
+    }
+    return out;
+}
+id key_item(id menu, const std::string &key, std::uint64_t modifiers, unsigned depth = 0) {
+    if (!menu || depth >= 32) return nullptr;
+    for (id item : as<menu_object>(menu)->items) {
+        auto *i = as<menu_item_object>(item); if (i->hidden || !i->enabled) continue;
+        if (id found = key_item(i->submenu, key, modifiers, depth + 1)) return found;
+        if (i->action && !i->key_equivalent.empty() && i->key_equivalent == key && (i->key_modifiers & 0x1e0000) == modifiers) return item;
+    }
+    return nullptr;
+}
+std::uint64_t menu_performKeyEquivalent(id self, SEL, id event) {
+    if (send(event, "type") != ev_key_down) return 0;
+    const auto key = to_utf8(obj(send(event, "charactersIgnoringModifiers")));
+    auto modifiers = send(event, "modifierFlags") & 0x1e0000;
+    id item = key_item(self, key, modifiers);
+    const char *native = std::getenv("MACHOMAN_NATIVE_SHORTCUTS");
+    if (!item && native && std::strcmp(native, "0") == 0 && (modifiers & (1ull << 18)) && !(modifiers & (1ull << 20)))
+        item = key_item(self, key, (modifiers & ~(1ull << 18)) | (1ull << 20));
+    if (!item) return 0;
+    retain(item); auto *i = as<menu_item_object>(item); const auto result = app_sendAction(g_NSApp, nullptr, i->action, i->target, item); release(item); return result;
 }
 
 /* ---- NSWorkspace and friends ------------------------------------------------ */
@@ -418,19 +721,55 @@ std::uint64_t workspace_shared(id cls_, SEL) {
     return ret(instance);
 }
 std::uint64_t workspace_openURL(id, SEL, id url) {
-    if (trace()) std::fprintf(stderr, "AppKit: -[NSWorkspace openURL:] %s\n", to_utf8(obj(send(url, "absoluteString"))).c_str());
+    const auto uri = to_utf8(obj(send(url, "absoluteString")));
+    if (trace()) std::fprintf(stderr, "AppKit: -[NSWorkspace openURL:] %s\n", uri.c_str());
+    return !uri.empty() && open_external_uri(uri);
+}
+std::uint64_t app_showHelp(id, SEL, id) {
+    id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")), "mainBundle"));
+    id folder = obj(send(bundle, "objectForInfoDictionaryKey:", ret(string("CFBundleHelpBookFolder"))));
+    if (!folder) return 0;
+    id directory = obj(send(bundle, "pathForResource:ofType:", ret(folder), 0));
+    if (!directory) return 0;
+    namespace fs = std::filesystem;
+    const fs::path root(to_utf8(directory));
+    std::error_code ec;
+    fs::path index;
+    for (auto name : {root.filename().string() + ".html", std::string("index.html")})
+        if (fs::is_regular_file(root / name, ec)) { index = root / name; break; }
+    if (index.empty()) {
+        for (auto &entry : fs::directory_iterator(root, ec)) {
+            if (entry.path().extension() != ".html") continue;
+            id html = obj(send(reinterpret_cast<id>(cls("NSString")), "stringWithContentsOfFile:encoding:error:", ret(string(entry.path().string())), 4, 0));
+            if (to_utf8(html).find("AppleTitle") != std::string::npos) { index = entry.path(); break; }
+        }
+    }
+    if (!index.empty()) {
+        id url = obj(send(reinterpret_cast<id>(cls("NSURL")), "fileURLWithPath:", ret(string(index.string()))));
+        workspace_openURL(nullptr, nullptr, url);
+    }
+    return 0;
+}
+std::uint64_t workspace_setIcon(id, SEL, id, id, std::uint64_t) {
+    // The Linux backend has no Finder per-file custom icons. Report failure
+    // through the public BOOL result rather than aborting an optional action.
     return 0;
 }
 /* NSAlert is a window with a message in it, so it keeps the same state a
  * window does: an app configures the alert, may ask for its -window to
  * position or theme it, and then runs it. Nothing here can wait for a
- * person to click, so -runModal reports the first button — the one a
- * default alert makes "OK" — and says on stderr what was asked. */
+ * person to click uses the native Linux message dialog backend. */
 struct alert_object {
     mm_objc_object base;
     id message = nullptr, informative = nullptr, window = nullptr;
     std::vector<id> buttons;
     std::uint64_t style = 1; /* NSAlertStyleWarning */
+    std::unique_ptr<native_dialog> request;
+    id handler = nullptr;
+    ~alert_object() {
+        release(message); release(informative); release(window); release(handler);
+        for (id button : buttons) release(button);
+    }
 };
 alert_object *alert(id o) { return as<alert_object>(o); }
 
@@ -477,24 +816,87 @@ std::uint64_t alert_buttons(id self, SEL) {
     return ret(array);
 }
 
+std::unique_ptr<native_dialog> alert_request(id self) {
+    auto *a = alert(self);
+    std::vector<std::string> buttons;
+    for (id button : a->buttons) buttons.push_back(to_utf8(obj(send(button, "title"))));
+    return open_message_dialog(to_utf8(a->message), to_utf8(a->informative), buttons, static_cast<unsigned>(a->style));
+}
+std::uint64_t alert_response(const dialog_result &result) {
+    if (!result.error.empty()) std::fprintf(stderr, "AppKit: alert: %s\n", result.error.c_str());
+    return result.accepted && !result.paths.empty() ? 1000 + std::stoull(result.paths[0]) : 0;
+}
+std::vector<id> active_alerts;
 std::uint64_t alert_runModal(id self, SEL) {
-    alert_object *a = alert(self);
-    std::fprintf(stderr, "AppKit: NSAlert: %s%s%s\n", to_utf8(a->message).c_str(),
-                 a->informative ? " — " : "", a->informative ? to_utf8(a->informative).c_str() : "");
-    return 1000; /* NSAlertFirstButtonReturn */
+    auto request = alert_request(self);
+    dialog_result result;
+    while (!request->poll(result)) application_dialog_tick(nullptr);
+    return alert_response(result);
 }
 std::uint64_t alert_beginSheetModal(id self, SEL, id, id handler) {
-    /* The completion handler runs with the same answer -runModal gives. */
-    alert_runModal(self, nullptr);
-    if (handler) {
-        const std::uint64_t response = 1000;
-        mm_objc_block_invoke(handler, 1, &response);
-    }
+    if (alert(self)->request) return 0;
+    alert(self)->request = alert_request(self);
+    alert(self)->handler = handler ? obj(send(handler, "copy")) : nullptr;
+    active_alerts.push_back(retain(self));
     return 0;
 }
-std::uint64_t panel_runModal(id, SEL) { return 0; /* NSModalResponseCancel */ }
+void poll_alerts() {
+    const auto snapshot = active_alerts;
+    for (id self : snapshot) retain(self);
+    for (id self : snapshot) {
+        auto it = std::find(active_alerts.begin(), active_alerts.end(), self);
+        if (it == active_alerts.end()) { release(self); continue; }
+        dialog_result result;
+        if (alert(self)->request->poll(result)) {
+            active_alerts.erase(it);
+            auto handler = alert(self)->handler;
+            alert(self)->handler = nullptr; alert(self)->request.reset();
+            const auto response = alert_response(result);
+            if (handler) { mm_objc_block_invoke(handler, 1, &response); release(handler); }
+            release(self);
+        }
+        release(self);
+    }
+}
 
 } // namespace
+
+/* Modal native dialogs keep timers, queued guest work and display events
+ * moving while input to the owning window is blocked. */
+void application_dialog_tick(id owner) {
+    autorelease_pool pool;
+    platform_event pe;
+    for (int i = 0; i < 64 && platform::next_event(pe, i == 0 ? 0.016 : 0); ++i) {
+        const bool input = pe.kind == event_kind::menu_action || pe.kind == event_kind::menu_open ||
+            pe.kind == event_kind::mouse_down || pe.kind == event_kind::mouse_up ||
+            pe.kind == event_kind::mouse_moved || pe.kind == event_kind::mouse_dragged ||
+            pe.kind == event_kind::key_down || pe.kind == event_kind::key_up ||
+            pe.kind == event_kind::scroll || pe.kind == event_kind::flags_changed;
+        if (!input || (owner && pe.window && platform_window_owner(pe.window) != owner)) deliver(pe);
+    }
+    dispatch_native_dialogs();
+    poll_file_panels();
+    poll_alerts();
+    if (g_NSApp) redraw_windows(g_NSApp);
+    CFRunLoopRunInMode_(string("NSModalPanelRunLoopMode"), 0, 0);
+}
+
+std::vector<native_menu_item> application_menu_snapshot() { return g_NSApp ? snapshot_menu(app(g_NSApp)->main_menu) : std::vector<native_menu_item>{}; }
+void application_menu_activate(std::uintptr_t token) {
+    if (!g_NSApp || !app(g_NSApp)->modals.empty() || file_panel_blocks_window(obj(send(g_NSApp, "keyWindow")))) return;
+    id item = find_menu_item(app(g_NSApp)->main_menu, token); if (!item) return;
+    retain(item); auto *i = as<menu_item_object>(item);
+    if (i->enabled && !i->separator && !i->hidden && !i->submenu) send(g_NSApp, "sendAction:to:from:", ret(i->action), ret(i->target), ret(item));
+    release(item);
+}
+void application_menu_open(std::uintptr_t token) {
+    if (!g_NSApp) return;
+    id item = find_menu_item(app(g_NSApp)->main_menu, token); if (!item) return;
+    id menu = as<menu_item_object>(item)->submenu; if (!menu) return;
+    retain(menu); auto *m = as<menu_object>(menu);
+    if (responds(m->delegate, "menuWillOpen:")) send(m->delegate, "menuWillOpen:", ret(menu));
+    update_menu(menu); release(menu);
+}
 
 id make_event(std::uint64_t type, id window, point where, std::uint64_t modifiers) {
     id event = obj(send(reinterpret_cast<id>(cls("NSEvent")), "alloc"));
@@ -514,10 +916,24 @@ void application_add_window(id window) {
     auto &v = app(g_NSApp)->windows;
     if (std::find(v.begin(), v.end(), window) == v.end()) v.push_back(window);
 }
+void application_window_closed() {if(g_NSApp)app(g_NSApp)->last_window_close_pending=true;}
 void application_remove_window(id window) {
     if (!g_NSApp) return;
     auto &v = app(g_NSApp)->windows;
     v.erase(std::remove(v.begin(), v.end(), window), v.end());
+    application_order_out(window);
+}
+void application_order_front(id window) {
+    if (!g_NSApp) return;
+    application_add_window(window);
+    application_order_out(window);
+    auto &ordered = app(g_NSApp)->ordered_windows;
+    ordered.insert(ordered.begin(), window);
+}
+void application_order_out(id window) {
+    if (!g_NSApp) return;
+    auto &ordered = app(g_NSApp)->ordered_windows;
+    ordered.erase(std::remove(ordered.begin(), ordered.end(), window), ordered.end());
 }
 
 void register_application() {
@@ -531,6 +947,7 @@ void register_application() {
         {"init", MM_IMP(app_init), "@16@0:8"},
         {"delegate", MM_IMP(app_delegate), "@16@0:8"},
         {"setDelegate:", MM_IMP(app_setDelegate), "v24@0:8@16"},
+        {"setServicesProvider:", MM_IMP(app_setServicesProvider), "v24@0:8@16"},
         {"mainMenu", MM_IMP(app_mainMenu), "@16@0:8"},
         {"setMainMenu:", MM_IMP(app_setMainMenu), "v24@0:8@16"},
         {"isRunning", MM_IMP(app_isRunning), "B16@0:8"},
@@ -539,6 +956,7 @@ void register_application() {
         {"activateIgnoringOtherApps:", MM_IMP(app_activateIgnoringOtherApps), "v24@0:8B16"},
         {"activate", MM_IMP(app_activateIgnoringOtherApps), "v16@0:8"},
         {"windows", MM_IMP(app_windows), "@16@0:8"},
+        {"orderedWindows", MM_IMP(app_orderedWindows), "@16@0:8"},
         {"keyWindow", MM_IMP(app_keyWindow), "@16@0:8"},
         {"mainWindow", MM_IMP(app_mainWindow), "@16@0:8"},
         {"windowWithWindowNumber:", MM_IMP(app_windowWithWindowNumber), "@24@0:8q16"},
@@ -546,14 +964,20 @@ void register_application() {
         {"run", MM_IMP(app_run), "v16@0:8"},
         {"stop:", MM_IMP(app_stop), "v24@0:8@16"},
         {"terminate:", MM_IMP(app_terminate), "v24@0:8@16"},
+        {"showHelp:", MM_IMP(app_showHelp), "v24@0:8@16"},
         {"nextEventMatchingMask:untilDate:inMode:dequeue:", MM_IMP(app_nextEventMatchingMask), "@48@0:8Q16@24@32B40"},
         {"sendEvent:", MM_IMP(app_sendEvent), "v24@0:8@16"},
+        {"sendAction:to:from:", MM_IMP(app_sendAction), "B40@0:8:16@24@32"},
         {"postEvent:atStart:", MM_IMP(app_postEvent), "v32@0:8@16B24"},
         {"currentEvent", MM_IMP(app_currentEvent), "@16@0:8"},
-        {"runModalForWindow:", MM_IMP(app_runModalForWindow), "q24@0:8@16"});
+        {"runModalForWindow:", MM_IMP(app_runModalForWindow), "q24@0:8@16"},
+        {"modalWindow", MM_IMP(app_modalWindow), "@16@0:8"},
+        {"stopModal", MM_IMP(app_stopModal), "v16@0:8"},
+        {"stopModalWithCode:", MM_IMP(app_stopModalWithCode), "v24@0:8q16"},
+        {"abortModal", MM_IMP(app_abortModal), "v16@0:8"});
     for (const char *sel : {"setApplicationIconImage:", "hide:", "unhide:", "unhideAllApplications:", "arrangeInFront:",
                             "updateWindows", "registerForRemoteNotifications", "setServicesMenu:", "setWindowsMenu:",
-                            "setHelpMenu:", "orderFrontStandardAboutPanel:", "abortModal", "stopModal", "requestUserAttention:",
+                            "setHelpMenu:", "orderFrontStandardAboutPanel:", "requestUserAttention:",
                             "setPresentationOptions:", "disableRelaunchOnLogin", "replyToApplicationShouldTerminate:"})
         mm_objc_add_method(g_application, sel, MM_IMP(app_noop), "v24@0:8@16");
     MM_CLASS_METHODS(g_application, {"sharedApplication", MM_IMP(app_sharedApplication), "@16@0:8"});
@@ -579,9 +1003,19 @@ void register_application() {
         {"itemAtIndex:", MM_IMP(menu_itemAtIndex), "@24@0:8q16"},
         {"title", MM_IMP(menu_title), "@16@0:8"},
         {"setTitle:", MM_IMP(menu_setTitle), "v24@0:8@16"},
-        {"removeAllItems", MM_IMP(menu_removeAllItems), "v16@0:8"});
-    for (const char *sel : {"setAutoenablesItems:", "setDelegate:", "update", "cancelTracking", "removeItem:",
-                            "insertItem:atIndex:", "setSubmenu:forItem:", "popUpMenuPositioningItem:atLocation:inView:"})
+        {"removeAllItems", MM_IMP(menu_removeAllItems), "v16@0:8"},
+        {"insertItem:atIndex:", MM_IMP(menu_insertItem), "v32@0:8@16q24"},
+        {"removeItem:", MM_IMP(menu_removeItem), "v24@0:8@16"},
+        {"removeItemAtIndex:", MM_IMP(menu_removeItemAtIndex), "v24@0:8q16"},
+        {"itemWithTag:", MM_IMP(menu_itemWithTag), "@24@0:8q16"},
+        {"setSubmenu:forItem:", MM_IMP(menu_setSubmenu), "v32@0:8@16@24"},
+        {"setDelegate:", MM_IMP(menu_setDelegate), "v24@0:8@16"},
+        {"delegate", MM_IMP(menu_delegate), "@16@0:8"},
+        {"setAutoenablesItems:", MM_IMP(menu_setAutoenables), "v24@0:8B16"},
+        {"autoenablesItems", MM_IMP(menu_autoenables), "B16@0:8"},
+        {"update", MM_IMP(menu_update), "v16@0:8"},
+        {"performKeyEquivalent:", MM_IMP(menu_performKeyEquivalent), "B24@0:8@16"});
+    for (const char *sel : {"cancelTracking", "popUpMenuPositioningItem:atLocation:inView:"})
         mm_objc_add_method(g_menu, sel, MM_IMP(app_noop), "v24@0:8@16");
 
     g_menu_item = mm_objc_define_class("NSMenuItem", nsobject, sizeof(menu_item_object),
@@ -593,6 +1027,7 @@ void register_application() {
         {"title", MM_IMP(item_title), "@16@0:8"},
         {"setTitle:", MM_IMP(item_setTitle), "v24@0:8@16"},
         {"target", MM_IMP(item_target), "@16@0:8"},
+        {"menu", MM_IMP(item_menu), "@16@0:8"},
         {"setTarget:", MM_IMP(item_setTarget), "v24@0:8@16"},
         {"action", MM_IMP(item_action), ":16@0:8"},
         {"setAction:", MM_IMP(item_setAction), "v24@0:8:16"},
@@ -605,8 +1040,15 @@ void register_application() {
         {"tag", MM_IMP(item_tag), "q16@0:8"},
         {"setTag:", MM_IMP(item_setTag), "v24@0:8q16"},
         {"representedObject", MM_IMP(item_representedObject), "@16@0:8"},
-        {"setRepresentedObject:", MM_IMP(item_setRepresentedObject), "v24@0:8@16"});
-    for (const char *sel : {"setKeyEquivalent:", "setKeyEquivalentModifierMask:", "setImage:", "setHidden:",
+        {"setRepresentedObject:", MM_IMP(item_setRepresentedObject), "v24@0:8@16"},
+        {"keyEquivalent", MM_IMP(item_keyEquivalent), "@16@0:8"},
+        {"setKeyEquivalent:", MM_IMP(item_setKeyEquivalent), "v24@0:8@16"},
+        {"keyEquivalentModifierMask", MM_IMP(item_keyModifiers), "Q16@0:8"},
+        {"setKeyEquivalentModifierMask:", MM_IMP(item_setKeyModifiers), "v24@0:8Q16"},
+        {"isHidden", MM_IMP(item_isHidden), "B16@0:8"},
+        {"setHidden:", MM_IMP(item_setHidden), "v24@0:8B16"},
+        {"isSeparatorItem", MM_IMP(item_isSeparator), "B16@0:8"});
+    for (const char *sel : {"setImage:",
                             "setToolTip:", "setAttributedTitle:", "setIndentationLevel:", "setOnStateImage:"})
         mm_objc_add_method(g_menu_item, sel, MM_IMP(app_noop), "v24@0:8@16");
     MM_CLASS_METHODS(g_menu_item, {"separatorItem", MM_IMP(item_separatorItem), "@16@0:8"});
@@ -624,6 +1066,7 @@ void register_application() {
     };
     MM_METHODS(workspace,
         {"openURL:", MM_IMP(workspace_openURL), "B24@0:8@16"},
+        {"setIcon:forFile:options:", MM_IMP(workspace_setIcon), "B40@0:8@16@24Q32"},
         {"runningApplications", MM_IMP(+workspace_running_apps), "@16@0:8"},
         {"frontmostApplication", MM_IMP(+running_current_of_workspace), "@16@0:8"});
     static auto workspace_center = [](id, SEL) -> std::uint64_t {
@@ -706,10 +1149,7 @@ void register_application() {
         mm_objc_add_method(bundle, "loadNibNamed:owner:topLevelObjects:", MM_IMP(+nib_load_top), "B40@0:8@16@24^@32");
     }
 
-    Class save = mm_objc_define_class("NSSavePanel", cls("NSPanel"), sizeof(window_object),
-                                      MM_FW_CLASS_REF(NSSavePanel), MM_FW_META_REF(NSSavePanel));
-    Class open = mm_objc_define_class("NSOpenPanel", save, sizeof(window_object), MM_FW_CLASS_REF(NSOpenPanel), MM_FW_META_REF(NSOpenPanel));
-    for (Class c : {save, open}) MM_METHODS(c, {"runModal", MM_IMP(panel_runModal), "q16@0:8"});
+
 }
 
 } // namespace ak

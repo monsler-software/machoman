@@ -121,7 +121,7 @@ struct task_object {
     id standard_output = nullptr, standard_error = nullptr, standard_input = nullptr;
     id termination_handler = nullptr;
     pid_t pid = -1;
-    int status = 0;
+    int status = 0, launch_error = 0;
     bool running = false, launched = false;
     ~task_object() {
         release(environment);
@@ -258,6 +258,12 @@ std::uint64_t task_launch(id self, SEL) {
      * started: through machoman, with the same venv. The runtime publishes
      * both in the environment (mm_runtime_launch). */
     if (is_macho(t->path)) {
+        if (std::getenv("MACHOMAN_DISABLE_GUEST_SUBPROCESSES")) {
+            std::fprintf(stderr, "Foundation: NSTask: guest helper disabled for this diagnostic run: %s\n", t->path.c_str());
+            t->launch_error = ENOMEM;
+            t->status = 127;
+            return 0;
+        }
         const char *launcher = std::getenv("MACHOMAN_EXE");
         const char *venv = std::getenv("MACHOMAN_VENV");
         if (!launcher || !venv) {
@@ -283,7 +289,12 @@ std::uint64_t task_launch(id self, SEL) {
 }
 std::uint64_t task_launchAndReturnError(id self, SEL, id *error) {
     task_launch(self, nullptr);
-    if (error) *error = nullptr;
+    if (error) {
+        *error = nullptr;
+        if (tk(self)->launch_error)
+            *error = obj(send(reinterpret_cast<id>(cls("NSError")), "errorWithDomain:code:userInfo:",
+                              ret(autorelease(string_from_utf8("NSPOSIXErrorDomain"))), tk(self)->launch_error, 0));
+    }
     return tk(self)->launched ? 1 : 0;
 }
 std::uint64_t task_waitUntilExit(id self, SEL) {

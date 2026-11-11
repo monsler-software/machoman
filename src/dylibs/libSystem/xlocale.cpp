@@ -4,8 +4,10 @@
  * are glibc's; everything below maps constants and routes the "_l" forms
  * through uselocale(). */
 #include "internal.h"
+#include "machoman/objc_host.h"
 
 #include <clocale>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,7 @@
 #include <cwchar>
 #include <langinfo.h>
 #include <locale.h>
+#include <new>
 
 namespace {
 
@@ -45,9 +48,15 @@ int mask_from_darwin(int m) {
 
 /* Runs `fn` with `loc` as the calling thread's locale. */
 template <typename F> auto with_locale(locale_t loc, F fn) {
-    const locale_t old = uselocale(loc ? loc : LC_GLOBAL_LOCALE);
+    /* Darwin accepts NULL as the current thread locale. glibc's *_l
+     * functions dereference it, and also reject LC_GLOBAL_LOCALE. Calling
+     * the ordinary function under the selected thread locale handles both. */
+    if (!loc) return fn();
+    const locale_t old = uselocale(loc);
     auto r = fn();
+    const int result_errno = errno;
     uselocale(old);
+    errno = result_errno;
     return r;
 }
 
@@ -128,7 +137,35 @@ darwin_lconv *darwin_localeconv_l(locale_t loc) { return with_locale(loc, [] { r
 char *darwin_nl_langinfo(int item) DARWIN(nl_langinfo);
 char *darwin_nl_langinfo(int item) { return nl_langinfo(langinfo_item_from_darwin(item)); }
 char *darwin_nl_langinfo_l(int item, locale_t loc) DARWIN(nl_langinfo_l);
-char *darwin_nl_langinfo_l(int item, locale_t loc) { return nl_langinfo_l(langinfo_item_from_darwin(item), loc ? loc : LC_GLOBAL_LOCALE); }
+char *darwin_nl_langinfo_l(int item, locale_t loc) {
+    return with_locale(loc, [&] { return nl_langinfo(langinfo_item_from_darwin(item)); });
+}
+
+/* Numeric conversions: NULL locales are used by Live's preferences parser. */
+double darwin_strtod_l(const char *s, char **end, locale_t loc) DARWIN(strtod_l);
+double darwin_strtod_l(const char *s, char **end, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtod(s, end); });
+}
+float darwin_strtof_l(const char *s, char **end, locale_t loc) DARWIN(strtof_l);
+float darwin_strtof_l(const char *s, char **end, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtof(s, end); });
+}
+long darwin_strtol_l(const char *s, char **end, int base, locale_t loc) DARWIN(strtol_l);
+long darwin_strtol_l(const char *s, char **end, int base, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtol(s, end, base); });
+}
+unsigned long darwin_strtoul_l(const char *s, char **end, int base, locale_t loc) DARWIN(strtoul_l);
+unsigned long darwin_strtoul_l(const char *s, char **end, int base, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtoul(s, end, base); });
+}
+long long darwin_strtoll_l(const char *s, char **end, int base, locale_t loc) DARWIN(strtoll_l);
+long long darwin_strtoll_l(const char *s, char **end, int base, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtoll(s, end, base); });
+}
+unsigned long long darwin_strtoull_l(const char *s, char **end, int base, locale_t loc) DARWIN(strtoull_l);
+unsigned long long darwin_strtoull_l(const char *s, char **end, int base, locale_t loc) {
+    return with_locale(loc, [&] { return std::strtoull(s, end, base); });
+}
 
 /* Multibyte "_l" forms glibc does not have. */
 int darwin_mbtowc_l(wchar_t *pwc, const char *s, std::size_t n, locale_t loc) DARWIN(mbtowc_l);
@@ -260,23 +297,50 @@ int darwin_istype_l(int c, unsigned long f, locale_t) { return darwin_maskrune(c
 /* ---- os_log: messages go to stderr when MACHOMAN_OSLOG is set ----------- */
 
 namespace {
-struct os_log_object { const char *subsystem; const char *category; };
-os_log_object g_default_log{"default", ""};
+struct os_log_object {
+    mm_objc_object object;
+    std::string subsystem;
+    std::string category;
+};
+void os_log_dealloc(mm_id self, mm_SEL) {
+    reinterpret_cast<os_log_object *>(self)->~os_log_object();
+    mm_objc_free_instance(self);
+}
+mm_objc_class *os_log_class() {
+    static mm_objc_class storage{}, metaclass{};
+    static auto *cls = [] {
+        auto *c = mm_objc_define_class("OS_os_log", mm_objc_class_named("NSObject"),
+            sizeof(os_log_object), &storage, &metaclass);
+        mm_objc_add_method(c, "dealloc", reinterpret_cast<void *>(&os_log_dealloc), "v16@0:8");
+        return c;
+    }();
+    return cls;
+}
+/* Allocated handles inherit NSObject's ARC methods and destroy their owned
+ * strings on the final release. The exported static handles remain alive. */
+bool is_log_object(const void *p) {
+    if (!p) return false;
+    mm_objc_class *isa;
+    std::memcpy(&isa, p, sizeof isa);
+    return isa == os_log_class();
+}
 bool oslog_enabled() { static const bool on = std::getenv("MACHOMAN_OSLOG") != nullptr; return on; }
 } // namespace
 
 extern "C" {
 
-__attribute__((visibility("default"))) os_log_object *os_log_default_ptr __asm__("__os_log_default") = &g_default_log;
-__attribute__((visibility("default"))) os_log_object *os_log_disabled_ptr __asm__("__os_log_disabled") = nullptr;
+/* Darwin exports the objects themselves: OS_LOG_DEFAULT is their address. */
+__attribute__((visibility("default"))) os_log_object darwin_os_log_default __asm__("__os_log_default"){{os_log_class()}, "default", ""};
+__attribute__((visibility("default"))) os_log_object darwin_os_log_disabled __asm__("__os_log_disabled"){{os_log_class()}, "disabled", ""};
 
 os_log_object *darwin_os_log_create(const char *subsystem, const char *category) DARWIN(os_log_create);
 os_log_object *darwin_os_log_create(const char *subsystem, const char *category) {
-    auto *l = new os_log_object{subsystem, category};
-    return l;
+    auto *cls = os_log_class();
+    auto *storage = mm_objc_alloc(cls, 0);
+    return new (storage) os_log_object{{cls}, subsystem ? subsystem : "", category ? category : ""};
 }
 int darwin_os_log_type_enabled(os_log_object *, std::uint8_t) DARWIN(os_log_type_enabled);
-int darwin_os_log_type_enabled(os_log_object *, std::uint8_t) { return oslog_enabled(); }
+int darwin_os_log_type_enabled(os_log_object *log, std::uint8_t) { return log != &darwin_os_log_disabled && oslog_enabled(); }
 
 /* _os_log_impl(dso, log, type, format, buf, size). The buffer holds the
  * arguments Apple's encoder produced: a summary byte, a count byte, then
@@ -287,7 +351,7 @@ void darwin_os_log_impl(void *, os_log_object *log, std::uint8_t type, const cha
                         std::uint32_t buflen) DARWIN(_os_log_impl);
 void darwin_os_log_impl(void *, os_log_object *log, std::uint8_t type, const char *format, std::uint8_t *buf,
                         std::uint32_t buflen) {
-    if (!oslog_enabled()) return;
+    if (!oslog_enabled() || log == &darwin_os_log_disabled) return;
     std::string out;
     const char *f = format ? format : "";
     std::uint32_t at = buf && buflen >= 2 ? 2u : buflen; /* skip summary and count */
@@ -341,8 +405,8 @@ void darwin_os_log_impl(void *, os_log_object *log, std::uint8_t type, const cha
         }
         i = j + 1;
     }
-    std::fprintf(stderr, "os_log[%s%s%s type=%u]: %s\n", log && log->subsystem ? log->subsystem : "",
-                 log && log->category && *log->category ? ":" : "", log && log->category ? log->category : "",
+    std::fprintf(stderr, "os_log[%s%s%s type=%u]: %s\n", log ? log->subsystem.c_str() : "",
+                 log && !log->category.empty() ? ":" : "", log ? log->category.c_str() : "",
                  type, out.c_str());
 }
 void darwin_os_log_error_impl(void *dso, os_log_object *log, std::uint8_t type, const char *format, std::uint8_t *buf, std::uint32_t n) DARWIN(_os_log_error_impl);
@@ -358,9 +422,14 @@ void darwin_os_log_debug_impl(void *dso, os_log_object *log, std::uint8_t type, 
     darwin_os_log_impl(dso, log, type, format, buf, n);
 }
 void darwin_os_release(void *p) DARWIN(os_release);
-void darwin_os_release(void *p) { (void)p; }
+void darwin_os_release(void *p) {
+    if (is_log_object(p)) mm_objc_release(reinterpret_cast<mm_id>(p));
+}
 void *darwin_os_retain(void *p) DARWIN(os_retain);
-void *darwin_os_retain(void *p) { return p; }
+void *darwin_os_retain(void *p) {
+    if (is_log_object(p)) mm_objc_retain(reinterpret_cast<mm_id>(p));
+    return p;
+}
 std::uint64_t darwin_os_signpost_id_generate(os_log_object *) DARWIN(os_signpost_id_generate);
 std::uint64_t darwin_os_signpost_id_generate(os_log_object *) { return 1; }
 int darwin_os_signpost_enabled(os_log_object *) DARWIN(os_signpost_enabled);

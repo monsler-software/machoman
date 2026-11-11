@@ -1,5 +1,6 @@
 /* machoman CLI — ties the three layers together:
  *   machoman venv-init  <dir>                 (layer 1)
+ *   machoman install    <venv-dir> <dmg>     (layer 1, app bundles)
  *   machoman inspect    <arm64-macho-binary>  (parsing, used by layers 2 & 3)
  *   machoman translate  <arm64-macho-binary>  (layer 2)
  *   machoman run        <venv-dir> <binary>   (layer 3, straight-line leaf code only)
@@ -16,12 +17,15 @@
 #include <print>
 #include <string_view>
 #include <vector>
+#include <chrono>
+#include "machoman/translation_cache.h"
 
 #include "machoman/arch/arm64_decoder.h"
 #include "machoman/macho.h"
 #include "machoman/runtime.h"
 #include "machoman/translator.h"
 #include "machoman/venv.h"
+#include "machoman/install.h"
 
 namespace {
 
@@ -97,6 +101,42 @@ int cmd_venv_init(const char *dir) {
     return 0;
 }
 
+std::string shell_argument(std::string_view text) {
+    std::string quoted = "'";
+    for (char c : text) {
+        if (c == '\'') quoted += "'\\''";
+        else quoted += c;
+    }
+    return quoted + "'";
+}
+
+int cmd_install(const char *dir, const char *dmg, const char *argv0) {
+    mm_venv venv;
+    if (auto st = mm_venv_open(dir, venv); st != mm_venv_status::ok) {
+        std::println(stderr, "error: {}; create it with 'machoman venv-init <venv>' first", mm_venv_status_str(st));
+        return 1;
+    }
+    mm_install_result result;
+    std::error_code ec;
+    auto self = std::filesystem::weakly_canonical(argv0, ec);
+#ifdef __linux__
+    // argv[0] may be just "machoman" when the CLI is found through PATH.
+    self = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
+    mm_install_options options;
+    if (!ec) options.executable_directory = self.parent_path();
+    std::println("installing {}", dmg);
+    if (!mm_install_dmg(venv, dmg, result, options)) {
+        std::println(stderr, "error: {}", result.error);
+        return 1;
+    }
+    for (const auto &app : result.apps) {
+        std::println("installed {}", app.bundle.string());
+        std::println("  run: machoman run {} {}", shell_argument(dir), shell_argument(app.executable));
+    }
+    return 0;
+}
+
 void print_unsupported_stats(std::span<const std::uint8_t> text, const mm_translation_result &result) {
     std::map<std::string_view, std::size_t> by_class;
     for (const auto &n : result.notes) {
@@ -115,7 +155,7 @@ void print_unsupported_stats(std::span<const std::uint8_t> text, const mm_transl
         std::println("  {:<28} {:>10}  {:5.1f}%", name, count, 100.0 * static_cast<double>(count) / total);
 }
 
-int cmd_translate(const char *path, bool stats) {
+int cmd_translate(const char *path, bool stats, bool cache = false) {
     std::vector<std::uint8_t> data;
     mm_macho_image img;
     if (!load_image(path, data, img))
@@ -126,16 +166,26 @@ int cmd_translate(const char *path, bool stats) {
         std::println(stderr, "error: no __TEXT,__text section found");
         return 1;
     }
-    const auto text_bytes = img.section_bytes(*text);
+    const auto code = cache ? img.executable_code() : mm_macho_image::code_range{text->addr, img.section_bytes(*text)};
+    const auto text_bytes = code.bytes;
     if (text_bytes.empty()) {
         std::println(stderr, "error: __TEXT,__text lies outside the file");
         return 1;
     }
 
     mm_translation_result result;
-    const std::size_t n = mm_translate_buffer(text_bytes, text->addr, result);
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t n;
+    if (cache) {
+        const auto status = mm_translate_cached(path, data, text_bytes, code.addr, result);
+        n = result.notes.size();
+        std::println("translation cache: {} ({:.3f} s): {}", status == mm_cache_status::hit ? "hit" :
+                     status == mm_cache_status::stored ? "stored" : "bypassed",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                     mm_translation_cache_path(path).string());
+    } else n = mm_translate_buffer(text_bytes, code.addr, result);
 
-    std::println("translated {} instructions from __text ({} bytes)", n, text_bytes.size());
+    std::println("translated {} instructions from {} ({} bytes)", n, cache ? "executable sections" : "__text", text_bytes.size());
     std::println("emitted {} bytes of x86_64 code", result.code.size());
     std::println("unsupported: {} / {} instructions ({:.1f}%)", result.unsupported_count, n,
                  n ? 100.0 * static_cast<double>(result.unsupported_count) / static_cast<double>(n) : 0.0);
@@ -240,7 +290,8 @@ void usage(const char *argv0) {
                  "usage:\n"
                  "  {0} inspect <arm64-macho-binary>\n"
                  "  {0} venv-init <venv-dir>\n"
-                 "  {0} translate [--stats] <arm64-macho-binary>\n"
+                 "  {0} install <venv-dir> <path-to-dmg>\n"
+                 "  {0} translate [--stats] [--cache] <arm64-macho-binary>\n"
                  "  {0} run [-e KEY=VALUE]... <venv-dir> <binary-within-venv> [args...]\n"
                  "  {0} disasm <arm64-macho-binary> <va> [count]\n\n"
                  "environment:\n"
@@ -265,10 +316,18 @@ int main(int argc, char **argv) {
         return cmd_inspect(argv[2]);
     if (cmd == "venv-init" && argc == 3)
         return cmd_venv_init(argv[2]);
-    if (cmd == "translate" && argc == 3)
-        return cmd_translate(argv[2], false);
-    if (cmd == "translate" && argc == 4 && std::string_view(argv[2]) == "--stats")
-        return cmd_translate(argv[3], true);
+    if (cmd == "install" && argc == 4)
+        return cmd_install(argv[2], argv[3], argv[0]);
+    if (cmd == "translate") {
+        bool stats = false, cache = false;
+        int i = 2;
+        for (; i < argc - 1; ++i) {
+            if (std::string_view(argv[i]) == "--stats") stats = true;
+            else if (std::string_view(argv[i]) == "--cache") cache = true;
+            else break;
+        }
+        if (i == argc - 1) return cmd_translate(argv[i], stats, cache);
+    }
     if (cmd == "run") {
         /* `-e KEY=VALUE` assignments precede the venv; everything after the
          * binary belongs to the guest, options included. */

@@ -3,13 +3,17 @@
  * this walks an arm64 Mach-O's executable segments ahead of time and
  * produces x86_64 machine code, so layer 3 can run it natively on a
  * Windows/Linux x86_64 host with no per-instruction interpretation at
- * run time. Static/AOT (not a JIT) by design: translate once at venv
- * build/import time, cache the result, run it many times.
+ * run time. At launch the loader reads a disk cache beside the source
+ * Mach-O, or translates and stores it on a miss. The CLI can populate
+ * the same cache with translate --cache.
  *
  * Execution model of the emitted code:
  *   - The guest register file lives in memory (mm_cpu_context). Host r15
  *     points at it for the whole run; every translated instruction loads
- *     its operands from there and stores its result back. This costs a few
+ *     its operands from there and stores its result back. Native FP chains
+ *     can reuse clean V results in xmm4/5; independent instruction entries
+ *     preload those copies from context in separate out-of-line stubs.
+ *     This costs a few
  *     memory ops per instruction but makes the translation exact: no
  *     aliasing between guest registers, XZR/SP resolved per opcode, and
  *     the host's callee-saved registers untouched except r15.
@@ -17,10 +21,12 @@
  *   - Guest SP is context.x[31]; the host stack is never used by guest code.
  *   - NZCV lives in context.eflags as a host EFLAGS image, saved with
  *     pushf right after every flag-setting guest instruction and restored
- *     with popf right before every consumer. Convention: CF holds NOT C
+ *     with popf before carry/conditional-select consumers. B.cond tests
+ *     the stored NZCV bits directly, avoiding a host RFLAGS restore.
+ *     Convention: CF holds NOT C
  *     (x86 "borrow" sense), so a sub/cmp saves its flags as-is, an add/cmn
  *     saves after `cmc`, and a logical op after `stc`. Every A64 condition
- *     then maps to a single jcc/cmovcc.
+ *     maps to jcc/cmovcc after the appropriate flag test or restore.
  *   - Direct branches become rel32 jumps to the translated target. Indirect
  *     ones (ret/br/blr) go through a dispatch stub that maps the guest VA to
  *     a host address via context.branch_table. Anything that cannot
@@ -86,6 +92,7 @@ struct alignas(16) mm_cpu_context {
     std::uint64_t tpidr_el0 = 0, tpidrro_el0 = 0;
     alignas(16) std::uint64_t v[32][2] = {}; /* SIMD&FP registers, little-endian 128-bit: v[n][0] = bits 63:0 */
     const std::uint64_t *branch_table = nullptr; /* L1 of the code map (see MM_CODE_MAP_*) */
+    std::uint32_t host_result_in_context = 0; /* dispatcher supplied FP results; mm_hostcall must preserve them */
 };
 
 struct mm_translate_note {
@@ -93,6 +100,7 @@ struct mm_translate_note {
     std::uint64_t output_offset; /* byte offset within result.code where this insn's encoding starts */
     mm_a64_opcode op;
     bool          supported;     /* false if the decoder/encoder couldn't handle it */
+    std::uint64_t entry_offset = 0; /* independent-entry preload; 0 means output_offset */
 };
 
 struct mm_translation_result {
@@ -114,5 +122,7 @@ struct mm_translation_result {
  * as ISA coverage grows. */
 std::size_t mm_translate_buffer(std::span<const std::uint8_t> arm64_code, std::uint64_t base_va,
                                 mm_translation_result &result);
+/* Write-through SIMD register residency; opt out for differential checks. */
+bool mm_register_cache_enabled();
 
 #endif /* MACHOMAN_TRANSLATOR_H */

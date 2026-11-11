@@ -1,8 +1,8 @@
 /* Socket options.
  *
  * The BSD socket calls themselves are the same on both systems — same
- * argument order, same `sockaddr`, same `SOCK_STREAM` — so they reach the
- * host libc unchanged. The option *names* are not: Darwin's SOL_SOCKET is
+ * argument order and same `SOCK_STREAM`. Addresses and resolver results
+ * are translated below. The option *names* differ: Darwin's SOL_SOCKET is
  * 0xffff where Linux's is 1, and every SO_ constant differs, so a
  * setsockopt that is not translated fails with an error the caller reads
  * as "this system is broken" (nanomsg aborts on it).
@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -187,9 +189,124 @@ void address_to_darwin(const sockaddr_storage &from, socklen_t from_length, void
     *length = size;
 }
 
+/* Darwin places ai_canonname before ai_addr; Linux reverses them. Returning
+ * libc's list directly makes the guest dereference a NULL canonical name
+ * as its sockaddr, as Python's socket.getaddrinfo did during Live startup. */
+struct darwin_addrinfo {
+    int flags, family, socktype, protocol;
+    socklen_t addrlen;
+    char *canonname;
+    void *addr;
+    darwin_addrinfo *next;
+};
+static_assert(sizeof(darwin_addrinfo) == 48 && offsetof(darwin_addrinfo, addr) == 32);
+
+struct resolver_error { int host, darwin; };
+constexpr resolver_error resolver_errors[] = {
+    {EAI_AGAIN, 2}, {EAI_BADFLAGS, 3}, {EAI_FAIL, 4}, {EAI_FAMILY, 5},
+    {EAI_MEMORY, 6}, {EAI_NONAME, 8}, {EAI_SERVICE, 9}, {EAI_SOCKTYPE, 10},
+    {EAI_SYSTEM, 11}, {EAI_OVERFLOW, 14},
+#ifdef EAI_ADDRFAMILY
+    {EAI_ADDRFAMILY, 1},
+#endif
+#ifdef EAI_NODATA
+    {EAI_NODATA, 7},
+#endif
+};
+int resolver_error_to_darwin(int code) {
+    if (!code) return 0;
+    for (auto error : resolver_errors) if (error.host == code) return error.darwin;
+    return 4;
+}
+int resolver_flags_to_host(int flags) {
+    int out = flags & 7; /* AI_PASSIVE, AI_CANONNAME, AI_NUMERICHOST match */
+    if (flags & 0x100) out |= AI_ALL;
+    if (flags & (0x200 | 0x800)) out |= AI_V4MAPPED;
+    if (flags & 0x400) out |= AI_ADDRCONFIG;
+    if (flags & 0x1000) out |= AI_NUMERICSERV;
+    return out;
+}
+void free_darwin_addrinfo(darwin_addrinfo *list) {
+    while (list) {
+        auto *next = list->next;
+        std::free(list->addr); std::free(list->canonname); std::free(list);
+        list = next;
+    }
+}
+
 } // namespace
 
 extern "C" {
+
+int darwin_getaddrinfo(const char *name, const char *service, const darwin_addrinfo *hints,
+                       darwin_addrinfo **result) DARWIN(getaddrinfo);
+int darwin_getaddrinfo(const char *name, const char *service, const darwin_addrinfo *hints,
+                       darwin_addrinfo **result) {
+    if (!result) return 4;
+    *result = nullptr;
+    addrinfo host_hints{};
+    if (hints) {
+        if (hints->flags & ~0x10001f07) return 3;
+        host_hints.ai_flags = resolver_flags_to_host(hints->flags);
+        host_hints.ai_family = family_to_host(hints->family);
+        host_hints.ai_socktype = hints->socktype;
+        host_hints.ai_protocol = hints->protocol;
+    }
+    addrinfo *host = nullptr;
+    const int rc = ::getaddrinfo(name, service, hints ? &host_hints : nullptr, &host);
+    if (rc) return resolver_error_to_darwin(rc);
+    darwin_addrinfo *head = nullptr, **tail = &head;
+    int error = 0;
+    for (auto *entry = host; entry; entry = entry->ai_next) {
+        auto *node = static_cast<darwin_addrinfo *>(std::calloc(1, sizeof(darwin_addrinfo)));
+        if (!node) { error = 6; break; }
+        *tail = node; tail = &node->next;
+        node->flags = hints ? hints->flags : 0;
+        node->family = family_to_darwin(entry->ai_family);
+        node->socktype = entry->ai_socktype; node->protocol = entry->ai_protocol;
+        if (entry->ai_canonname) {
+            node->canonname = ::strdup(entry->ai_canonname);
+            if (!node->canonname) { error = 6; break; }
+        }
+        if (entry->ai_addr) {
+            if (entry->ai_addrlen > sizeof(sockaddr_storage)) { error = 5; break; }
+            sockaddr_storage address{};
+            std::memcpy(&address, entry->ai_addr, entry->ai_addrlen);
+            node->addr = std::calloc(1, sizeof(sockaddr_storage));
+            if (!node->addr) { error = 6; break; }
+            node->addrlen = sizeof(sockaddr_storage);
+            address_to_darwin(address, entry->ai_addrlen, node->addr, &node->addrlen);
+        }
+    }
+    ::freeaddrinfo(host);
+    if (error) { free_darwin_addrinfo(head); return error; }
+    *result = head;
+    return 0;
+}
+void darwin_freeaddrinfo(darwin_addrinfo *list) DARWIN(freeaddrinfo);
+void darwin_freeaddrinfo(darwin_addrinfo *list) { free_darwin_addrinfo(list); }
+const char *darwin_gai_strerror(int code) DARWIN(gai_strerror);
+const char *darwin_gai_strerror(int code) {
+    for (auto error : resolver_errors) if (error.darwin == code) return ::gai_strerror(error.host);
+    return code ? "Unknown address resolution error" : "Success";
+}
+int darwin_getnameinfo(const void *address, socklen_t length, char *name, socklen_t name_size,
+                      char *service, socklen_t service_size, int flags) DARWIN(getnameinfo);
+int darwin_getnameinfo(const void *address, socklen_t length, char *name, socklen_t name_size,
+                      char *service, socklen_t service_size, int flags) {
+    if (flags & ~0x13f) return 3;
+    int host_flags = 0;
+    if (flags & 1) host_flags |= NI_NOFQDN;
+    if (flags & 2) host_flags |= NI_NUMERICHOST;
+    if (flags & 4) host_flags |= NI_NAMEREQD;
+    if (flags & 8) host_flags |= NI_NUMERICSERV;
+    if (flags & 16) host_flags |= NI_DGRAM;
+    sockaddr_storage host{};
+    const socklen_t host_length = address_to_host(address, length, host);
+    if (!host_length) return 5;
+    return resolver_error_to_darwin(::getnameinfo(reinterpret_cast<const sockaddr *>(&host), host_length,
+        name, name_size, service, service_size, host_flags));
+}
 
 int darwin_socket(int domain, int type, int protocol) DARWIN(socket);
 int darwin_socket(int domain, int type, int protocol) { return ::socket(family_to_host(domain), type, protocol); }

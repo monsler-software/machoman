@@ -9,6 +9,7 @@
 #define MACHOMAN_VENV_H
 
 #include <filesystem>
+#include <string>
 #include <string_view>
 
 enum class mm_venv_status {
@@ -26,6 +27,7 @@ inline constexpr std::string_view MM_VENV_DIR_ORIGINAL   = "original";          
 inline constexpr std::string_view MM_VENV_DIR_USR_LIB    = "usr/lib";                   /* flat-namespace dylib stubs */
 inline constexpr std::string_view MM_VENV_DIR_FRAMEWORKS = "System/Library/Frameworks"; /* framework bundle stubs */
 inline constexpr std::string_view MM_VENV_MANIFEST_FILE  = "machoman-venv.json";
+inline constexpr std::string_view MM_VENV_LAUNCHER_MAGIC = "machoman-app-v1";
 
 struct mm_venv {
     std::filesystem::path root;
@@ -48,6 +50,10 @@ mm_venv_status mm_venv_open(const std::filesystem::path &root_path, mm_venv &out
  * install name as found in LC_LOAD_DYLIB (e.g. "/usr/lib/libSystem.B.dylib")
  * and stores the stub by its basename. */
 mm_venv_status mm_venv_register_dylib_stub(const mm_venv &venv, std::string_view dylib_name);
+
+/* Resolve normal binaries/symlinks and portable app launch records.
+ * Relative records keep resource lookup working after a venv is moved. */
+std::filesystem::path mm_venv_resolve_executable(const mm_venv &, std::string_view binary, std::string &error);
 
 const char *mm_venv_status_str(mm_venv_status status);
 

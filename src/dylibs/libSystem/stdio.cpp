@@ -294,8 +294,9 @@ int darwin_asprintf_l(char **out, void *, const char *fmt, ...) {
     return static_cast<int>(s.size());
 }
 
-int darwin_snprintf_chk(char *dst, int, std::size_t size, const char *fmt, ...) DARWIN(__snprintf_chk);
-int darwin_snprintf_chk(char *dst, int, std::size_t size, const char *fmt, ...) {
+int darwin_snprintf_chk(char *dst, std::size_t size, int, std::size_t capacity, const char *fmt, ...) DARWIN(__snprintf_chk);
+int darwin_snprintf_chk(char *dst, std::size_t size, int, std::size_t capacity, const char *fmt, ...) {
+    if (capacity != static_cast<std::size_t>(-1) && size > capacity) std::abort();
     return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site()));
 }
 

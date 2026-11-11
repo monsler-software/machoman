@@ -4,12 +4,16 @@
  * NSUUID, the run loop, geometry helpers and the well-known constant
  * strings the guest binds to by symbol. */
 #include "foundation.h"
+#include "machoman/host_filesystem.h"
+#include <sys/statvfs.h>
 #include "synthesise.h"
+#include "machoman/runtime.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <cstdio>
@@ -18,9 +22,13 @@
 #include <ctime>
 #include <dirent.h>
 #include <mutex>
+#include <memory>
+#include <unordered_map>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <atomic>
+#include <fcntl.h>
 
 extern "C" {
 void *objc_autoreleasePoolPush_() __asm__("_objc_autoreleasePoolPush");
@@ -36,10 +44,10 @@ id search_path_directories(std::uint64_t directory);
 /* Class storage the guest binds to: external linkage, so not inside the
  * anonymous namespace below. */
 FND_CLASS(NSURL); FND_CLASS(NSError); FND_CLASS(NSBundle); FND_CLASS(NSUserDefaults); FND_CLASS(NSProcessInfo);
-FND_CLASS(NSFileManager); FND_CLASS(NSLocale); FND_CLASS(NSUUID); FND_CLASS(NSRunLoop); FND_CLASS(NSDate);
+FND_CLASS(NSFileManager); FND_CLASS(NSLocale); FND_CLASS(NSUUID); FND_CLASS(NSRunLoop);
 FND_CLASS(NSAppleEventManager);
 FND_CLASS(NSNotificationCenter); FND_CLASS(NSDistributedNotificationCenter); FND_CLASS(NSNotification); FND_CLASS(NSException);
-FND_CLASS(NSAutoreleasePool); FND_CLASS(NSThread); FND_CLASS(NSTimer); FND_CLASS(NSOperationQueue); FND_CLASS(NSCharacterSet);
+FND_CLASS(NSAutoreleasePool); FND_CLASS(NSTimer); FND_CLASS(NSOperationQueue); FND_CLASS(NSCharacterSet);
 
 namespace {
 
@@ -47,8 +55,8 @@ const mm_host_api *g_api = nullptr;
 bool g_trace = false;
 
 
-Class g_url, g_error, g_bundle, g_defaults, g_processinfo, g_filemanager, g_locale, g_uuid, g_runloop, g_date,
-    g_apple_event_manager, g_notification_center, g_distributed_center, g_notification, g_exception, g_pool, g_thread, g_timer, g_opqueue, g_charset;
+Class g_url, g_error, g_bundle, g_defaults, g_processinfo, g_filemanager, g_locale, g_uuid, g_runloop,
+    g_apple_event_manager, g_notification_center, g_distributed_center, g_notification, g_exception, g_pool, g_timer, g_opqueue, g_charset;
 
 /* ---- allocators ---------------------------------------------------------- */
 
@@ -115,6 +123,8 @@ extern EXPORT id NSFileTypeDirectory_ __asm__("_NSFileTypeDirectory");
 extern EXPORT id NSFileTypeRegular_ __asm__("_NSFileTypeRegular");
 extern EXPORT id NSKeyValueChangeNewKey_ __asm__("_NSKeyValueChangeNewKey");
 extern EXPORT id NSKeyValueChangeOldKey_ __asm__("_NSKeyValueChangeOldKey");
+extern EXPORT id NSKeyValueChangeKindKey_ __asm__("_NSKeyValueChangeKindKey");
+extern EXPORT id NSKeyValueChangeNotificationIsPriorKey_ __asm__("_NSKeyValueChangeNotificationIsPriorKey");
 extern EXPORT id kCFNumberFormatterMinFractionDigits_ __asm__("_kCFNumberFormatterMinFractionDigits");
 extern EXPORT id kCFNumberFormatterMaxFractionDigits_ __asm__("_kCFNumberFormatterMaxFractionDigits");
 extern EXPORT id kCFLocaleIdentifier_ __asm__("_kCFLocaleIdentifier");
@@ -127,7 +137,8 @@ id kCFRunLoopDefaultMode_, kCFRunLoopCommonModes_, NSDefaultRunLoopMode_, NSRunL
     kCFPreferencesAnyUser_, kCFPreferencesCurrentUser_, kCFURLIsHiddenKey_, kCFURLIsPackageKey_, kCFURLIsDirectoryKey_,
     kCFURLVolumeIdentifierKey_, kCFURLNameKey_, kCFURLPathKey_, NSURLVolumeIsLocalKey_, NSURLIsDirectoryKey_,
     NSFileHFSCreatorCode_, NSFileHFSTypeCode_, NSFileImmutable_, NSFileSize_, NSFileType_, NSFileTypeDirectory_,
-    NSFileTypeRegular_, NSKeyValueChangeNewKey_, NSKeyValueChangeOldKey_, kCFNumberFormatterMinFractionDigits_,
+    NSFileTypeRegular_, NSKeyValueChangeNewKey_, NSKeyValueChangeOldKey_, NSKeyValueChangeKindKey_,
+    NSKeyValueChangeNotificationIsPriorKey_, kCFNumberFormatterMinFractionDigits_,
     kCFNumberFormatterMaxFractionDigits_, kCFLocaleIdentifier_, kCFLocaleDecimalSeparator_;
 
 void init_constant_strings() {
@@ -150,6 +161,7 @@ void init_constant_strings() {
         {"NSFileHFSTypeCode", &NSFileHFSTypeCode_}, {"NSFileImmutable", &NSFileImmutable_}, {"NSFileSize", &NSFileSize_},
         {"NSFileType", &NSFileType_}, {"NSFileTypeDirectory", &NSFileTypeDirectory_}, {"NSFileTypeRegular", &NSFileTypeRegular_},
         {"new", &NSKeyValueChangeNewKey_}, {"old", &NSKeyValueChangeOldKey_},
+        {"kind", &NSKeyValueChangeKindKey_}, {"notificationIsPrior", &NSKeyValueChangeNotificationIsPriorKey_},
         {"kCFNumberFormatterMinFractionDigits", &kCFNumberFormatterMinFractionDigits_},
         {"kCFNumberFormatterMaxFractionDigits", &kCFNumberFormatterMaxFractionDigits_},
         {"kCFLocaleIdentifier", &kCFLocaleIdentifier_}, {"kCFLocaleDecimalSeparator", &kCFLocaleDecimalSeparator_},
@@ -161,7 +173,18 @@ void init_constant_strings() {
 
 /* Only file:// URLs matter to Live; the object keeps the absolute path and
  * whether it denotes a directory. */
-struct url_object { mm_objc_object base; std::string path; std::string scheme{"file"}; bool is_dir = false; };
+std::atomic<std::uint64_t> url_cache_generation{0};
+struct url_cached_value { id value = nullptr; bool temporary = false, cocoa = false; std::uint64_t generation = 0; };
+struct url_object {
+    mm_objc_object base;
+    std::string path;
+    std::string scheme{"file"};
+    bool is_dir = false;
+    std::recursive_mutex resource_mutex;
+    std::unordered_map<std::string, url_cached_value> resources;
+    std::uint64_t resource_generation = 0;
+    ~url_object() { for (auto &[key, entry] : resources) release(entry.value); }
+};
 
 url_object *u(id o) { return as<url_object>(o); }
 
@@ -251,7 +274,8 @@ id bookmark_data_for(const std::string &path) {
 bool bookmark_path(id data, std::string &out) {
     if (!is_data(data)) return false;
     const std::string &bytes = data_storage(data);
-    if (bytes.size() < bookmark_tag.size() || bytes.compare(0, bookmark_tag.size(), bookmark_tag) != 0) return false;
+    if (bytes.size() <= bookmark_tag.size() || bytes.compare(0, bookmark_tag.size(), bookmark_tag) != 0 ||
+        bytes.find('\0') != std::string::npos) return false;
     out = bytes.substr(bookmark_tag.size());
     return true;
 }
@@ -261,10 +285,29 @@ std::uint64_t url_bookmarkDataWithOptions(id self, SEL, std::uint64_t, id, id, i
 }
 std::uint64_t urlc_bookmarkDataWithContentsOfURL(id, SEL, id url, id *error) {
     if (error) *error = nullptr;
-    if (!is_url(url)) return 0;
-    return ret(autorelease(bookmark_data_for(u(url)->path)));
+    const auto fail = [&](std::int64_t code) -> std::uint64_t {
+        if (error) *error = autorelease(error_create(NSCocoaErrorDomain_, code, nullptr));
+        return 0;
+    };
+    if (!is_url(url) || u(url)->scheme != "file") return fail(262 /* NSFileReadUnsupportedSchemeError */);
+    std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(u(url)->path.c_str(), "rb"), &std::fclose);
+    if (!file) return fail(260 /* NSFileReadNoSuchFileError */);
+    /* This API reads a bookmark file; an ordinary file is not a bookmark
+     * just because it has a URL. Fabricating one made Live resolve the
+     * same text file repeatedly while canonicalising its preferences path. */
+    std::string bytes(bookmark_tag.size(), '\0');
+    const std::size_t header = std::fread(bytes.data(), 1, bytes.size(), file.get());
+    if (std::ferror(file.get())) return fail(256 /* NSFileReadUnknownError */);
+    if (header != bytes.size() || bytes != bookmark_tag) return fail(259 /* NSFileReadCorruptFileError */);
+    char buffer[4096];
+    for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file.get())) > 0;) bytes.append(buffer, n);
+    if (std::ferror(file.get())) return fail(256);
+    id data = data_create(bytes.data(), static_cast<CFIndex>(bytes.size()), false);
+    std::string path;
+    if (!bookmark_path(data, path)) { release(data); return fail(259); }
+    return ret(autorelease(data));
 }
-std::uint64_t urlc_URLByResolvingBookmarkData(id, SEL, id data, std::uint64_t, id, std::uint64_t *stale, id *error) {
+std::uint64_t urlc_URLByResolvingBookmarkData(id, SEL, id data, std::uint64_t, id, std::uint8_t *stale, id *error) {
     std::string path;
     if (stale) *stale = 0;
     if (!bookmark_path(data, path)) {
@@ -275,7 +318,7 @@ std::uint64_t urlc_URLByResolvingBookmarkData(id, SEL, id data, std::uint64_t, i
     if (error) *error = nullptr;
     return ret(autorelease(url_new(path, false)));
 }
-std::uint64_t url_initByResolvingBookmarkData(id self, SEL, id data, std::uint64_t, id, std::uint64_t *stale, id *error) {
+std::uint64_t url_initByResolvingBookmarkData(id self, SEL, id data, std::uint64_t, id, std::uint8_t *stale, id *error) {
     std::string path;
     if (stale) *stale = 0;
     if (!bookmark_path(data, path)) {
@@ -295,12 +338,182 @@ std::uint64_t urlc_resourceValuesForKeys(id, SEL, id, id data) {
     id d = dictionary_create(false);
     return ret(autorelease(d));
 }
-std::uint64_t urlc_writeBookmarkData(id, SEL, id, id, std::uint64_t, id *error) {
+std::uint64_t urlc_writeBookmarkData(id, SEL, id data, id url, std::uint64_t, id *error) {
     if (error) *error = nullptr;
-    return 0; /* no alias files: nothing reads them back */
+    std::string path;
+    if (!is_url(url) || u(url)->scheme != "file" || !bookmark_path(data, path)) {
+        if (error) *error = autorelease(error_create(NSCocoaErrorDomain_, 512 /* NSFileWriteUnknownError */, nullptr));
+        return 0;
+    }
+    FILE *file = std::fopen(u(url)->path.c_str(), "wb");
+    if (!file) {
+        if (error) *error = autorelease(error_create(NSCocoaErrorDomain_, 512, nullptr));
+        return 0;
+    }
+    const std::string &bytes = data_storage(data);
+    const bool written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
+    const bool closed = std::fclose(file) == 0;
+    if ((!written || !closed) && error) *error = autorelease(error_create(NSCocoaErrorDomain_, 512, nullptr));
+    return written && closed;
 }
 std::uint64_t urlc_fileURLWithPathIsDirectory(id, SEL, id path, std::uint64_t dir) { return ret(autorelease(url_new(to_utf8(path), dir != 0))); }
 std::uint64_t urlc_URLWithString(id c, SEL, id s) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "initWithString:", ret(s))))); }
+
+struct url_resource_snapshot {
+    struct stat st{}, link{};
+    struct statvfs volume{};
+    bool loaded = false, volume_loaded = false;
+    int failure = 0, volume_failure = 0;
+};
+id url_resource(id url, id key, id *error, bool *success = nullptr,
+                url_resource_snapshot *batch = nullptr, bool cocoa = false) {
+    if (error) *error = nullptr;
+    if (success) *success = false;
+    const auto fail = [&](std::int64_t code, int posix = 0) -> id {
+        if (error) {
+            id info = dictionary_create(false);
+            if (is_url(url)) { id path = string_from_utf8(u(url)->path); dictionary_set(info, constant_string("NSFilePath"), path); release(path); }
+            if (posix) { id underlying = error_create(NSPOSIXErrorDomain_, posix, nullptr); dictionary_set(info, NSUnderlyingErrorKey_, underlying); release(underlying); }
+            *error = autorelease(error_create(NSCocoaErrorDomain_, code, info)); release(info);
+        }
+        return nullptr;
+    };
+    if (!is_url(url) || !key) return fail(256);
+    if (u(url)->scheme != "file") return fail(262 /* unsupported scheme */);
+    auto *object = u(url);
+    std::lock_guard lock(object->resource_mutex);
+    const auto generation = url_cache_generation.load(std::memory_order_relaxed);
+    if (object->resource_generation != generation) for (auto it = object->resources.begin(); it != object->resources.end();) {
+        if (it->second.cocoa && !it->second.temporary && it->second.generation != generation) {
+            release(it->second.value); it = object->resources.erase(it);
+        } else ++it;
+    }
+    object->resource_generation = generation;
+    const auto k = to_utf8(key);
+    const bool main = cocoa && api() && api()->thread_self && api()->thread_self() == 1;
+    if (auto it = object->resources.find(k); it != object->resources.end()) {
+        if (main) { it->second.cocoa = true; it->second.generation = generation; }
+        if (success) *success = true;
+        return retain(it->second.value);
+    }
+    url_resource_snapshot local;
+    auto &snapshot = batch ? *batch : local;
+    const auto &path = object->path;
+    if (!snapshot.loaded) {
+        snapshot.loaded = true;
+        if (lstat(path.c_str(), &snapshot.link)) snapshot.failure = errno;
+        else if (stat(path.c_str(), &snapshot.st)) {
+            /* The link itself still has resource values when its target is absent. */
+            if (S_ISLNK(snapshot.link.st_mode)) snapshot.st = snapshot.link;
+            else snapshot.failure = errno;
+        }
+    }
+    if (snapshot.failure) return fail(snapshot.failure == EACCES || snapshot.failure == EPERM ? 257 :
+        snapshot.failure == ENOENT || snapshot.failure == ENOTDIR ? 260 : 256, snapshot.failure);
+    const auto &st = snapshot.st;
+    const auto obtain = [&]() -> id {
+    if (k == "NSURLIsDirectoryKey") return retain(number_bool(S_ISDIR(st.st_mode)));
+    if (k == "NSURLIsRegularFileKey") return retain(number_bool(S_ISREG(st.st_mode)));
+    if (k == "NSURLIsSymbolicLinkKey") return retain(number_bool(S_ISLNK(snapshot.link.st_mode)));
+    auto normalized = std::filesystem::path(path).lexically_normal();
+    if (normalized.filename().empty() && normalized != normalized.root_path()) normalized = normalized.parent_path();
+    const auto filename = normalized.filename().string();
+    if (k == "NSURLIsHiddenKey") return retain(number_bool(!filename.empty() && filename[0] == '.'));
+    if (k == "NSURLIsPackageKey") return retain(number_bool(S_ISDIR(st.st_mode) && (normalized.extension() == ".app" || normalized.extension() == ".bundle" || normalized.extension() == ".framework" || normalized.extension() == ".pkg")));
+    if (k == "NSURLIsApplicationKey") return retain(number_bool(S_ISDIR(st.st_mode) && normalized.extension() == ".app"));
+    if (k == "NSURLNameKey" || k == "NSURLLocalizedNameKey") return string_from_utf8(filename);
+    if (k == "NSURLPathKey") return string_from_utf8(path);
+    if (k == "NSURLParentDirectoryURLKey") return url_new(normalized.parent_path().string(), true);
+    if (k == "NSURLIsReadableKey") return retain(number_bool(access(path.c_str(), R_OK) == 0));
+    if (k == "NSURLIsWritableKey") return retain(number_bool(access(path.c_str(), W_OK) == 0));
+    if (k == "NSURLIsExecutableKey") return retain(number_bool(access(path.c_str(), X_OK) == 0));
+    if (k == "NSURLFileSizeKey" || k == "NSURLTotalFileSizeKey") return number_from_int64(st.st_size);
+    if (k == "NSURLFileAllocatedSizeKey" || k == "NSURLTotalFileAllocatedSizeKey") return number_from_int64(st.st_blocks * 512);
+    if (k == "NSURLLinkCountKey") return number_from_int64(st.st_nlink);
+    if (k == "NSURLVolumeIdentifierKey") return number_from_int64(st.st_dev);
+    if (k == "NSURLFileResourceIdentifierKey") {
+        const std::uint64_t identity[] = {st.st_dev, st.st_ino};
+        return data_create(identity, sizeof identity, false);
+    }
+    if (k == "NSURLContentModificationDateKey" || k == "NSURLContentAccessDateKey" || k == "NSURLCreationDateKey") {
+        auto t = k == "NSURLContentModificationDateKey" ? st.st_mtim : st.st_atim;
+        if (k == "NSURLCreationDateKey") {
+            struct statx birth{};
+            if (statx(AT_FDCWD, path.c_str(), 0, STATX_BTIME, &birth) || !(birth.stx_mask & STATX_BTIME)) return nullptr;
+            t.tv_sec = birth.stx_btime.tv_sec; t.tv_nsec = birth.stx_btime.tv_nsec;
+        }
+        const double seconds = t.tv_sec + t.tv_nsec / 1e9;
+        return date_from_epoch(seconds);
+    }
+    if (k.starts_with("NSURLVolume") || k == "NSURLIsVolumeKey") {
+        if (k == "NSURLVolumeURLKey" || k == "NSURLVolumeIsLocalKey" || k == "NSURLVolumeLocalizedFormatDescriptionKey" ||
+            k == "NSURLVolumeTypeNameKey" || k == "NSURLVolumeMountFromLocationKey" || k == "NSURLIsVolumeKey" || k == "NSURLVolumeIsRootFileSystemKey") {
+            const auto mount = mmfs::mount_for(path);
+            if (k == "NSURLVolumeURLKey") return url_new(mount.path, true);
+            if (k == "NSURLVolumeIsLocalKey") return retain(number_bool(mount.local));
+            if (k == "NSURLVolumeLocalizedFormatDescriptionKey" || k == "NSURLVolumeTypeNameKey") return string_from_utf8(mount.type);
+            if (k == "NSURLVolumeMountFromLocationKey") return string_from_utf8(mount.source);
+            if (k == "NSURLVolumeIsRootFileSystemKey") return retain(number_bool(mount.path == "/"));
+            std::error_code ec; const auto canonical = std::filesystem::canonical(path, ec);
+            return retain(number_bool(!ec && canonical.string() == mount.path));
+        }
+        if (k == "NSURLVolumeTotalCapacityKey" || k == "NSURLVolumeAvailableCapacityKey" || k == "NSURLVolumeIsReadOnlyKey") {
+            if (!snapshot.volume_loaded) {
+                snapshot.volume_loaded = true;
+                if (statvfs(path.c_str(), &snapshot.volume)) snapshot.volume_failure = errno;
+            }
+            if (snapshot.volume_failure) return fail(256, snapshot.volume_failure);
+            const auto &volume = snapshot.volume;
+            if (k == "NSURLVolumeTotalCapacityKey") return number_from_int64(volume.f_blocks * volume.f_frsize);
+            if (k == "NSURLVolumeAvailableCapacityKey") return number_from_int64(volume.f_bavail * volume.f_frsize);
+            if (k == "NSURLVolumeIsReadOnlyKey") return retain(number_bool(volume.f_flag & ST_RDONLY));
+        }
+    }
+    /* An unavailable property is a successful query with a nil value. */
+    return nullptr;
+    };
+    id value = obtain();
+    if (snapshot.volume_failure) return nullptr;
+    object->resources.emplace(k, url_cached_value{retain(value), false, main, generation});
+    if (success) *success = true;
+    return value;
+}
+std::uint64_t url_getResource(id self, SEL, id *out, id key, id *error) {
+    bool success;
+    id value = url_resource(self, key, error, &success, nullptr, true);
+    if (out) *out = autorelease(value); else release(value);
+    return success;
+}
+std::uint64_t url_resourceValues(id self, SEL, id keys, id *error) {
+    if (error) *error = nullptr;
+    id result = dictionary_create(false);
+    url_resource_snapshot snapshot;
+    for (id key : array_storage(keys)) {
+        bool success;
+        id value = url_resource(self, key, error, &success, &snapshot, true);
+        if (!success) { release(result); return 0; }
+        if (value) { dictionary_set(result, key, value); release(value); }
+    }
+    return ret(autorelease(result));
+}
+std::uint64_t url_clearResource(id self, SEL, id key) {
+    std::lock_guard lock(u(self)->resource_mutex);
+    if (auto it = u(self)->resources.find(to_utf8(key)); it != u(self)->resources.end()) { release(it->second.value); u(self)->resources.erase(it); }
+    return 0;
+}
+std::uint64_t url_clearResources(id self, SEL) {
+    std::lock_guard lock(u(self)->resource_mutex);
+    for (auto &[key, entry] : u(self)->resources) release(entry.value);
+    u(self)->resources.clear(); return 0;
+}
+std::uint64_t url_temporaryResource(id self, SEL, id value, id key) {
+    std::lock_guard lock(u(self)->resource_mutex);
+    id next = retain(value);
+    auto &entry = u(self)->resources[to_utf8(key)]; release(entry.value);
+    entry = {next, true, false, 0}; return 0;
+}
+std::uint64_t url_startAccess(id self, SEL) { return u(self)->scheme == "file" && access(u(self)->path.c_str(), R_OK) == 0; }
+std::uint64_t url_stopAccess(id, SEL) { return 0; }
 
 /* ---- NSError --------------------------------------------------------------- */
 
@@ -482,9 +695,12 @@ std::uint64_t defaults_objectForKey(id, SEL, id key) { return ret(prefs().get(ke
 std::uint64_t defaults_setObjectForKey(id, SEL, id value, id key) { prefs().set(key, value); return 0; }
 std::uint64_t defaults_removeObjectForKey(id, SEL, id key) { prefs().set(key, nullptr); return 0; }
 std::uint64_t defaults_stringForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_string(v) ? ret(v) : 0; }
+std::uint64_t defaults_arrayForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_kind(v, cls("NSArray")) ? ret(v) : 0; }
+std::uint64_t defaults_dictionaryForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_kind(v, cls("NSDictionary")) ? ret(v) : 0; }
 std::uint64_t defaults_boolForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? (number_int64(v) != 0) : 0; }
 std::uint64_t defaults_integerForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? static_cast<std::uint64_t>(number_int64(v)) : 0; }
 double defaults_doubleForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? number_double(v) : 0.0; }
+float defaults_floatForKey(id self, SEL selector, id key) { return static_cast<float>(defaults_doubleForKey(self, selector, key)); }
 std::uint64_t defaults_setBoolForKey(id, SEL, std::uint64_t b, id key) { prefs().set(key, number_bool((b & 0xFF) != 0)); return 0; }
 std::uint64_t defaults_setIntegerForKey(id, SEL, std::uint64_t v, id key) { id n = number_from_int64(static_cast<std::int64_t>(v)); prefs().set(key, n); release(n); return 0; }
 std::uint64_t defaults_setDoubleForKey(id, SEL, double v, id key) { id n = number_from_double(v); prefs().set(key, n); release(n); return 0; }
@@ -534,7 +750,15 @@ std::uint64_t proc_hostName(id, SEL) { char buf[256] = {}; gethostname(buf, size
 std::uint64_t proc_activeProcessorCount(id, SEL) { return static_cast<std::uint64_t>(sysconf(_SC_NPROCESSORS_ONLN)); }
 std::uint64_t proc_physicalMemory(id, SEL) { return static_cast<std::uint64_t>(sysconf(_SC_PHYS_PAGES)) * static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE)); }
 std::uint64_t proc_operatingSystemVersionString(id, SEL) { return ret(constant_string("Version 12.0 (Build 21A559)")); }
-std::uint64_t proc_operatingSystemVersion(id, SEL) { mm_objc_return_words_hi(0); mm_objc_return_doubles_hi(0, 0); return 12; } /* {major, minor}; patch in x2 */
+std::uint64_t proc_operatingSystemVersion(id, SEL) {
+    /* A 24-byte integer aggregate is returned through the caller's x8
+     * buffer on arm64, rather than in x0-x2. */
+    const std::int64_t version[3] = {12, 0, 0};
+    const mm_host_api *a = api();
+    if (mm_cpu_context *ctx = a && a->current_context ? a->current_context() : nullptr)
+        if (ctx->x[8]) std::memcpy(reinterpret_cast<void *>(ctx->x[8]), version, sizeof version);
+    return 0;
+}
 std::uint64_t procc_processInfo(id, SEL) {
     static id p = nullptr;
     if (!p) p = mm_objc_alloc(g_processinfo, 0);
@@ -751,21 +975,46 @@ std::uint64_t uuidc_UUID(id c, SEL) { return ret(autorelease(obj(send(obj(send(c
 
 /* ---- run loop ------------------------------------------------------------------ */
 
-/* One run loop per guest thread. Sources are blocks/functions queued with
- * CFRunLoopPerformBlock; CFRunLoopRun drains them and then waits until
- * something is queued or the loop is stopped. Timers and ports come with
- * the event loop AppKit will need, not before. */
+/* One run loop per guest thread, shared by Cocoa sources and Carbon timers. */
+struct run_loop;
+struct selector_request {
+    id target = nullptr, argument = nullptr;
+    SEL selector = nullptr;
+    run_loop *owner = nullptr;
+    std::chrono::steady_clock::time_point due;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool started = false, cancelled = false, done = false;
+    ~selector_request() { release(target); release(argument); }
+};
+std::mutex selector_registry_mu;
+std::vector<std::weak_ptr<selector_request>> selector_registry;
+struct run_loop_timer {
+    std::mutex mu;
+    std::chrono::steady_clock::time_point due;
+    double interval = 0;
+    std::uint64_t callback = 0, info = 0;
+    run_loop *owner = nullptr;
+    bool active = true, removed = false;
+    id cocoa_timer = nullptr; /* the owning run loop retains scheduled NSTimers */
+    ~run_loop_timer() { release(cocoa_timer); }
+};
 struct run_loop {
     std::mutex mu;
     std::condition_variable cv;
     std::vector<std::pair<void *, bool>> blocks; /* block or function pointer, is_block */
+    std::vector<std::shared_ptr<run_loop_timer>> timers;
+    std::vector<std::shared_ptr<selector_request>> selectors;
     bool stopped = false;
     mm_objc_object base_storage{};
 };
 run_loop *loop_for_current_thread() {
     static std::mutex mu;
     static std::vector<std::pair<std::uint64_t, run_loop *>> loops;
-    const std::uint64_t tid = g_api ? g_api->thread_self() : 0;
+    const std::uint64_t current = g_api ? g_api->thread_self() : 0;
+    /* Host dylib initialization precedes the main guest context. Both
+     * belong to guest thread 1, so its main loop must be the same object. */
+    const std::uint64_t tid = current ? current : 1;
     std::lock_guard lock(mu);
     for (auto &[k, v] : loops) if (k == tid) return v;
     auto *l = new run_loop;
@@ -777,8 +1026,205 @@ run_loop *g_main_loop = nullptr;
 run_loop *loop_of(id o) { return reinterpret_cast<run_loop *>(reinterpret_cast<char *>(o) - offsetof(run_loop, base_storage)); }
 id loop_object(run_loop *l) { return reinterpret_cast<id>(&l->base_storage); }
 
+std::mutex timer_registry_mu;
+std::unordered_map<void *, std::shared_ptr<run_loop_timer>> timer_registry;
+
+std::chrono::steady_clock::time_point timer_deadline(double delay) {
+    const auto now = std::chrono::steady_clock::now();
+    const double limit = std::chrono::duration<double>(std::chrono::steady_clock::time_point::max() - now).count();
+    if (delay >= limit) return std::chrono::steady_clock::time_point::max();
+    return now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(std::max(0.0, delay)));
+}
+
+struct timer_object {
+    mm_objc_object base;
+    std::mutex mu;
+    double interval = 0;
+    std::chrono::steady_clock::time_point due;
+    id target = nullptr, user_info = nullptr, block = nullptr;
+    SEL action = nullptr;
+    bool valid = true, repeats = false;
+    std::weak_ptr<run_loop_timer> scheduled;
+    ~timer_object() { release(target); release(user_info); release(block); }
+};
+
+std::uint64_t timer_invalidate(id self, SEL) {
+    /* Keep the receiver alive while removing the run loop's last reference.
+     * Invalidation and callbacks must not run guest code under loop locks. */
+    retain(self);
+    auto *o = as<timer_object>(self);
+    std::shared_ptr<run_loop_timer> timer;
+    id target, info, block;
+    {
+        std::lock_guard lock(o->mu);
+        o->valid = false;
+        timer = o->scheduled.lock();
+        o->scheduled.reset();
+        target = o->target; info = o->user_info; block = o->block;
+        o->target = o->user_info = o->block = nullptr;
+    }
+    if (timer) {
+        run_loop *l = timer->owner;
+        {
+            std::lock_guard lock(l->mu);
+            std::lock_guard timer_lock(timer->mu);
+            timer->removed = true;
+            std::erase(l->timers, timer);
+        }
+        l->cv.notify_all();
+    }
+    release(target); release(info); release(block);
+    timer.reset();
+    release(self);
+    return 0;
+}
+
+std::uint64_t timer_fire(id self, SEL) {
+    auto *o = as<timer_object>(self);
+    id target, block;
+    SEL action;
+    bool repeats;
+    {
+        std::lock_guard lock(o->mu);
+        if (!o->valid) return 0;
+        target = retain(o->target); block = retain(o->block); action = o->action; repeats = o->repeats;
+    }
+    retain(self);
+    if (g_trace) std::fprintf(stderr, "Foundation: NSTimer %p firing %s\n", static_cast<void *>(self), action ? action : "(nil)");
+    const std::uint64_t arg = ret(self);
+    if (target && action) mm_objc_send(target, action, 1, &arg);
+    if (block) mm_objc_block_invoke(block, 1, &arg);
+    if (!repeats) timer_invalidate(self, nullptr);
+    release(target); release(block);
+    release(self);
+    return 0;
+}
+
+std::uint64_t runloop_addTimer(id self, SEL, id value, id) {
+    if (!value || !is_kind(value, g_timer)) return 0;
+    auto *o = as<timer_object>(value);
+    run_loop *l = loop_of(self);
+    std::lock_guard lock(o->mu);
+    /* Adding one timer in several modes must not multiply its callbacks.
+     * Like other sources in this bridge, modes currently share one queue. */
+    if (!o->valid || !o->scheduled.expired()) return 0;
+    auto timer = std::make_shared<run_loop_timer>();
+    timer->owner = l;
+    timer->due = o->due;
+    timer->interval = o->repeats ? o->interval : 0;
+    timer->cocoa_timer = retain(value);
+    o->scheduled = timer;
+    {
+        std::lock_guard loop_lock(l->mu);
+        l->timers.push_back(timer);
+    }
+    l->cv.notify_all();
+    return 0;
+}
+
+std::uint64_t timerc_timer(id cls_, SEL, double interval, id target, SEL action, id info, std::uint64_t repeats) {
+    if (!std::isfinite(interval)) return 0;
+    auto *o = make<timer_object>(reinterpret_cast<Class>(cls_));
+    o->interval = std::max(0.0001, interval);
+    o->due = timer_deadline(o->interval);
+    o->target = retain(target); o->action = action; o->user_info = retain(info);
+    o->repeats = repeats != 0;
+    return ret(autorelease(reinterpret_cast<id>(o)));
+}
+std::uint64_t timerc_scheduledTimer(id cls_, SEL sel, double interval, id target, SEL action, id info, std::uint64_t repeats) {
+    id timer = obj(timerc_timer(cls_, sel, interval, target, action, info, repeats));
+    runloop_addTimer(loop_object(loop_for_current_thread()), nullptr, timer, nullptr);
+    return ret(timer);
+}
+std::uint64_t timerc_timerBlock(id cls_, SEL, double interval, std::uint64_t repeats, id block) {
+    id timer = obj(timerc_timer(cls_, nullptr, interval, nullptr, nullptr, nullptr, repeats));
+    if (timer) as<timer_object>(timer)->block = retain(block);
+    return ret(timer);
+}
+std::uint64_t timerc_scheduledTimerBlock(id cls_, SEL, double interval, std::uint64_t repeats, id block) {
+    id timer = obj(timerc_timerBlock(cls_, nullptr, interval, repeats, block));
+    runloop_addTimer(loop_object(loop_for_current_thread()), nullptr, timer, nullptr);
+    return ret(timer);
+}
+std::uint64_t timer_isValid(id self, SEL) { auto *o = as<timer_object>(self); std::lock_guard lock(o->mu); return o->valid; }
+std::uint64_t timer_userInfo(id self, SEL) { auto *o = as<timer_object>(self); std::lock_guard lock(o->mu); return ret(o->user_info); }
+double timer_timeInterval(id self, SEL) { return as<timer_object>(self)->interval; }
+
+void run_loop_fire_timers(run_loop *l) {
+    std::vector<std::shared_ptr<run_loop_timer>> due;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(l->mu);
+        for (auto it = l->timers.begin(); it != l->timers.end();) {
+            auto timer = *it;
+            std::lock_guard timer_lock(timer->mu);
+            if (timer->removed) { it = l->timers.erase(it); continue; }
+            if (timer->active && timer->due <= now) {
+                if (timer->interval > 0) timer->due = timer_deadline(timer->interval);
+                else timer->active = false;
+                due.push_back(timer);
+            }
+            ++it;
+        }
+    }
+    for (auto &timer : due) {
+        std::uint64_t callback, info;
+        {
+            std::lock_guard lock(timer->mu);
+            if (timer->removed) continue;
+            callback = timer->callback;
+            info = timer->info;
+        }
+        if (timer->cocoa_timer) {
+            timer_fire(timer->cocoa_timer, nullptr);
+            continue;
+        }
+        const std::uint64_t args[2] = {reinterpret_cast<std::uintptr_t>(timer.get()), info};
+        if (api()->is_guest_code(callback)) api()->call_guest(callback, args, 2);
+        else reinterpret_cast<void (*)(void *, void *)>(callback)(timer.get(), reinterpret_cast<void *>(info));
+    }
+}
+
+/* Caller holds l->mu through wait_for, so registration cannot lose a wakeup. */
+double run_loop_timer_wait_locked(run_loop *l, double seconds) {
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto &timer : l->timers) {
+        std::lock_guard timer_lock(timer->mu);
+        if (timer->active && !timer->removed)
+            seconds = std::min(seconds, std::max(0.0, std::chrono::duration<double>(timer->due - now).count()));
+    }
+    for(const auto &request:l->selectors) {
+        std::lock_guard lock(request->mu);
+        if(!request->cancelled&&!request->done)seconds=std::min(seconds,std::max(0.,std::chrono::duration<double>(request->due-now).count()));
+    }
+    return seconds;
+}
+void run_loop_fire_selectors(run_loop *l) {
+    std::vector<std::shared_ptr<selector_request>> due;
+    const auto now=std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(l->mu);
+        for(auto it=l->selectors.begin();it!=l->selectors.end();) {
+            auto request=*it;
+            std::lock_guard request_lock(request->mu);
+            if(request->cancelled||request->due<=now) {due.push_back(request);it=l->selectors.erase(it);}
+            else ++it;
+        }
+    }
+    for(auto &request:due) {
+        bool run;
+        {std::lock_guard lock(request->mu);run=!request->cancelled;request->started=run;}
+        if(run){const auto argument=ret(request->argument);mm_objc_send(request->target,request->selector,1,&argument);}
+        {std::lock_guard lock(request->mu);request->done=true;}
+        request->cv.notify_all();
+    }
+}
 void run_loop_drain(run_loop *l) {
-    dispatch_drain_main_queue();
+    if (l == g_main_loop) url_cache_generation.fetch_add(1, std::memory_order_relaxed);
+    if(l==g_main_loop)dispatch_drain_main_queue();
+    run_loop_fire_selectors(l);
+    run_loop_fire_timers(l);
     for (;;) {
         std::pair<void *, bool> item;
         {
@@ -787,7 +1233,10 @@ void run_loop_drain(run_loop *l) {
             item = l->blocks.front();
             l->blocks.erase(l->blocks.begin());
         }
-        if (item.second) mm_objc_block_invoke(item.first, 0, nullptr);
+        if (item.second) {
+            std::unique_ptr<mm_objc_object, decltype(&mm_objc_release)> block(static_cast<id>(item.first), mm_objc_release);
+            mm_objc_block_invoke(block.get(), 0, nullptr);
+        }
         else if (api()->is_guest_code(reinterpret_cast<std::uintptr_t>(item.first))) api()->call_guest(reinterpret_cast<std::uintptr_t>(item.first), nullptr, 0);
         else reinterpret_cast<void (*)()>(item.first)();
     }
@@ -799,7 +1248,8 @@ std::uint64_t runloop_run(id self, SEL) {
         run_loop_drain(l);
         std::unique_lock lock(l->mu);
         if (l->stopped) { l->stopped = false; return 0; }
-        if (l->blocks.empty()) l->cv.wait_for(lock, std::chrono::milliseconds(100));
+        if (l->blocks.empty())
+            l->cv.wait_for(lock, std::chrono::duration<double>(run_loop_timer_wait_locked(l, 0.1)));
     }
 }
 std::uint64_t runloop_stop(id self, SEL) { run_loop *l = loop_of(self); { std::lock_guard lock(l->mu); l->stopped = true; } l->cv.notify_all(); return 0; }
@@ -811,10 +1261,6 @@ std::uint64_t runloopc_mainRunLoop(id, SEL) { return ret(loop_object(g_main_loop
 struct pool_object { mm_objc_object base; void *token = nullptr; };
 std::uint64_t pool_init(id self, SEL) { as<pool_object>(self)->token = objc_autoreleasePoolPush_(); return ret(self); }
 std::uint64_t pool_drain(id self, SEL) { objc_autoreleasePoolPop_(as<pool_object>(self)->token); mm_objc_free_instance(self); return 0; }
-
-std::uint64_t thread_isMainThread(id, SEL) { return api()->thread_self() == 1; }
-std::uint64_t threadc_currentThread(id c, SEL) { static id t = nullptr; if (!t) t = mm_objc_alloc(reinterpret_cast<Class>(c), 0); return ret(t); }
-std::uint64_t threadc_sleepForTimeInterval(id, SEL, double s) { struct timespec ts{static_cast<time_t>(s), static_cast<long>((s - static_cast<double>(static_cast<time_t>(s))) * 1e9)}; nanosleep(&ts, nullptr); return 0; }
 
 /* ---- NSAppleEventManager ------------------------------------------------------ */
 
@@ -1026,6 +1472,32 @@ id url_from_path(std::string_view path, bool is_dir) { return url_new(std::strin
 std::string url_path(id url) { return is_url(url) ? u(url)->path : to_utf8(url); }
 bool is_url(id o) { return o && is_kind(o, g_url); }
 
+void enqueue_selector(id loop,id target,SEL selector,id argument,double delay,bool wait) {
+    if(!target||!selector||!std::isfinite(delay))return;
+    run_loop *owner=loop?loop_of(loop):loop_for_current_thread();
+    if(wait&&owner==loop_for_current_thread()) {const auto arg=ret(argument);mm_objc_send(target,selector,1,&arg);return;}
+    auto request=std::make_shared<selector_request>();request->target=retain(target);request->argument=retain(argument);
+    request->selector=selector;request->owner=owner;request->due=timer_deadline(delay);
+    {std::lock_guard lock(selector_registry_mu);std::erase_if(selector_registry,[](const auto &weak){return weak.expired();});selector_registry.push_back(request);}
+    {std::lock_guard lock(owner->mu);owner->selectors.push_back(request);}
+    owner->cv.notify_all();
+    if(wait){std::unique_lock lock(request->mu);request->cv.wait(lock,[&]{return request->done||request->cancelled;});}
+}
+void cancel_selectors(id target,SEL selector,id argument,bool match_argument) {
+    std::vector<std::shared_ptr<selector_request>> snapshot;
+    {std::lock_guard lock(selector_registry_mu);for(auto &weak:selector_registry)if(auto request=weak.lock())snapshot.push_back(request);}
+    for(auto &request:snapshot) {
+        if(request->target!=target||(selector&&request->selector!=selector))continue;
+        if(match_argument&&!objects_equal(request->argument,argument))continue;
+        {
+            std::lock_guard owner_lock(request->owner->mu);std::lock_guard lock(request->mu);
+            if(request->started)continue;request->cancelled=true;request->done=true;
+            std::erase(request->owner->selectors,request);
+        }
+        request->cv.notify_all();request->owner->cv.notify_all();
+    }
+}
+
 void register_misc() {
     Class nsobject = cls("NSObject");
     init_constant_strings();
@@ -1055,6 +1527,13 @@ void register_misc() {
         {"URLByResolvingSymlinksInPath", IMP(url_copyWithZone), "@16@0:8"},
         {"initFileURLWithPath:", IMP(url_initFileURLWithPath), "@24@0:8@16"},
         {"initFileURLWithPath:isDirectory:", IMP(url_initFileURLWithPathIsDirectory), "@32@0:8@16B24"},
+        {"getResourceValue:forKey:error:", IMP(url_getResource), "B40@0:8^@16@24^@32"},
+        {"resourceValuesForKeys:error:", IMP(url_resourceValues), "@32@0:8@16^@24"},
+        {"removeCachedResourceValueForKey:", IMP(url_clearResource), "v24@0:8@16"},
+        {"removeAllCachedResourceValues", IMP(url_clearResources), "v16@0:8"},
+        {"setTemporaryResourceValue:forKey:", IMP(url_temporaryResource), "v32@0:8@16@24"},
+        {"startAccessingSecurityScopedResource", IMP(url_startAccess), "B16@0:8"},
+        {"stopAccessingSecurityScopedResource", IMP(url_stopAccess), "v16@0:8"},
         {"initWithString:", IMP(url_initWithString), "@24@0:8@16"},
         {"description", IMP(url_description), "@16@0:8"},
         {"isEqual:", IMP(url_isEqual), "B24@0:8@16"},
@@ -1115,8 +1594,11 @@ void register_misc() {
         {"setObject:forKey:", IMP(defaults_setObjectForKey), "v32@0:8@16@24"},
         {"removeObjectForKey:", IMP(defaults_removeObjectForKey), "v24@0:8@16"},
         {"stringForKey:", IMP(defaults_stringForKey), "@24@0:8@16"},
+        {"arrayForKey:", IMP(defaults_arrayForKey), "@24@0:8@16"},
+        {"dictionaryForKey:", IMP(defaults_dictionaryForKey), "@24@0:8@16"},
         {"boolForKey:", IMP(defaults_boolForKey), "B24@0:8@16"},
         {"integerForKey:", IMP(defaults_integerForKey), "q24@0:8@16"},
+        {"floatForKey:", IMP(defaults_floatForKey), "f24@0:8@16"},
         {"doubleForKey:", IMP(defaults_doubleForKey), "d24@0:8@16"},
         {"setBool:forKey:", IMP(defaults_setBoolForKey), "v32@0:8B16@24"},
         {"setInteger:forKey:", IMP(defaults_setIntegerForKey), "v32@0:8q16@24"},
@@ -1196,20 +1678,14 @@ void register_misc() {
     FND_CLASS_METHODS(g_uuid, {"UUID", IMP(uuidc_UUID), "@16@0:8"});
 
     g_runloop = mm_objc_define_class("NSRunLoop", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSRunLoop), FND_META_REF(NSRunLoop));
-    FND_METHODS(g_runloop, {"run", IMP(runloop_run), "v16@0:8"}, {"stop", IMP(runloop_stop), "v16@0:8"});
+    FND_METHODS(g_runloop, {"run", IMP(runloop_run), "v16@0:8"}, {"stop", IMP(runloop_stop), "v16@0:8"},
+        {"addTimer:forMode:", IMP(runloop_addTimer), "v32@0:8@16@24"});
     FND_CLASS_METHODS(g_runloop,
         {"currentRunLoop", IMP(runloopc_currentRunLoop), "@16@0:8"},
         {"mainRunLoop", IMP(runloopc_mainRunLoop), "@16@0:8"});
 
     g_pool = mm_objc_define_class("NSAutoreleasePool", nsobject, sizeof(pool_object), FND_CLASS_REF(NSAutoreleasePool), FND_META_REF(NSAutoreleasePool));
     FND_METHODS(g_pool, {"init", IMP(pool_init), "@16@0:8"}, {"drain", IMP(pool_drain), "v16@0:8"}, {"release", IMP(pool_drain), "v16@0:8"});
-
-    g_thread = mm_objc_define_class("NSThread", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSThread), FND_META_REF(NSThread));
-    FND_METHODS(g_thread, {"isMainThread", IMP(thread_isMainThread), "B16@0:8"});
-    FND_CLASS_METHODS(g_thread,
-        {"currentThread", IMP(threadc_currentThread), "@16@0:8"},
-        {"isMainThread", IMP(thread_isMainThread), "B16@0:8"},
-        {"sleepForTimeInterval:", IMP(threadc_sleepForTimeInterval), "v24@0:8d16"});
 
     g_apple_event_manager = mm_objc_define_class("NSAppleEventManager", nsobject, sizeof(apple_event_manager),
                                                 FND_CLASS_REF(NSAppleEventManager), FND_META_REF(NSAppleEventManager));
@@ -1254,10 +1730,21 @@ void register_misc() {
     FND_METHODS(g_exception, {"raise", IMP(exception_raise), "v16@0:8"});
     FND_CLASS_METHODS(g_exception, {"raise:format:", IMP(exceptionc_raiseFormat), "v32@0:8@16@24"});
 
-    /* Declared so the guest's class references resolve; behaviour comes later. */
-    g_date = mm_objc_define_class("NSDate", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSDate), FND_META_REF(NSDate));
-    g_timer = mm_objc_define_class("NSTimer", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSTimer), FND_META_REF(NSTimer));
+    g_timer = mm_objc_define_class("NSTimer", nsobject, sizeof(timer_object), FND_CLASS_REF(NSTimer), FND_META_REF(NSTimer));
+    register_lifecycle<timer_object>(g_timer);
+    FND_CLASS_METHODS(g_timer,
+        {"timerWithTimeInterval:target:selector:userInfo:repeats:", IMP(timerc_timer), "@56@0:8d16@24:32@40B48"},
+        {"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:", IMP(timerc_scheduledTimer), "@56@0:8d16@24:32@40B48"},
+        {"timerWithTimeInterval:repeats:block:", IMP(timerc_timerBlock), "@40@0:8d16B24@?32"},
+        {"scheduledTimerWithTimeInterval:repeats:block:", IMP(timerc_scheduledTimerBlock), "@40@0:8d16B24@?32"});
+    FND_METHODS(g_timer,
+        {"fire", IMP(timer_fire), "v16@0:8"},
+        {"invalidate", IMP(timer_invalidate), "v16@0:8"},
+        {"isValid", IMP(timer_isValid), "B16@0:8"},
+        {"userInfo", IMP(timer_userInfo), "@16@0:8"},
+        {"timeInterval", IMP(timer_timeInterval), "d16@0:8"});
     g_opqueue = mm_objc_define_class("NSOperationQueue", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSOperationQueue), FND_META_REF(NSOperationQueue));
+    register_threading();
     g_charset = mm_objc_define_class("NSCharacterSet", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSCharacterSet), FND_META_REF(NSCharacterSet));
 }
 
@@ -1349,7 +1836,9 @@ id CFURLCreateFromFileSystemRepresentation_(void *, const std::uint8_t *p, CFInd
 id CFURLCreateWithString_(void *, id s, id base) DARWIN(CFURLCreateWithString);
 id CFURLCreateWithString_(void *, id s, id base) {
     (void)base;
-    id u2 = mm_objc_alloc(reinterpret_cast<Class>(cls("NSURL")), 0);
+    /* +alloc constructs the std::string payload; the raw runtime allocator
+     * only creates zeroed Objective-C storage. */
+    id u2 = obj(send(reinterpret_cast<id>(cls("NSURL")), "alloc"));
     return obj(url_initWithString(u2, nullptr, s));
 }
 id CFURLCopyFileSystemPath_(id url, std::uint64_t) DARWIN(CFURLCopyFileSystemPath);
@@ -1377,20 +1866,18 @@ id CFURLCreateCopyAppendingPathComponent_(void *, id url, id comp, int is_dir) {
 id CFURLCreateCopyDeletingLastPathComponent_(void *, id url) DARWIN(CFURLCreateCopyDeletingLastPathComponent);
 id CFURLCreateCopyDeletingLastPathComponent_(void *, id url) { return retain(obj(url_URLByDeletingLastPathComponent(url, nullptr))); }
 int CFURLCopyResourcePropertyForKey_(id url, id key, void *out, id *) DARWIN(CFURLCopyResourcePropertyForKey);
-int CFURLCopyResourcePropertyForKey_(id url, id key, void *out, id *) {
-    const std::string k = describe(key);
-    struct stat st;
-    if (stat(url_path(url).c_str(), &st) != 0) return 0;
-    id value = nullptr;
-    if (k == "NSURLIsDirectoryKey") value = retain(number_bool(S_ISDIR(st.st_mode)));
-    else if (k == "NSURLIsHiddenKey") { const std::string p = url_path(url); const auto slash = p.rfind('/'); value = retain(number_bool(slash + 1 < p.size() && p[slash + 1] == '.')); }
-    else if (k == "NSURLIsPackageKey") value = retain(number_bool(url_path(url).ends_with(".app") || url_path(url).ends_with(".bundle")));
-    else if (k == "NSURLNameKey") value = string_from_utf8(url_path(url));
-    else if (k == "NSURLVolumeIdentifierKey" || k == "NSURLVolumeIsLocalKey") value = number_from_int64(static_cast<std::int64_t>(st.st_dev));
-    else return 0;
-    if (out) std::memcpy(out, &value, 8);
-    return 1;
+int CFURLCopyResourcePropertyForKey_(id url, id key, void *out, id *error) {
+    bool success;
+    id value = url_resource(url, key, error, &success);
+    if (out) std::memcpy(out, &value, sizeof value); else release(value);
+    return success;
 }
+void CFURLClearResourcePropertyCacheForKey_(id url, id key) DARWIN(CFURLClearResourcePropertyCacheForKey);
+void CFURLClearResourcePropertyCacheForKey_(id url, id key) { url_clearResource(url, nullptr, key); }
+void CFURLClearResourcePropertyCache_(id url) DARWIN(CFURLClearResourcePropertyCache);
+void CFURLClearResourcePropertyCache_(id url) { url_clearResources(url, nullptr); }
+void CFURLSetTemporaryResourcePropertyForKey_(id url, id key, id value) DARWIN(CFURLSetTemporaryResourcePropertyForKey);
+void CFURLSetTemporaryResourcePropertyForKey_(id url, id key, id value) { url_temporaryResource(url, nullptr, value, key); }
 int CFURLSetResourcePropertyForKey_(id, id, id, id *) DARWIN(CFURLSetResourcePropertyForKey);
 int CFURLSetResourcePropertyForKey_(id, id, id, id *) { return 1; }
 int CFURLCreateDataAndPropertiesFromResource_(void *, id url, id *data, id *props, id, std::int32_t *code) DARWIN(CFURLCreateDataAndPropertiesFromResource);
@@ -1472,6 +1959,66 @@ cfuuid_bytes CFUUIDGetUUIDBytes_(id u2) DARWIN(CFUUIDGetUUIDBytes);
 cfuuid_bytes CFUUIDGetUUIDBytes_(id u2) { cfuuid_bytes out{}; send(u2, "getUUIDBytes:", ret(out.b)); return out; }
 
 /* CFRunLoop: the same loops NSRunLoop uses. */
+/* Carbon's timers share this loop so their guest callbacks run on the
+ * owning guest thread, between AppKit events. These are host bridge APIs. */
+EXPORT void *machoman_runloop_timer_create(id loop, double delay, double interval, void *callback, void *info) {
+    if (!loop || !callback || !std::isfinite(delay) || !std::isfinite(interval) ||
+        (delay < 0 && delay != -1) || (interval < 0 && interval != -1)) return nullptr;
+    auto timer = std::make_shared<run_loop_timer>();
+    timer->due = timer_deadline(delay);
+    timer->active = delay != -1; /* kEventDurationForever disables firing. */
+    timer->interval = std::max(0.0, interval);
+    timer->owner = loop_of(loop);
+    timer->callback = reinterpret_cast<std::uintptr_t>(callback);
+    timer->info = reinterpret_cast<std::uintptr_t>(info);
+    {
+        std::lock_guard lock(timer_registry_mu);
+        timer_registry[timer.get()] = timer;
+    }
+    run_loop *l = loop_of(loop);
+    {
+        std::lock_guard lock(l->mu);
+        l->timers.push_back(timer);
+    }
+    l->cv.notify_all();
+    return timer.get();
+}
+EXPORT int machoman_runloop_timer_remove(void *handle) {
+    std::shared_ptr<run_loop_timer> timer;
+    {
+        std::lock_guard lock(timer_registry_mu);
+        auto it = timer_registry.find(handle);
+        if (it == timer_registry.end()) return -50;
+        timer = it->second;
+        timer_registry.erase(it);
+    }
+    {
+        std::lock_guard loop_lock(timer->owner->mu);
+        std::lock_guard lock(timer->mu);
+        timer->removed = true;
+    }
+    timer->owner->cv.notify_all();
+    return 0;
+}
+EXPORT int machoman_runloop_timer_reschedule(void *handle, double delay) {
+    if (!std::isfinite(delay) || (delay < 0 && delay != -1)) return -50;
+    std::shared_ptr<run_loop_timer> timer;
+    {
+        std::lock_guard lock(timer_registry_mu);
+        auto it = timer_registry.find(handle);
+        if (it == timer_registry.end()) return -50;
+        timer = it->second;
+    }
+    {
+        std::lock_guard loop_lock(timer->owner->mu);
+        std::lock_guard lock(timer->mu);
+        if (timer->removed) return -50;
+        timer->due = timer_deadline(delay);
+        timer->active = delay != -1;
+    }
+    timer->owner->cv.notify_all();
+    return 0;
+}
 id CFRunLoopGetCurrent_() DARWIN(CFRunLoopGetCurrent);
 id CFRunLoopGetCurrent_() { return loop_object(loop_for_current_thread()); }
 id CFRunLoopGetMain_() DARWIN(CFRunLoopGetMain);
@@ -1482,11 +2029,11 @@ std::int32_t CFRunLoopRunInMode_(id, double seconds, int) DARWIN(CFRunLoopRunInM
 std::int32_t CFRunLoopRunInMode_(id, double seconds, int) {
     /* Blocks sent to the main dispatch queue run here, on the thread that
      * owns the loop, as they do on macOS. */
-    dispatch_drain_main_queue();
     run_loop *l = loop_for_current_thread();
     run_loop_drain(l);
     if (seconds > 0) {
         std::unique_lock lock(l->mu);
+        seconds = run_loop_timer_wait_locked(l, seconds);
         if (l->blocks.empty() && !l->stopped) l->cv.wait_for(lock, std::chrono::duration<double>(seconds));
     }
     run_loop_drain(l);
@@ -1500,8 +2047,13 @@ void CFRunLoopWakeUp_(id loop) DARWIN(CFRunLoopWakeUp);
 void CFRunLoopWakeUp_(id loop) { loop_of(loop)->cv.notify_all(); }
 void CFRunLoopPerformBlock_(id loop, id, void *block) DARWIN(CFRunLoopPerformBlock);
 void CFRunLoopPerformBlock_(id loop, id, void *block) {
+    if (!block) return;
+    /* A stack block may be gone before the next run-loop turn. Copy before
+     * locking: its capture helpers can call back into guest code. */
+    id copied = obj(send(static_cast<id>(block), "copy"));
+    if (!copied) return;
     run_loop *l = loop_of(loop);
-    { std::lock_guard lock(l->mu); l->blocks.emplace_back(block, true); }
+    { std::lock_guard lock(l->mu); l->blocks.emplace_back(copied, true); }
     l->cv.notify_all();
 }
 int CFRunLoopIsWaiting_(id) DARWIN(CFRunLoopIsWaiting);
@@ -1633,6 +2185,7 @@ static void foundation_ctor() {
     register_strings();
     register_collections();
     register_misc();
+    register_key_value();
     register_plists();
     register_task();
 }

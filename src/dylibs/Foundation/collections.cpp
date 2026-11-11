@@ -9,12 +9,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <mutex>
+#include <memory>
 
 namespace fnd {
 
 /* Class storage the guest binds to: external linkage, so not inside the
  * anonymous namespace below. */
-FND_CLASS(NSArray); FND_CLASS(NSMutableArray); FND_CLASS(__NSArrayM);
+FND_CLASS(NSArray); FND_CLASS(NSMutableArray); FND_CLASS(__NSArrayM); FND_CLASS(NSConstantArray);
 FND_CLASS(NSDictionary); FND_CLASS(NSMutableDictionary); FND_CLASS(__NSDictionaryM);
 FND_CLASS(NSSet); FND_CLASS(NSMutableSet); FND_CLASS(__NSSetM);
 FND_CLASS(NSData); FND_CLASS(NSMutableData); FND_CLASS(__NSDataM);
@@ -71,7 +73,24 @@ dict_object NSDictionary0_storage;
 std::uint64_t kCFTypeArrayCallBacks_[6], kCFTypeDictionaryKeyCallBacks_[7], kCFCopyStringDictionaryKeyCallBacks_[7],
     kCFTypeDictionaryValueCallBacks_[6], kCFTypeSetCallBacks_[6], kCFCopyStringSetCallBacks_[6];
 
-array_object *arr(id a) { return as<array_object>(a); }
+/* New SDKs emit immutable NSArray literals in the image as isa, count,
+ * items. Adapt that Darwin layout to the collection storage API without
+ * writing into the image or treating it as a C++ vector. */
+struct constant_array { mm_objc_object base; std::uint64_t count; id const *items; };
+array_object *arr(id a) {
+    if (mm_objc_object_class(a) != FND_CLASS_REF(NSConstantArray)) return as<array_object>(a);
+    static std::mutex mutex;
+    static std::unordered_map<id, std::unique_ptr<array_object>> cache;
+    std::lock_guard lock(mutex);
+    auto &storage = cache[a];
+    if (!storage) {
+        auto *constant = as<constant_array>(a);
+        storage = std::make_unique<array_object>();
+        storage->base.isa = g_array;
+        if (constant->count) storage->items.assign(constant->items, constant->items + constant->count);
+    }
+    return storage.get();
+}
 dict_object *dict(id d) { return as<dict_object>(d); }
 
 template <typename T> T *mutable_of(id o, const char *what) {
@@ -464,6 +483,7 @@ std::uint64_t s_countByEnumerating(id self, SEL, fast_state *st, id *buf, std::u
     return n;
 }
 std::uint64_t s_init(id self, SEL) { return ret(self); }
+std::uint64_t s_initWithCapacity(id self, SEL, std::uint64_t capacity) { set(self)->items.reserve(capacity); return ret(self); }
 std::uint64_t s_initWithObjectsCount(id self, SEL, const id *objs, std::uint64_t n) { for (std::uint64_t i = 0; i < n; i++) if (!set_contains(set(self), objs[i])) set(self)->items.push_back(retain(objs[i])); return ret(self); }
 std::uint64_t s_initWithArray(id self, SEL, id a) { if (a) for (id e : arr(a)->items) if (!set_contains(set(self), e)) set(self)->items.push_back(retain(e)); return ret(self); }
 std::uint64_t s_initWithSet(id self, SEL, id a) { if (a) for (id e : set(a)->items) set(self)->items.push_back(retain(e)); return ret(self); }
@@ -484,6 +504,7 @@ std::uint64_t s_isEqualToSet(id self, SEL, id o) {
     return 1;
 }
 std::uint64_t sc_set(id c, SEL) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "init")))); }
+std::uint64_t sc_setWithCapacity(id c, SEL, std::uint64_t capacity) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "initWithCapacity:", capacity)))); }
 std::uint64_t sc_setWithObject(id c, SEL, id o) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "initWithObjects:count:", ret(&o), 1)))); }
 std::uint64_t sc_setWithArray(id c, SEL, id a) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "initWithArray:", ret(a))))); }
 std::uint64_t sc_setWithObjects(id c, SEL, id first) {
@@ -786,6 +807,7 @@ struct set_dtor : set_object { ~set_dtor() { for (id o : items) release(o); } };
 void register_collections() {
     Class nsobject = cls("NSObject");
     g_array = mm_objc_define_class("NSArray", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSArray), FND_META_REF(NSArray));
+    mm_objc_define_class("NSConstantArray", g_array, sizeof(constant_array), FND_CLASS_REF(NSConstantArray), FND_META_REF(NSConstantArray));
     g_marray = mm_objc_define_class("NSMutableArray", g_array, sizeof(mm_objc_object), FND_CLASS_REF(NSMutableArray), FND_META_REF(NSMutableArray));
     g_carray = mm_objc_define_class("__NSArrayM", g_marray, sizeof(array_object), FND_CLASS_REF(__NSArrayM), FND_META_REF(__NSArrayM));
     register_lifecycle<array_dtor>(g_carray);
@@ -950,12 +972,14 @@ void register_collections() {
         {"setWithArray:", IMP(sc_setWithArray), "@24@0:8@16"},
         {"setWithObjects:", IMP(sc_setWithObjects), "@24@0:8@16"});
     FND_METHODS(g_mset,
+        {"initWithCapacity:", IMP(s_initWithCapacity), "@24@0:8Q16"},
         {"addObject:", IMP(ms_addObject), "v24@0:8@16"},
         {"removeObject:", IMP(ms_removeObject), "v24@0:8@16"},
         {"removeAllObjects", IMP(ms_removeAllObjects), "v16@0:8"},
         {"addObjectsFromArray:", IMP(ms_addObjectsFromArray), "v24@0:8@16"},
         {"unionSet:", IMP(ms_unionSet), "v24@0:8@16"},
         {"minusSet:", IMP(ms_minusSet), "v24@0:8@16"});
+    FND_CLASS_METHODS(g_mset, {"setWithCapacity:", IMP(sc_setWithCapacity), "@24@0:8Q16"});
 
     g_data = mm_objc_define_class("NSData", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSData), FND_META_REF(NSData));
     g_mdata = mm_objc_define_class("NSMutableData", g_data, sizeof(mm_objc_object), FND_CLASS_REF(NSMutableData), FND_META_REF(NSMutableData));

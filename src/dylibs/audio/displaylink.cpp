@@ -2,7 +2,7 @@
  *
  * On macOS it is the display's own refresh signal, delivered on a
  * high-priority thread. Here it is a thread ticking at the refresh rate
- * the backend reports (60 Hz), because what a program needs from it is a
+ * the backend reports, because what a program needs from it is a
  * steady callback it can render on — without one it builds its window and
  * then waits forever for a frame that never comes, which is exactly where
  * Ableton Live stopped.
@@ -10,12 +10,16 @@
  * The callback is guest code, so it goes through mm_call_callback rather
  * than being called directly. */
 #include "machoman/objc_host.h"
+#include "machoman/objc_framework.h"
 #include "machoman/runtime.h"
 #include "synthesise.h"
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <dlfcn.h>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -27,7 +31,16 @@
 
 namespace {
 
-constexpr double refresh_hz = 60.0;
+double refresh_hz() {
+    if (const char *value = std::getenv("MACHOMAN_DISPLAY_HZ")) {
+        char *end = nullptr; const double hz = std::strtod(value, &end);
+        if (end != value && !*end && std::isfinite(hz) && hz >= 1 && hz <= 1000) return hz;
+    }
+    using Hook = double (*)();
+    const auto hook = reinterpret_cast<Hook>(dlsym(RTLD_DEFAULT, "machoman_appkit_display_refresh_hz"));
+    const double hz = hook ? hook() : 60.0;
+    return std::isfinite(hz) && hz >= 1 && hz <= 1000 ? hz : 60.0;
+}
 
 /* CVTimeStamp, as CoreVideo lays it out; a callback reads the host time
  * and the video time from it. */
@@ -38,16 +51,23 @@ struct cv_time_stamp {
     std::uint64_t host_time;
     double rate_scalar;
     std::int64_t video_refresh_period;
-    struct { double time_value; std::uint32_t time_scale; std::uint32_t flags; } smpte_time;
+    struct {
+        std::int16_t subframes, subframe_divisor;
+        std::uint32_t counter, type, flags;
+        std::int16_t hours, minutes, seconds, frames;
+    } smpte_time;
     std::uint64_t flags;
     std::uint64_t reserved;
 };
+static_assert(sizeof(cv_time_stamp) == 80);
+static_assert(offsetof(cv_time_stamp, flags) == 64);
 
 struct display_link {
     std::uint64_t callback = 0, user_info = 0;
     std::atomic<bool> running{false};
     std::thread thread;
     std::int64_t frame = 0;
+    double hz = 60.0;
     ~display_link() {
         running = false;
         if (thread.joinable()) thread.join();
@@ -78,20 +98,27 @@ std::uint64_t now_nanoseconds() {
 }
 
 void tick(display_link *link) {
-    const auto period = std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / refresh_hz));
+    const auto period = std::chrono::nanoseconds(static_cast<std::int64_t>(1e9 / link->hz));
     auto next = std::chrono::steady_clock::now();
     while (link->running) {
         next += period;
+        const auto clock_now = std::chrono::steady_clock::now();
+        if (clock_now > next + period) {
+            const auto missed = (clock_now - next) / period;
+            next += (missed + 1) * period;
+            link->frame += missed + 1;
+        }
         std::this_thread::sleep_until(next);
         if (!link->running || !link->callback) continue;
 
         cv_time_stamp now{}, output{};
         now.version = 0;
-        now.video_time_scale = static_cast<std::int32_t>(refresh_hz * 1000);
+        now.video_time_scale = static_cast<std::int32_t>(std::lround(link->hz * 1000));
         now.video_time = link->frame * 1000;
         now.host_time = now_nanoseconds();
         now.rate_scalar = 1.0;
         now.video_refresh_period = 1000;
+        now.flags = 3 | 8 | 16; // Video/host times, refresh period and rate scalar.
         output = now;
         output.video_time += 1000;               /* the next frame */
         link->frame++;
@@ -104,11 +131,19 @@ void tick(display_link *link) {
                                        0,
                                        reinterpret_cast<std::uintptr_t>(&flags_out),
                                        link->user_info};
+        mmfw::autorelease_pool pool;
         call_callback(link->callback, args, 6);
     }
 }
 
 } // namespace
+
+extern "C" __attribute__((visibility("default"))) void machoman_dylib_quiesce() {
+    std::vector<display_link *> snapshot;
+    { std::lock_guard lock(links_mutex()); for (auto &link : links()) snapshot.push_back(link.get()); }
+    for (auto *link : snapshot) link->running = false;
+    for (auto *link : snapshot) if (link->thread.joinable()) link->thread.join();
+}
 
 extern "C" {
 
@@ -142,8 +177,9 @@ std::int32_t darwin_CVDisplayLinkStart(display_link *link) DARWIN(CVDisplayLinkS
 std::int32_t darwin_CVDisplayLinkStart(display_link *link) {
     if (!link || link->running) return link ? 0 : -1;
     link->running = true;
+    link->hz = refresh_hz();
     if (std::getenv("MACHOMAN_APPKIT_TRACE") || std::getenv("MACHOMAN_TRACE"))
-        std::fprintf(stderr, "CoreVideo: display link started at %g Hz\n", refresh_hz);
+        std::fprintf(stderr, "CoreVideo: display link started at %g Hz\n", link->hz);
     link->thread = std::thread([link] { tick(link); });
     return 0;
 }
@@ -170,16 +206,13 @@ void darwin_CVDisplayLinkRelease(display_link *link) {
 }
 
 double darwin_CVDisplayLinkGetActualOutputVideoRefreshPeriod(display_link *) DARWIN(CVDisplayLinkGetActualOutputVideoRefreshPeriod);
-double darwin_CVDisplayLinkGetActualOutputVideoRefreshPeriod(display_link *) { return 1.0 / refresh_hz; }
+double darwin_CVDisplayLinkGetActualOutputVideoRefreshPeriod(display_link *link) { return 1.0 / (link && link->running ? link->hz : refresh_hz()); }
 
-std::int32_t darwin_CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link *, cv_time_stamp *out) DARWIN(CVDisplayLinkGetNominalOutputVideoRefreshPeriod);
-std::int32_t darwin_CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link *, cv_time_stamp *out) {
-    if (out) {
-        out->video_time_scale = static_cast<std::int32_t>(refresh_hz * 1000);
-        out->video_time = 1000;
-        out->flags = 1; /* kCVTimeStampVideoTimeValid */
-    }
-    return 0;
+std::uint64_t darwin_CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link *) DARWIN(CVDisplayLinkGetNominalOutputVideoRefreshPeriod);
+std::uint64_t darwin_CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link *link) {
+    // CVTime is returned in x0/x1 (int64 value, int32 scale, int32 flags).
+    mm_objc_return_words_hi(static_cast<std::uint32_t>(std::lround((link && link->running ? link->hz : refresh_hz()) * 1000)));
+    return 1000;
 }
 
 std::uint64_t darwin_CVGetCurrentHostTime() DARWIN(CVGetCurrentHostTime);

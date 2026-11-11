@@ -1,0 +1,8 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '@rpath/libaudio_null_probe.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ _machoman_audio_null_check, _machoman_audio_callback_check, _machoman_audio_callback_busy, _machoman_audio_callback_nested ]
+...

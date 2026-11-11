@@ -232,6 +232,7 @@ void dup_lane(mm_x64_buf &buf, int esize, int idx) {
 } // namespace
 
 bool emit_fp_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
+    if (insn.elem_size == 2 || (insn.fop == mm_a64_fop::fcvt && insn.imm == 2)) return emit_half_fp(buf, insn);
     const int e = insn.elem_size;
     const bool vec = insn.fvec;
     const fk k = kind(e, vec);

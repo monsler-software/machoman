@@ -82,6 +82,8 @@ enum class mm_a64_opcode : std::uint8_t {
     casp,          /* casp Xs,Xs+1, Xt,Xt+1, [Xn]: atomic compare and swap of a register pair */
     eor3,          /* eor3 Vd.16b, Vn.16b, Vm.16b, Va.16b: three-way exclusive or */
     bcax,          /* bcax Vd.16b, Vn.16b, Vm.16b, Va.16b: Vn EOR (Vm AND NOT Va) */
+    crypto,        /* ARMv8 crypto extension; the instruction in `crypto` */
+    simd_helper,   /* validated AdvSIMD semantics implemented by a portable lane helper */
     ldar,      /* load-acquire (also ldapr): plain sized load on x86 */
     stlr,      /* store-release: xchg */
     ldxr,      /* load-exclusive (ldxr/ldaxr): load + set monitor */
@@ -131,6 +133,26 @@ enum class mm_a64_sysreg : std::uint8_t { unknown, nzcv, fpcr, fpsr, tpidr_el0, 
 enum class mm_a64_atomic : std::uint8_t { add, clr, eor, set, smax, smin, umax, umin, swp };
 enum class mm_a64_vlogic : std::uint8_t { and_, bic, orr, orn, eor, bsl, bit, bif };
 
+/* ARMv8 crypto extension instructions. All operate on whole 128-bit
+ * registers (sha1h's destination is scalar but zeroes the upper lanes, as
+ * every scalar write does). */
+enum class mm_a64_crypto : std::uint8_t {
+    sha1h,      /* Sd = ror(Sn<31:0>, 2), upper lanes zeroed */
+    sha1su1,    /* schedule update 1 over (Vd, Vn) */
+    sha256su0,  /* Vd += sigma0 over (Vd, Vn) */
+    aese,       /* Vd = SubBytes(ShiftRows(Vd ^ Vn)) */
+    aesd,       /* Vd = InvSubBytes(InvShiftRows(Vd ^ Vn)) */
+    aesmc,      /* Vd = MixColumns(Vn) */
+    aesimc,     /* Vd = InvMixColumns(Vn) */
+    sha1c,      /* four SHA-1 choose rounds over (Vd, Sn, Vm) */
+    sha1p,      /* ... parity rounds */
+    sha1m,      /* ... majority rounds */
+    sha1su0,    /* schedule update 0 over (Vd, Vn, Vm) */
+    sha256h,    /* four SHA-256 rounds, Vd <- working (a,b,c,d) */
+    sha256h2,   /* four SHA-256 rounds, Vd <- working (e,f,g,h) */
+    sha256su1,  /* Vd += sigma1 over (Vd, Vn, Vm) */
+};
+
 /* Floating-point operations. elem_size is the FP width (4 = single, 8 =
  * double). Scalar forms write the whole V register (rest zero). */
 enum class mm_a64_fop : std::uint8_t {
@@ -166,9 +188,10 @@ enum class mm_a64_vop : std::uint8_t {
     addhn, addhn2, raddhn, raddhn2, subhn, subhn2, rsubhn, rsubhn2,
     uqadd, sqadd, uqsub, sqsub, addp, smaxp, sminp, umaxp, uminp, ushl, sshl,
     /* rd = op rn */
-    not_, neg, abs, cmeq0, cmgt0, cmge0, cmlt0, cmle0, rev64, rev32, rev16, cnt, xtn, xtn2, uaddlp, saddlp, uadalp, sadalp,
+    not_, neg, abs, cmeq0, cmgt0, cmge0, cmlt0, cmle0, rev64, rev32, rev16, cnt, xtn, xtn2,
+    sqxtn, sqxtn2, uqxtn, uqxtn2, sqxtun, sqxtun2, uaddlp, saddlp, uadalp, sadalp,
     /* rd = rn shifted by imm (imm = shift amount) */
-    sshr, ushr, shl, ssra, usra, shrn, shrn2, sshll, sshll2, ushll, ushll2,
+    sshr, ushr, shl, sli, sri, ssra, usra, shrn, shrn2, sshll, sshll2, ushll, ushll2,
     /* scalar rd = reduce(rn) */
     addv, smaxv, sminv, umaxv, uminv, uaddlv,
     /* permutes: rd = f(rn, rm); ext uses imm as the byte index */
@@ -212,13 +235,15 @@ struct mm_a64_insn {
     /* SIMD&FP */
     bool          simd = false;        /* ld/st: rd (and rt2) name V registers; mem_size may be 16 */
     bool          q = false;           /* 128-bit vector form */
+    bool          simd_imm_merge = false; /* ORR/BIC modified immediate preserves destination bits */
     std::uint8_t  elem_size = 0;       /* element width in bytes for lane ops */
     std::uint8_t  elem_index = 0;
     mm_a64_vlogic vlogic = mm_a64_vlogic::and_;
     mm_a64_vop    vop = mm_a64_vop::add;
+    mm_a64_crypto crypto = mm_a64_crypto::sha1h;
     mm_a64_fop    fop = mm_a64_fop::fmov;
     bool          fvec = false;        /* fop: vector (AdvSIMD) rather than scalar form */
-    bool          simd_scalar = false; /* fop: scalar AdvSIMD form (V registers both sides, e.g. scvtf s0, s1) */
+    bool          simd_scalar = false; /* scalar AdvSIMD form (e.g. scvtf s0, s1 or sqxtn b0, h1) */
 
     /* Load/store only. `is64` gives the destination width for sign-extending
      * loads; unsigned loads zero-extend to 64 bits regardless. */

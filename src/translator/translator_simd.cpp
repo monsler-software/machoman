@@ -38,6 +38,43 @@ void vzero(mm_x64_buf &buf, int xmm) { mm_x64_emit_sse_rr(buf, sse::pxor, xmm, x
 void vones(mm_x64_buf &buf, int xmm) { mm_x64_emit_sse_rr(buf, sse::pcmpeqb, xmm, xmm); }
 void vmov(mm_x64_buf &buf, int dst, int src) { mm_x64_emit_sse_rr(buf, sse::movdqa, dst, src); }
 
+/* USHL/SSHL interpret just the signed low byte of each count lane. AVX2
+ * logical shifts saturate to zero for oversized unsigned counts, so the
+ * negative count naturally suppresses the unused direction. No per-lane
+ * branches, helpers, or partially written destination register. */
+void emit_packed_shift(mm_x64_buf &buf, const mm_a64_insn &insn) {
+    using vs = mm_x64_vshift;
+    using vv = mm_x64_vshift_var;
+    const bool wide = insn.elem_size == 8, sg = insn.vop == vop::sshl;
+    vload(buf, X0, insn.rn);
+    vload(buf, X1, insn.rm);
+    if (!wide) {
+        mm_x64_emit_sse_shift_imm(buf, vs::pslld, X1, 24);
+        mm_x64_emit_sse_shift_imm(buf, vs::psrad, X1, 24);
+    } else {
+        mm_x64_emit_sse_shift_imm(buf, vs::psllq, X1, 56);
+        vmov(buf, X2, X1);
+        mm_x64_emit_sse_shift_imm(buf, vs::psrad, X2, 31); // high dword sign mask
+        mm_x64_emit_sse_shift_imm(buf, vs::psrlq, X1, 32);
+        mm_x64_emit_sse_shift_imm(buf, vs::psrad, X1, 24); // low dword signed byte
+        mm_x64_emit_sse_rr(buf, sse::por, X1, X2);
+    }
+    vzero(buf, X2);
+    mm_x64_emit_sse_rr(buf, wide ? sse::psubq : sse::psubd, X2, X1);
+    mm_x64_emit_vshift_var(buf, sg ? vv::psravd : wide ? vv::psrlvq : vv::psrlvd, X3, X0, X2);
+    if (sg) {
+        // Arithmetic right shift saturates to sign bits, even when unused:
+        // retain it only for negative ARM counts. Left shift then provides
+        // zero/positive counts, including oversized counts that yield zero.
+        vzero(buf, X2);
+        mm_x64_emit_sse_rr(buf, sse::pcmpgtd, X2, X1);
+        mm_x64_emit_sse_rr(buf, sse::pand, X3, X2);
+    }
+    mm_x64_emit_vshift_var(buf, wide ? vv::psllvq : vv::psllvd, X0, X0, X1);
+    mm_x64_emit_sse_rr(buf, sse::por, X0, X3);
+    vstore(buf, insn.rd, X0, insn.q);
+}
+
 void shift_imm(mm_x64_buf &buf, int xmm, int esize, bool left, bool arith, std::uint8_t n) {
     using vs = mm_x64_vshift;
     if (esize == 2) mm_x64_emit_sse_shift_imm(buf, left ? vs::psllw : arith ? vs::psraw : vs::psrlw, xmm, n);
@@ -346,20 +383,26 @@ bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
 
         const int wide = e * 2;
         const int lanes = 8 / e;                    /* a 64-bit half of narrow lanes */
-        const std::int32_t narrow_base = upper ? 8 : 0;
         auto signed_kind = [](int size) {
             return size == 1 ? mm_x64_load::s8_64 : size == 2 ? mm_x64_load::s16_64
                  : size == 4 ? mm_x64_load::s32_64 : mm_x64_load::u64;
         };
         const mm_x64_load nk = sg ? signed_kind(e) : unsigned_kind(e);
         const mm_x64_load wk = sg ? signed_kind(wide) : unsigned_kind(wide);
+        /* Preserve both source vectors before writing widened lanes. When
+         * Rd aliases a narrow source, the first store overwrites later inputs. */
+        vload(buf, X0, insn.rn);
+        vload(buf, X1, insn.rm);
+        if (upper && !wide_first) mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X0, 8);
+        if (upper) mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X1, 8);
         for (int i = 0; i < lanes; i++) {
             const std::int32_t d_off = voff(insn.rd, 0) + i * wide;
-            const std::int32_t n_off = wide_first ? voff(insn.rn, 0) + i * wide
-                                                  : voff(insn.rn, 0) + narrow_base + i * e;
-            const std::int32_t m_off = voff(insn.rm, 0) + narrow_base + i * e;
-            mm_x64_emit_load(buf, A, CTX, n_off, wide_first ? wk : nk);
-            mm_x64_emit_load(buf, B, CTX, m_off, nk);
+            mm_x64_emit_movq_to_gpr(buf, A, X0);
+            mm_x64_emit_movq_to_gpr(buf, B, X1);
+            mm_x64_emit_extend_reg(buf, A, A, wide_first ? wk : nk);
+            mm_x64_emit_extend_reg(buf, B, B, nk);
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X0, static_cast<std::uint8_t>(wide_first ? wide : e));
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X1, static_cast<std::uint8_t>(e));
             if (multiply) {
                 mm_x64_emit_imul_reg(buf, A, B);
                 if (negate_product) mm_x64_emit_neg_reg(buf, A);
@@ -442,6 +485,11 @@ bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
     }
 
     case vop::ushl: case vop::sshl: {
+        if ((e == 4 || (e == 8 && insn.vop == vop::ushl)) &&
+            (mm_x64_codegen_features() & MM_X64_FEATURE_AVX2)) {
+            emit_packed_shift(buf, insn);
+            return true;
+        }
         /* Per lane: count = low byte of rm lane (signed); left if >= 0, else right by -count. */
         const bool sg = insn.vop == vop::sshl;
         const int lanes = (q ? 16 : 8) / e;
@@ -560,6 +608,47 @@ bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
         mm_x64_emit_sse_rr(buf, sse::punpcklqdq, X1, X0);
         vstore(buf, insn.rd, X1, true);
         return true;
+    case vop::sqxtn: case vop::sqxtn2: case vop::uqxtn: case vop::uqxtn2:
+    case vop::sqxtun: case vop::sqxtun2: {
+        const int dest_size = e / 2;
+        const bool unsigned_source = insn.vop == vop::uqxtn || insn.vop == vop::uqxtn2;
+        const bool signed_dest = insn.vop == vop::sqxtn || insn.vop == vop::sqxtn2;
+        const bool high = insn.vop == vop::sqxtn2 || insn.vop == vop::uqxtn2 || insn.vop == vop::sqxtun2;
+        const std::uint64_t max = (std::uint64_t{1} << (8 * dest_size - (signed_dest ? 1 : 0))) - 1;
+        const std::uint64_t min = signed_dest ? ~max : 0;
+        /* Snapshot before any destination stores: SQXTN2 can overwrite
+         * lanes that have not yet been read when rd == rn. */
+        vload(buf, X0, insn.rn);
+        auto clamp = [&](std::uint64_t bound, mm_x64_cc within) {
+            mm_x64_emit_mov_imm(buf, B, bound);
+            mm_x64_emit_cmp_reg(buf, A, B);
+            const auto skip = mm_x64_emit_jcc_rel8(buf, within);
+            mm_x64_emit_mov_reg(buf, A, B);
+            mm_x64_emit_mov_load(buf, T, CTX, offsetof(mm_cpu_context, fpsr));
+            mm_x64_emit_alu_imm32(buf, mm_x64_alu::or_, T, 1u << 27, true); /* cumulative saturation, FPSR.QC */
+            mm_x64_emit_mov_store(buf, CTX, offsetof(mm_cpu_context, fpsr), T);
+            mm_x64_patch_rel8_to_here(buf, skip);
+        };
+        for (int i = 0; i < (insn.simd_scalar ? 1 : 16 / e); i++) {
+            mm_x64_emit_movq_to_gpr(buf, A, X0);
+            if (e < 8) {
+                const auto kind = unsigned_source ? unsigned_kind(e)
+                    : e == 2 ? mm_x64_load::s16_64 : mm_x64_load::s32_64;
+                mm_x64_emit_extend_reg(buf, A, A, kind);
+            }
+            if (!unsigned_source) clamp(min, mm_x64_cc::ge);
+            clamp(max, unsigned_source ? mm_x64_cc::be : mm_x64_cc::le);
+            if (insn.simd_scalar) {
+                mm_x64_emit_extend_reg(buf, A, A, unsigned_kind(dest_size));
+                mm_x64_emit_mov_store(buf, CTX, voff(insn.rd, 0), A);
+            } else {
+                mm_x64_emit_store(buf, CTX, voff(insn.rd, high ? 1 : 0) + i * dest_size, A, dest_size);
+            }
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X0, static_cast<std::uint8_t>(e));
+        }
+        if (!high) store_v_zero_high(buf, insn.rd);
+        return true;
+    }
     case vop::uaddlp: case vop::saddlp: case vop::uadalp: case vop::sadalp: {
         vload(buf, X0, insn.rn);
         const bool sg = insn.vop == vop::saddlp || insn.vop == vop::sadalp;
@@ -591,6 +680,24 @@ bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
     }
 
     /* ---- shifts by immediate ---------------------------------------------- */
+    case vop::sli: case vop::sri: {
+        const auto n = static_cast<std::uint8_t>(insn.imm);
+        const bool left = insn.vop == vop::sli;
+        vload(buf, X0, insn.rn);
+        vload(buf, X1, insn.rd);
+        vones(buf, X2); /* mask of destination bits replaced by the insert */
+        if (e == 1) {
+            shift_bytes(buf, X0, left, false, n);
+            shift_bytes(buf, X2, left, false, n);
+        } else {
+            shift_imm(buf, X0, e, left, false, n);
+            shift_imm(buf, X2, e, left, false, n);
+        }
+        mm_x64_emit_sse_rr(buf, sse::pandn, X2, X1);
+        mm_x64_emit_sse_rr(buf, sse::por, X0, X2);
+        vstore(buf, insn.rd, X0, q);
+        return true;
+    }
     case vop::sshr: case vop::ushr: case vop::shl: case vop::ssra: case vop::usra: {
         const auto n = static_cast<std::uint8_t>(insn.imm);
         const bool left = insn.vop == vop::shl;
@@ -793,6 +900,365 @@ bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
         mm_x64_emit_load(buf, A, CTX, voff(insn.rn, 0) + static_cast<std::int32_t>(insn.imm) * e, unsigned_kind(e));
         mm_x64_emit_store(buf, CTX, voff(insn.rd, 0) + insn.elem_index * e, A, e);
         return true;
+    }
+    return false;
+}
+
+/* ---- ARMv8 crypto extension -------------------------------------------- */
+
+namespace {
+
+/* Extract lane i of an xmm into a 32-bit GPR. */
+void extract_lane32(mm_x64_buf &buf, int gpr, int xmm, int lane) {
+    if (lane == 0) mm_x64_emit_movd_to_gpr(buf, gpr, xmm);
+    else mm_x64_emit_pextrd(buf, gpr, xmm, static_cast<std::uint8_t>(lane));
+}
+
+/* The SHA-1 round function over the lane-rotated state vectors: result in
+ * x_c (lane 0); x_b and x_d are consumed. b/c/d name the value each vector
+ * holds in lane 0, not the register roles. */
+void sha1_f(mm_x64_buf &buf, mm_a64_crypto op, int x_b, int x_c, int x_d) {
+    switch (op) {
+    case mm_a64_crypto::sha1c: /* (b & (c ^ d)) ^ d */
+        mm_x64_emit_sse_rr(buf, sse::pxor, x_c, x_d);
+        mm_x64_emit_sse_rr(buf, sse::pand, x_c, x_b);
+        mm_x64_emit_sse_rr(buf, sse::pxor, x_c, x_d);
+        break;
+    case mm_a64_crypto::sha1p: /* b ^ c ^ d */
+        mm_x64_emit_sse_rr(buf, sse::pxor, x_c, x_d);
+        mm_x64_emit_sse_rr(buf, sse::pxor, x_c, x_b);
+        break;
+    default: /* sha1m: (b & c) | (b & d) | (c & d) */
+        mm_x64_emit_sse_rr(buf, sse::pand, x_c, x_d); /* c & d */
+        mm_x64_emit_sse_rr(buf, sse::pand, x_d, x_b); /* b & d */
+        mm_x64_emit_sse_rr(buf, sse::por, x_c, x_d);
+        mm_x64_emit_pshufd(buf, x_d, x_b, 0x55);      /* c broadcast (b holds c in lane 1) */
+        mm_x64_emit_sse_rr(buf, sse::pand, x_d, x_b); /* b & c */
+        mm_x64_emit_sse_rr(buf, sse::por, x_c, x_d);
+        break;
+    }
+}
+
+/* Sigma0/Sigma1 of SHA-256 in the GPRs: dst = Sigma(src), src preserved.
+ * Uses T as scratch. */
+/* The GPR shifts are the encoder's 64-bit forms, so a 32-bit rotate is
+ * built from a left and a right shift: for a zero-extended dword the low
+ * half of (x << n) | (x >> (32 - n)) is exactly the 32-bit rotate. The high
+ * half stays garbage; it never reaches the result because every consumer
+ * goes through adds (whose low half only depends on low halves) and
+ * pextrd/pinsrd. */
+
+/* acc = ror32(src, shr_n) = (src << shl_n) | (src >> shr_n). */
+void ror32_into(mm_x64_buf &buf, int acc, int src, std::uint8_t shl_n, std::uint8_t shr_n) {
+    mm_x64_emit_mov_reg(buf, acc, src);
+    mm_x64_emit_shl_imm(buf, acc, shl_n);
+    mm_x64_emit_mov_reg(buf, T, src);
+    mm_x64_emit_shr_imm(buf, T, shr_n);
+    mm_x64_emit_or_reg(buf, acc, T);
+}
+
+/* acc ^= ror32(src, shr_n); the accumulator takes a round trip through the
+ * stack because the rotate needs both remaining registers. */
+void xor_ror32(mm_x64_buf &buf, int acc, int src, std::uint8_t shl_n, std::uint8_t shr_n) {
+    mm_x64_emit_push(buf, acc);
+    mm_x64_emit_mov_reg(buf, acc, src);
+    mm_x64_emit_shl_imm(buf, acc, shl_n);
+    mm_x64_emit_mov_reg(buf, T, src);
+    mm_x64_emit_shr_imm(buf, T, shr_n);
+    mm_x64_emit_or_reg(buf, acc, T);
+    mm_x64_emit_pop(buf, T);
+    mm_x64_emit_xor_reg(buf, acc, T);
+}
+
+/* Sigma0/Sigma1 of SHA-256 in the GPRs: dst = Sigma(src), src preserved. */
+void sha256_sigma0(mm_x64_buf &buf, int dst, int src) {
+    ror32_into(buf, dst, src, 30, 2);
+    xor_ror32(buf, dst, src, 19, 13);
+    xor_ror32(buf, dst, src, 10, 22);
+}
+void sha256_sigma1(mm_x64_buf &buf, int dst, int src) {
+    ror32_into(buf, dst, src, 26, 6);
+    xor_ror32(buf, dst, src, 21, 11);
+    xor_ror32(buf, dst, src, 7, 25);
+}
+
+/* The schedule's small sigma1 (the hash rounds use the big Sigma1 above). */
+void sha256_small_sigma1(mm_x64_buf &buf, int dst, int src) {
+    ror32_into(buf, dst, src, 15, 17);
+    xor_ror32(buf, dst, src, 13, 19);
+    mm_x64_emit_mov_reg(buf, T, src);
+    mm_x64_emit_shr_imm(buf, T, 10);
+    mm_x64_emit_xor_reg(buf, dst, T);
+}
+} // namespace
+
+bool emit_crypto_op(mm_x64_buf &buf, const mm_a64_insn &insn) {
+    switch (insn.crypto) {
+    case mm_a64_crypto::sha1h:
+        /* Sd = ror(Sn<31:0>, 2); movd zero-extends, so the upper lanes of
+         * the destination are zeroed the way a scalar write does. */
+        vload(buf, X0, insn.rn);
+        mm_x64_emit_movd_to_gpr(buf, A, X0);
+        mm_x64_emit_mov_reg(buf, T, A);
+        mm_x64_emit_shl_imm(buf, A, 30);
+        mm_x64_emit_shr_imm(buf, T, 2);
+        mm_x64_emit_or_reg(buf, A, T); /* ror 2 */
+        mm_x64_emit_movd_from_gpr(buf, X0, A);
+        vstore(buf, insn.rd, X0, true);
+        return true;
+
+    case mm_a64_crypto::sha1su1: {
+        /* T = Vd ^ (Vn >> 32); lanes 0..2 = rol(T, 1), lane 3 ^= rol(T0, 2). */
+        vload(buf, X0, insn.rd);
+        vload(buf, X1, insn.rn);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X1, 4); /* (w1, w2, w3, 0) */
+        mm_x64_emit_sse_rr(buf, sse::pxor, X1, X0);                   /* T */
+        mm_x64_emit_pshufd(buf, X2, X1, 0x00);                        /* T0 broadcast, for lane 3 */
+        vmov(buf, X3, X1);                                            /* per-lane copy for the wrap bits */
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X1, 1);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X3, 31);
+        mm_x64_emit_sse_rr(buf, sse::por, X1, X3);                    /* rol(T, 1) */
+        /* rol2(T0) = (T0 << 2) | (T0 >> 30): X0 is free since the pxor. */
+        vmov(buf, X0, X2);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X2, 2);  /* T0 << 2 */
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X0, 30); /* T0 >> 30 */
+        mm_x64_emit_sse_rr(buf, sse::por, X2, X0);                    /* rol2(T0) */
+        vconst(buf, X3, 0, 0xFFFFFFFF00000000ull);                    /* lane 3 mask */
+        mm_x64_emit_sse_rr(buf, sse::pand, X2, X3);
+        mm_x64_emit_sse_rr(buf, sse::pxor, X1, X2);
+        vstore(buf, insn.rd, X1, true);
+        return true;
+    }
+
+    case mm_a64_crypto::sha256su0: {
+        /* T = (d1, d2, d3, Vn0); lane i = sigma0(T[i]) + Vd[i]. x86 palignr
+         * takes its SOURCE as the high half of the concatenation, so the
+         * destination register is the one holding Vn. */
+        vload(buf, X0, insn.rd);
+        vload(buf, X1, insn.rn);
+        vmov(buf, X2, X0);
+        mm_x64_emit_palignr(buf, X1, X2, 4); /* (Vd : Vn) >> 4 bytes */
+        vmov(buf, X2, X1);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X2, 14);
+        vmov(buf, X3, X1);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X3, 18);
+        mm_x64_emit_sse_rr(buf, sse::por, X2, X3); /* ror 18 */
+        vmov(buf, X3, X1);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X3, 3);
+        mm_x64_emit_sse_rr(buf, sse::pxor, X2, X3); /* ^ (>> 3) */
+        vmov(buf, X3, X1);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X3, 7);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X1, 25);
+        mm_x64_emit_sse_rr(buf, sse::por, X3, X1); /* ror 7 */
+        mm_x64_emit_sse_rr(buf, sse::pxor, X2, X3); /* sigma0 */
+        mm_x64_emit_sse_rr(buf, sse::paddd, X2, X0);
+        vstore(buf, insn.rd, X2, true);
+        return true;
+    }
+
+    case mm_a64_crypto::aese:
+    case mm_a64_crypto::aesd: {
+        /* AESE = SubBytes(ShiftRows(Vd ^ Vn)): x86 aesenc is
+         * MixColumns(SubBytes(ShiftRows())) ^ src, and InvMixColumns
+         * (aesimc) undoes its MixColumns; aesdec mirrors this for AESD
+         * with three aesimc (MixColumns = InvMixColumns^3). */
+        vload(buf, X0, insn.rd);
+        vload(buf, X1, insn.rn);
+        mm_x64_emit_sse_rr(buf, sse::pxor, X0, X1);
+        vzero(buf, X2);
+        if (insn.crypto == mm_a64_crypto::aese) {
+            mm_x64_emit_aesenc(buf, X0, X2);
+            mm_x64_emit_aesimc(buf, X0, X0);
+        } else {
+            mm_x64_emit_aesdec(buf, X0, X2);
+            mm_x64_emit_aesimc(buf, X0, X0);
+            mm_x64_emit_aesimc(buf, X0, X0);
+            mm_x64_emit_aesimc(buf, X0, X0);
+        }
+        vstore(buf, insn.rd, X0, true);
+        return true;
+    }
+
+    case mm_a64_crypto::aesmc: /* MixColumns = InvMixColumns^3 */
+    case mm_a64_crypto::aesimc: {
+        vload(buf, X0, insn.rn);
+        mm_x64_emit_aesimc(buf, X0, X0);
+        if (insn.crypto == mm_a64_crypto::aesmc) {
+            mm_x64_emit_aesimc(buf, X0, X0);
+            mm_x64_emit_aesimc(buf, X0, X0);
+        }
+        vstore(buf, insn.rd, X0, true);
+        return true;
+    }
+
+    case mm_a64_crypto::sha1su0: {
+        /* result = (Vn.lo :: Vd.hi) ^ Vd ^ Vm. */
+        vload(buf, X0, insn.rd);
+        vload(buf, X2, insn.rm);
+        vload(buf, X1, insn.rn);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslldq, X1, 8); /* (0, Vn.lo) */
+        vmov(buf, X3, X0);
+        mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrldq, X3, 8); /* (Vd.hi, 0) */
+        mm_x64_emit_sse_rr(buf, sse::por, X3, X1);                    /* (Vn.lo :: Vd.hi) */
+        mm_x64_emit_sse_rr(buf, sse::pxor, X3, X0);
+        mm_x64_emit_sse_rr(buf, sse::pxor, X3, X2);
+        vstore(buf, insn.rd, X3, true);
+        return true;
+    }
+
+    case mm_a64_crypto::sha1c:
+    case mm_a64_crypto::sha1p:
+    case mm_a64_crypto::sha1m: {
+        /* Four SHA-1 rounds: t = f(b,c,d) + rol(a,5) + e + w[i];
+         * (a,b,c,d,e) <- (t, a, rol30(b), c, d). Vn is read-only: the caller
+         * keeps e there and rotates it with sha1h between round groups. */
+        vload(buf, X0, insn.rd); /* (a, b, c, d) */
+        vload(buf, X1, insn.rn);
+        mm_x64_emit_pextrd(buf, T, X1, 0); /* e */
+        for (int i = 0; i < 4; i++) {
+            vload(buf, X3, insn.rm); /* w, reloaded each round: the scratch
+                                      * registers churn inside the round body */
+            mm_x64_emit_pextrd(buf, B, X3, static_cast<std::uint8_t>(i)); /* w[i] */
+            mm_x64_emit_pshufd(buf, X1, X0, 0x39); /* (b, c, d, a) */
+            mm_x64_emit_pshufd(buf, X3, X0, 0x4E); /* (c, d, a, b) */
+            mm_x64_emit_pshufd(buf, X2, X0, 0x93); /* (d, a, b, c) */
+            sha1_f(buf, insn.crypto, X1 /* b */, X3 /* c */, X2 /* d */); /* f in X3 */
+            /* rol5(a) into X2 */
+            mm_x64_emit_pshufd(buf, X2, X0, 0x00);
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X2, 5);
+            mm_x64_emit_pshufd(buf, X1, X0, 0x00);
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X1, 27);
+            mm_x64_emit_sse_rr(buf, sse::por, X2, X1);
+            mm_x64_emit_sse_rr(buf, sse::paddd, X3, X2); /* f + rol5(a) */
+            mm_x64_emit_movd_from_gpr(buf, X1, B);       /* w[i], upper lanes zero */
+            mm_x64_emit_sse_rr(buf, sse::paddd, X3, X1);
+            mm_x64_emit_movd_to_gpr(buf, A, X3);
+            mm_x64_emit_add_reg(buf, A, T);    /* a_new = f + rol5(a) + w[i] + e */
+            mm_x64_emit_pextrd(buf, T, X0, 3); /* e_new = d_old */
+            /* rol30 of every lane into X1 */
+            vmov(buf, X1, X0);
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::pslld, X1, 30);
+            vmov(buf, X2, X0);
+            mm_x64_emit_sse_shift_imm(buf, mm_x64_vshift::psrld, X2, 2);
+            mm_x64_emit_sse_rr(buf, sse::por, X1, X2);
+            /* (a_new, a_old, rol30(b), c_old) into X2 */
+            mm_x64_emit_pextrd(buf, B, X0, 0); /* a_old */
+            mm_x64_emit_movd_from_gpr(buf, X2, A);
+            mm_x64_emit_pinsrd(buf, X2, B, 1);
+            mm_x64_emit_pextrd(buf, B, X1, 1); /* rol30(b) */
+            mm_x64_emit_pinsrd(buf, X2, B, 2);
+            mm_x64_emit_pextrd(buf, B, X0, 2); /* c_old */
+            mm_x64_emit_pinsrd(buf, X2, B, 3);
+            vmov(buf, X0, X2);
+        }
+        vstore(buf, insn.rd, X0, true);
+        return true;
+    }
+
+    case mm_a64_crypto::sha256h:
+    case mm_a64_crypto::sha256h2: {
+        /* Four SHA-256 rounds. For h: Vd = (a,b,c,d) and Vn = (e,f,g,h) are
+         * both chains, and the result is the working (a,b,c,d). For h2:
+         * Vd = (e,f,g,h) is the only chain, Vn is a read-only copy of the
+         * (a,b,c,d) state whose lane 3-i is round i's "d" input, and the
+         * result is the working (e,f,g,h). The caller adds the working
+         * values to the saved state once per block. */
+        const bool part1 = insn.crypto == mm_a64_crypto::sha256h;
+        vload(buf, X0, insn.rd); /* h: abcd / h2: efgh — the chain that updates */
+        vload(buf, X2, insn.rn); /* h: efgh / h2: abcd state copy */
+        vload(buf, X1, insn.rm); /* w */
+        for (int i = 0; i < 4; i++) {
+            /* T1 = cho(e,f,g) + h + sigma1(e) + w[i] over the state the
+             * cho reads: X2 for h, X0 for h2. */
+            const int x = part1 ? X2 : X0;
+            extract_lane32(buf, A, x, 0); /* e */
+            sha256_sigma1(buf, B, A);
+            mm_x64_emit_push(buf, B);
+            extract_lane32(buf, B, x, 1); /* f */
+            extract_lane32(buf, T, x, 2); /* g */
+            mm_x64_emit_xor_reg(buf, B, T);
+            mm_x64_emit_and_reg(buf, B, A);
+            mm_x64_emit_xor_reg(buf, B, T); /* cho */
+            mm_x64_emit_pop(buf, T);
+            mm_x64_emit_add_reg(buf, B, T); /* cho + sigma1 */
+            extract_lane32(buf, T, x, 3);   /* h */
+            mm_x64_emit_add_reg(buf, B, T);
+            extract_lane32(buf, T, X1, i); /* w[i] */
+            mm_x64_emit_add_reg(buf, B, T); /* B = T1 */
+            if (part1)
+                mm_x64_emit_push(buf, B); /* T1 survives the T2 computation below;
+                                           * h2 never reaches it and must not leak a push */
+            /* The (e,f,g,h) chain's new lane 0: for h it is d_state + T1
+             * (read before the abcd chain moves); for h2 the state copy's
+             * lane 3-i is round i's d input. */
+            if (part1)
+                extract_lane32(buf, T, X0, 3);
+            else
+                extract_lane32(buf, T, X2, 3 - i);
+            mm_x64_emit_add_reg(buf, T, B);
+            mm_x64_emit_push(buf, T);
+            if (part1) {
+                mm_x64_emit_pshufd(buf, X2, X2, 0x93); /* (h, e, f, g) */
+                mm_x64_emit_pop(buf, T);
+                mm_x64_emit_pinsrd(buf, X2, T, 0); /* (e_new, e, f, g) */
+            } else {
+                mm_x64_emit_pshufd(buf, X0, X0, 0x93);
+                mm_x64_emit_pop(buf, T);
+                mm_x64_emit_pinsrd(buf, X0, T, 0);
+                continue;
+            }
+            /* h only: T2 = sigma0(a) + maj(a,b,c) over the abcd chain, then
+             * a_new = T1 + T2. */
+            extract_lane32(buf, A, X0, 0); /* a */
+            sha256_sigma0(buf, B, A);
+            mm_x64_emit_push(buf, B);
+            extract_lane32(buf, B, X0, 1); /* b */
+            extract_lane32(buf, T, X0, 2); /* c */
+            mm_x64_emit_push(buf, T);
+            mm_x64_emit_mov_reg(buf, T, A);
+            mm_x64_emit_and_reg(buf, T, B); /* a & b */
+            mm_x64_emit_push(buf, T);
+            mm_x64_emit_mov_reg(buf, T, A);
+            mm_x64_emit_or_reg(buf, T, B); /* a | b */
+            mm_x64_emit_push(buf, T);
+            mm_x64_emit_pop(buf, B);       /* a | b */
+            mm_x64_emit_pop(buf, T);       /* a & b */
+            mm_x64_emit_pop(buf, A);       /* c */
+            mm_x64_emit_and_reg(buf, B, A); /* (a|b) & c */
+            mm_x64_emit_or_reg(buf, B, T); /* maj */
+            mm_x64_emit_pop(buf, T);       /* sigma0 */
+            mm_x64_emit_add_reg(buf, B, T); /* B = T2 */
+            mm_x64_emit_pop(buf, T);       /* T1, pushed before the chain update */
+            mm_x64_emit_add_reg(buf, B, T); /* a_new = T1 + T2 */
+            mm_x64_emit_pshufd(buf, X0, X0, 0x93); /* (d, a, b, c) */
+            mm_x64_emit_pinsrd(buf, X0, B, 0); /* (a_new, a, b, c) */
+        }
+        vstore(buf, insn.rd, X0, true);
+        return true;
+    }
+
+    case mm_a64_crypto::sha256su1: {
+        /* lane 0 += sigma1(w2) + n1; lane 1 += sigma1(w3) + n2;
+         * lane 2 += sigma1(d0_new) + n3; lane 3 += sigma1(d1_new) + w0. */
+        vload(buf, X0, insn.rd); /* d */
+        vload(buf, X1, insn.rn); /* n */
+        vload(buf, X2, insn.rm); /* w */
+        for (int lane = 0; lane < 4; lane++) {
+            const int sigma_src_reg = lane == 0 ? X2 : lane == 1 ? X2 : X0;
+            const int sigma_src_lane = lane == 0 ? 2 : lane == 1 ? 3 : lane - 2;
+            const int add1_reg = lane < 2 ? X1 : lane == 2 ? X1 : X2;
+            const int add1_lane = lane == 0 ? 1 : lane == 1 ? 2 : lane == 2 ? 3 : 0;
+            extract_lane32(buf, A, sigma_src_reg, sigma_src_lane);
+            sha256_small_sigma1(buf, B, A);
+            extract_lane32(buf, T, add1_reg, add1_lane);
+            mm_x64_emit_add_reg(buf, B, T);
+            extract_lane32(buf, T, X0, lane); /* original d lane */
+            mm_x64_emit_add_reg(buf, B, T);
+            mm_x64_emit_pinsrd(buf, X0, B, static_cast<std::uint8_t>(lane));
+        }
+        vstore(buf, insn.rd, X0, true);
+        return true;
+    }
     }
     return false;
 }

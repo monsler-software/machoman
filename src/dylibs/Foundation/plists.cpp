@@ -492,6 +492,8 @@ void register_uid() {
     Class c = mm_objc_define_class("__NSCFKeyedArchiverUID", cls("NSObject"), sizeof(uid_object),
                                    FND_CLASS_REF(__NSCFKeyedArchiverUID), FND_META_REF(__NSCFKeyedArchiverUID));
     register_lifecycle<uid_object>(c);
+    static auto create = [](id, SEL, std::uint64_t value) -> std::uint64_t { return ret(autorelease(uid_create(value))); };
+    mm_objc_add_class_method(c, "uidWithValue:", IMP(+create), "@24@0:8Q16");
     FND_METHODS(c,
         {"value", IMP(uid_value_imp), "Q16@0:8"},
         {"unsignedIntegerValue", IMP(uid_value_imp), "Q16@0:8"},

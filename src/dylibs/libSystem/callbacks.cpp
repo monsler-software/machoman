@@ -8,15 +8,45 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <semaphore.h>
 #include <fcntl.h>
 #include <cerrno>
+#include <condition_variable>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
+
+struct dispatch_once_sync {
+    std::mutex mu;
+    std::condition_variable cv;
+};
+dispatch_once_sync &once_sync() {
+    static dispatch_once_sync state;
+    return state;
+}
+
+template <typename Callback>
+void dispatch_once_run(std::intptr_t *predicate, Callback callback) {
+    if (!predicate) std::abort();
+    if (__atomic_load_n(predicate, __ATOMIC_ACQUIRE) == -1) return;
+    auto &state = once_sync();
+    std::unique_lock lock(state.mu);
+    while (__atomic_load_n(predicate, __ATOMIC_ACQUIRE) == 1) state.cv.wait(lock);
+    if (__atomic_load_n(predicate, __ATOMIC_ACQUIRE) == -1) return;
+    __atomic_store_n(predicate, 1, __ATOMIC_RELAXED);
+    lock.unlock();
+    /* Nested once calls on other predicates must run without this lock. */
+    callback();
+    lock.lock();
+    __atomic_store_n(predicate, -1, __ATOMIC_RELEASE);
+    lock.unlock();
+    state.cv.notify_all();
+}
 
 int compare_through(const void *fn, const void *a, const void *b) {
     const std::uint64_t args[2] = {reinterpret_cast<std::uintptr_t>(a), reinterpret_cast<std::uintptr_t>(b)};
@@ -48,6 +78,29 @@ void sort_elements(void *base, std::size_t count, std::size_t size, Compare less
 } // namespace
 
 extern "C" {
+
+/* Compiler-rt uses a weak dispatch_once_f import while checking the OS
+ * version. It still needs to resolve to a real function and invoke the
+ * initializer through the guest runtime, on the calling thread. */
+void darwin_dispatch_once_f(std::intptr_t *, void *, const void *) DARWIN(dispatch_once_f);
+void darwin_dispatch_once_f(std::intptr_t *predicate, void *context, const void *function) {
+    if (!function) std::abort();
+    dispatch_once_run(predicate, [&] {
+        const std::uint64_t argument = reinterpret_cast<std::uintptr_t>(context);
+        mm_call_callback(function, &argument, 1);
+    });
+}
+
+void darwin_dispatch_once(std::intptr_t *, const void *) DARWIN(dispatch_once);
+void darwin_dispatch_once(std::intptr_t *predicate, const void *block) {
+    if (!block) std::abort();
+    /* The caller keeps the synchronous block alive for the whole call. */
+    struct block_header { const void *isa; std::int32_t flags, reserved; const void *invoke; };
+    dispatch_once_run(predicate, [&] {
+        const std::uint64_t argument = reinterpret_cast<std::uintptr_t>(block);
+        mm_call_callback(static_cast<const block_header *>(block)->invoke, &argument, 1);
+    });
+}
 
 void darwin_qsort(void *base, std::size_t count, std::size_t size, const void *cmp) DARWIN(qsort);
 void darwin_qsort(void *base, std::size_t count, std::size_t size, const void *cmp) {
@@ -87,17 +140,37 @@ void *darwin_bsearch(const void *key, const void *base, std::size_t count, std::
     return nullptr;
 }
 
-/* pthread_once's initializer is guest code too. Darwin's pthread_once_t is
- * {long sig; char opaque[8]}; only the signature word matters here. */
+/* pthread_once's initializer is guest code too, and it re-enters pthread_once:
+ * a static initializer that reaches another static goes through
+ * __cxa_guard_acquire and pthread_once again, and Darwin lets an initializer
+ * call pthread_once on other controls freely and on its own control
+ * recursively (that call returns at once). Holding one mutex across the
+ * initializer deadlocks on all of these — the state lives in the control and
+ * the mutex only serializes state transitions. Darwin's pthread_once_t is
+ * {long sig; char opaque[8]}; the signature word matters for the layout only,
+ * and opaque[0] is the state: 0 not run, 1 running, 2 done. */
 struct darwin_once { long sig; char opaque[8]; };
 int darwin_pthread_once(darwin_once *once, const void *init) DARWIN(pthread_once);
 int darwin_pthread_once(darwin_once *once, const void *init) {
     static std::mutex mu;
-    std::lock_guard lock(mu);
+    static std::condition_variable cv;
+    /* The control whose initializer this host thread is running; it decides
+     * the recursive call the way pthread_self/pthread_equal would. */
+    static thread_local darwin_once *running = nullptr;
     if (!once) return 22; /* EINVAL */
-    if (once->opaque[0] == 1) return 0;
+    std::unique_lock lock(mu);
+    while (once->opaque[0] == 1 && running != once)
+        cv.wait(lock);
+    if (once->opaque[0] == 2 || running == once) return 0;
     once->opaque[0] = 1;
+    darwin_once *const outer = std::exchange(running, once);
+    lock.unlock();
     mm_call_callback(init, nullptr, 0);
+    lock.lock();
+    once->opaque[0] = 2;
+    running = outer;
+    lock.unlock();
+    cv.notify_all();
     return 0;
 }
 

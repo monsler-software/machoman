@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <utility>
 
 #include "machoman/macho.h"
 #include "machoman/translator.h"
@@ -66,12 +67,17 @@ enum class mm_runtime_status {
  * shadow a symbol another library really defines. `flags` carries what the
  * bind record knows about the symbol's use. */
 inline constexpr unsigned MM_SYMBOL_LAZY = 1u; /* a lazy bind: the slot is called, so the symbol is a function */
+
+struct mm_callback_result {
+    mm_runtime_status status = mm_runtime_status::ok;
+    std::uint64_t value = 0, fault_va = 0, fault_addr = 0;
+};
 /* Passed to a host dylib's `machoman_dylib_init` (if it exports one) so it
  * can reach the guest image, process arguments and the runtime's thread
  * machinery without hardcoding anything about the executable. All
  * function pointers are valid for the process lifetime. */
 struct mm_host_api {
-    std::uint32_t version;         /* 2 */
+    std::uint32_t version;         /* 3; new fields are appended */
     const void   *main_image;      /* mapped Mach-O header of the executable */
     int           argc;
     char        **argv;
@@ -102,9 +108,10 @@ struct mm_host_api {
      * (untranslated instruction), SIGSEGV/SIGBUS (memory fault) and SIGTRAP
      * (brk) to these with Darwin siginfo/ucontext arguments. */
     std::uint64_t (*signal_install)(int signum, std::uint64_t handler_va, std::uint32_t flags, std::uint32_t mask);
-    /* Calls guest function `fn_va` with up to eight integer arguments on the
-     * calling guest thread (nested run on the same thread and guest stack)
-     * and returns its x0. The caller's guest registers are preserved. */
+    /* Calls guest function `fn_va` with up to eight integer arguments and
+     * returns its x0. A guest caller uses a nested run on its own stack;
+     * a native framework worker gets a persistent guest thread and stack
+     * on its first callback. The caller's guest registers are preserved. */
     std::uint64_t (*call_guest)(std::uint64_t fn_va, const std::uint64_t *args, int nargs);
     /* True if `va` is inside the translated code of the executable, i.e.
      * a function pointer that must be called with call_guest rather than
@@ -131,8 +138,24 @@ struct mm_host_api {
      * For a host function that is about to report something the guest did
      * (an alert, an unimplemented call), so the log says where it came from. */
     void (*print_guest_backtrace)();
+
+    /* v3: prepare/release on the native processing thread before/after
+     * activation. Handles on one native thread share a prefaulted guest
+     * stack and identity. Invoke rejects concurrent/reentrant use, returns
+     * faults as data, and avoids thread-registration and handler-lifecycle
+     * locks. The caller owns handle lifetime and must quiesce before release.
+     * Unbound host branch targets are rejected; no dynamic host target
+     * discovery occurs here. Guest DSP, dispatchers and host callees require
+     * a realtime audit; this API imposes no execution time limit. */
+    int (*prepare_guest_callback)(std::uint64_t fn_va, std::size_t stack_size, void **handle);
+    int (*invoke_guest_callback)(void *handle, const std::uint64_t *args, int nargs, mm_callback_result *result);
+    int (*release_guest_callback)(void *handle);
 };
 using mm_dylib_init_fn = void (*)(const mm_host_api *);
+/* Optional machoman_dylib_start hook: all host APIs and guest translations
+ * are ready, and callbacks run on the guest main thread before its static
+ * initializers. init hooks register metadata without executing guest code. */
+using mm_dylib_start_fn = void (*)();
 
 /* Translated code mapped into executable memory, re-enterable any number
  * of times (each host call-out returns here and resumes via run()). Its
@@ -166,6 +189,7 @@ private:
     std::uint8_t *mem_ = nullptr;
     std::size_t mem_size_ = 0;
     std::uint8_t *code_ = nullptr;             /* translated instructions start */
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> entry_ranges_; /* cold offset -> source offset */
 };
 
 /* One entry in the Darwin -> host syscall translation table. `darwin_nr`

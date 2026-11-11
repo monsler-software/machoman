@@ -10,11 +10,16 @@
  * Guest arguments arrive as plain integer registers, so pointers are guest
  * VAs that are directly dereferenceable (single address space). */
 #include "internal.h"
+#include "darwin_stat.h"
 #include "machoman/macho.h"
+#include "machoman/objc_framework.h"
 #include "machoman/runtime.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <cstdarg>
 #include <cstdint>
@@ -24,6 +29,7 @@
 #include <string_view>
 #include <ctime>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -139,42 +145,6 @@ int open_flags_to_darwin(int f) {
 
 /* ---- struct stat (64-bit inode layout, the only one on arm64) --------- */
 
-struct darwin_timespec { std::int64_t tv_sec, tv_nsec; };
-struct darwin_stat_t {
-    std::int32_t  st_dev;
-    std::uint16_t st_mode;
-    std::uint16_t st_nlink;
-    std::uint64_t st_ino;
-    std::uint32_t st_uid, st_gid;
-    std::int32_t  st_rdev;
-    std::int32_t  pad;
-    darwin_timespec st_atimespec, st_mtimespec, st_ctimespec, st_birthtimespec;
-    std::int64_t  st_size, st_blocks;
-    std::int32_t  st_blksize;
-    std::uint32_t st_flags, st_gen;
-    std::int32_t  st_lspare;
-    std::int64_t  st_qspare[2];
-};
-static_assert(sizeof(darwin_stat_t) == 144);
-
-void convert_stat(const struct stat &h, darwin_stat_t *d) {
-    std::memset(d, 0, sizeof *d);
-    d->st_dev = static_cast<std::int32_t>(h.st_dev);
-    d->st_mode = static_cast<std::uint16_t>(h.st_mode);
-    d->st_nlink = static_cast<std::uint16_t>(h.st_nlink);
-    d->st_ino = h.st_ino;
-    d->st_uid = h.st_uid;
-    d->st_gid = h.st_gid;
-    d->st_rdev = static_cast<std::int32_t>(h.st_rdev);
-    d->st_atimespec = {h.st_atim.tv_sec, h.st_atim.tv_nsec};
-    d->st_mtimespec = {h.st_mtim.tv_sec, h.st_mtim.tv_nsec};
-    d->st_ctimespec = {h.st_ctim.tv_sec, h.st_ctim.tv_nsec};
-    d->st_birthtimespec = d->st_ctimespec;
-    d->st_size = h.st_size;
-    d->st_blocks = h.st_blocks;
-    d->st_blksize = static_cast<std::int32_t>(h.st_blksize);
-}
-
 /* ---- dirent ------------------------------------------------------------ */
 
 struct darwin_dirent {
@@ -259,6 +229,7 @@ __attribute__((visibility("default"))) void machoman_dylib_init(const mm_host_ap
 } /* extern "C" */
 
 const mm_host_api *mm_libsystem_api() { return g_api; }
+int mm_darwin_errno(int error) { return to_darwin_errno(error); }
 
 std::uint64_t mm_call_callback(const void *fn, const std::uint64_t *args, int n) {
     if (g_api && g_api->is_guest_code(reinterpret_cast<std::uintptr_t>(fn)))
@@ -450,14 +421,22 @@ std::size_t darwin_confstr(int name, char *buf, std::size_t len) {
     case 65536:   /* _CS_DARWIN_USER_DIR */
     case 65537:   /* _CS_DARWIN_USER_TEMP_DIR */
     case 65538: { /* _CS_DARWIN_USER_CACHE_DIR */
-        const char *base = std::getenv("XDG_RUNTIME_DIR");
-        if (!base) base = std::getenv("TMPDIR");
-        std::string dir = (base ? std::string(base) : "/tmp") + "/machoman-" + std::to_string(getuid());
-        ::mkdir(dir.c_str(), 0700);
-        if (name == 65537) dir += "/T";
-        else if (name == 65538) dir += "/C";
-        if (name != 65536) ::mkdir(dir.c_str(), 0700);
-        value = dir + "/";
+        /* A display's runtime directory can be read-only to this process.
+         * Respect an explicit TMPDIR and only report a directory that we
+         * could create and can write to. */
+        const char *bases[] = {std::getenv("TMPDIR"), std::getenv("XDG_RUNTIME_DIR"), "/tmp"};
+        for (const char *base : bases) {
+            if (!base || !*base) continue;
+            std::string dir = std::string(base) + "/machoman-" + std::to_string(getuid());
+            if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) continue;
+            if (name == 65537) dir += "/T";
+            else if (name == 65538) dir += "/C";
+            if (name != 65536 && ::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) continue;
+            if (::access(dir.c_str(), W_OK | X_OK) != 0) continue;
+            value = dir + "/";
+            break;
+        }
+        if (value.empty()) return 0;
         break;
     }
     default:
@@ -712,6 +691,12 @@ int spawn_common(int *pid_out, const char *path, char *const *argv, char *const 
     const char *launcher = std::getenv("MACHOMAN_EXE");
     const char *venv = std::getenv("MACHOMAN_VENV");
     const bool nested = file_is_macho(path) && launcher && venv;
+    if (nested && std::getenv("MACHOMAN_DISABLE_GUEST_SUBPROCESSES")) {
+        /* Diagnostic isolation: each helper has a separate translation
+         * image and can exhaust the UI run's cgroup memory budget. */
+        std::fprintf(stderr, "posix_spawn: guest helper disabled for this diagnostic run: %s\n", path);
+        return ENOMEM;
+    }
     if (nested) {
         args.push_back(launcher);
         args.push_back("run");
@@ -856,6 +841,46 @@ int darwin_dyld_find_unwind_sections(void *addr, dyld_unwind_sections *info) {
 
 void *darwin_dlsym(void *, const char *) DARWIN(dlsym);
 void *darwin_dlsym(void *, const char *) { return nullptr; }
+
+bool darwin_NSIsSymbolNameDefined(const char *name) DARWIN(NSIsSymbolNameDefined);
+bool darwin_NSIsSymbolNameDefined(const char *name) {
+    if (!name) return false;
+    const char *plain = name[0] == '_' ? name + 1 : name;
+    if (std::strstr(plain, "GREMEDY")) return false;
+    if (dlsym(RTLD_DEFAULT, plain)) return true;
+    static void *libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    if (libgl && dlsym(libgl, plain)) return true;
+    using proc_fn = void (*)();
+    static auto egl_get_proc = reinterpret_cast<proc_fn (*)(const char *)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+    if (egl_get_proc && egl_get_proc(plain)) return true;
+    return false;
+}
+
+bool darwin_NSIsSymbolNameDefinedInImage(void *, const char *name) DARWIN(NSIsSymbolNameDefinedInImage);
+bool darwin_NSIsSymbolNameDefinedInImage(void *, const char *name) {
+    return darwin_NSIsSymbolNameDefined(name);
+}
+
+void *darwin_NSLookupAndBindSymbol(const char *name) DARWIN(NSLookupAndBindSymbol);
+void *darwin_NSLookupAndBindSymbol(const char *name) {
+    if (!name) return nullptr;
+    const char *plain = name[0] == '_' ? name + 1 : name;
+    if (std::strstr(plain, "GREMEDY")) return nullptr;
+    if (void *sym = dlsym(RTLD_DEFAULT, plain)) return sym;
+    static void *libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    if (libgl) {
+        if (void *sym = dlsym(libgl, plain)) return sym;
+    }
+    using proc_fn = void (*)();
+    static auto egl_get_proc = reinterpret_cast<proc_fn (*)(const char *)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+    if (egl_get_proc) {
+        if (void *sym = reinterpret_cast<void *>(egl_get_proc(plain))) return sym;
+    }
+    return nullptr;
+}
+
+void *darwin_NSAddressOfSymbol(void *sym) DARWIN(NSAddressOfSymbol);
+void *darwin_NSAddressOfSymbol(void *sym) { return sym; }
 
 void darwin_dyld_stub_binder() DARWIN(dyld_stub_binder);
 void darwin_dyld_stub_binder() {
@@ -1150,33 +1175,78 @@ void darwin_pthread_jit_write_protect_np(int) {}
 void darwin_sys_icache_invalidate(void *, std::size_t) DARWIN(sys_icache_invalidate);
 void darwin_sys_icache_invalidate(void *, std::size_t) {}
 
-/* ---- libdispatch semaphores (enough for thread parking) --------------- */
+/* ---- libdispatch semaphores ------------------------------------------ */
 
-sem_t *darwin_dispatch_semaphore_create(long value) DARWIN(dispatch_semaphore_create);
-sem_t *darwin_dispatch_semaphore_create(long value) {
-    auto *s = new sem_t;
-    sem_init(s, 0, static_cast<unsigned>(value));
+struct dispatch_semaphore_object {
+    mm_objc_object header;
+    std::mutex mutex;
+    std::condition_variable available;
+    std::uint64_t value = 0, waiters = 0;
+};
+
+static mm_objc_class *dispatch_semaphore_class() {
+    static mm_objc_class storage{}, metaclass{};
+    static auto *cls = [] {
+        auto *c = mm_objc_define_class("OS_dispatch_semaphore", mm_objc_class_named("NSObject"),
+            sizeof(dispatch_semaphore_object), &storage, &metaclass);
+        mmfw::register_lifecycle<dispatch_semaphore_object>(c);
+        return c;
+    }();
+    return cls;
+}
+
+dispatch_semaphore_object *darwin_dispatch_semaphore_create(long value) DARWIN(dispatch_semaphore_create);
+dispatch_semaphore_object *darwin_dispatch_semaphore_create(long value) {
+    if (value < 0) return nullptr;
+    auto *s = mmfw::make<dispatch_semaphore_object>(dispatch_semaphore_class());
+    s->value = static_cast<std::uint64_t>(value);
     return s;
 }
-long darwin_dispatch_semaphore_wait(sem_t *s, std::uint64_t timeout) DARWIN(dispatch_semaphore_wait);
-long darwin_dispatch_semaphore_wait(sem_t *s, std::uint64_t timeout) {
-    if (timeout == ~0ull) { while (sem_wait(s) < 0 && errno == EINTR) {} return 0; }
-    if (timeout == 0) return sem_trywait(s) == 0 ? 0 : 49;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += static_cast<time_t>(timeout / 1000000000ull);
-    ts.tv_nsec += static_cast<long>(timeout % 1000000000ull);
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    return sem_timedwait(s, &ts) == 0 ? 0 : 49;
+long darwin_dispatch_semaphore_wait(dispatch_semaphore_object *s, std::uint64_t timeout) DARWIN(dispatch_semaphore_wait);
+long darwin_dispatch_semaphore_wait(dispatch_semaphore_object *s, std::uint64_t timeout) {
+    std::unique_lock lock(s->mutex);
+    if (!s->value) {
+        if (timeout == 0) return 49;
+        ++s->waiters;
+        bool acquired = true;
+        if (timeout == ~0ull) {
+            s->available.wait(lock, [&] { return s->value != 0; });
+        } else {
+            // dispatch_time_t is an absolute monotonic nanosecond deadline.
+            auto deadline = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
+                static_cast<std::int64_t>(std::min(timeout,
+                    static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))));
+            acquired = s->available.wait_until(lock, deadline, [&] { return s->value != 0; });
+        }
+        --s->waiters;
+        if (!acquired) return 49;
+    }
+    --s->value;
+    return 0;
 }
-long darwin_dispatch_semaphore_signal(sem_t *s) DARWIN(dispatch_semaphore_signal);
-long darwin_dispatch_semaphore_signal(sem_t *s) { sem_post(s); return 0; }
-void darwin_dispatch_release(sem_t *s) DARWIN(dispatch_release);
-void darwin_dispatch_release(sem_t *s) { sem_destroy(s); delete s; }
+long darwin_dispatch_semaphore_signal(dispatch_semaphore_object *s) DARWIN(dispatch_semaphore_signal);
+long darwin_dispatch_semaphore_signal(dispatch_semaphore_object *s) {
+    std::lock_guard lock(s->mutex);
+    bool wakes_waiter = s->waiters > s->value;
+    ++s->value;
+    if (wakes_waiter) s->available.notify_one();
+    return wakes_waiter ? 1 : 0;
+}
+void darwin_dispatch_retain(mm_id object) DARWIN(dispatch_retain);
+void darwin_dispatch_retain(mm_id object) { mm_objc_retain(object); }
+void darwin_dispatch_release(mm_id object) DARWIN(dispatch_release);
+void darwin_dispatch_release(mm_id object) { mm_objc_release(object); }
 std::uint64_t darwin_dispatch_time(std::uint64_t base, std::int64_t delta) DARWIN(dispatch_time);
 std::uint64_t darwin_dispatch_time(std::uint64_t base, std::int64_t delta) {
     if (base == ~0ull) return base;
-    return base + static_cast<std::uint64_t>(delta);
+    if (base == 0) base = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (delta < 0) {
+        auto magnitude = std::uint64_t{0} - static_cast<std::uint64_t>(delta);
+        return magnitude >= base ? 1 : base - magnitude;
+    }
+    auto increment = static_cast<std::uint64_t>(delta);
+    return increment >= ~0ull - base ? ~0ull : base + increment;
 }
 
 /* Unwinding is not defined here on purpose. Apple ships libunwind inside

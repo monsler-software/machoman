@@ -1,5 +1,0 @@
-framework module JavaRuntimeSupport {
-    umbrella header "JavaRuntimeSupport.h"
-    export *
-    module * { export * }
-}

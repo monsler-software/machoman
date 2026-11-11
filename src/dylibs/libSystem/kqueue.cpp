@@ -13,6 +13,8 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -312,6 +314,55 @@ namespace {
 std::mutex g_semaphores_mu;
 std::unordered_map<unsigned, sem_t *> g_semaphores;
 unsigned g_next_semaphore = 0x1000;
+
+/* Darwin task_info counts 32-bit words and packs these records to four
+ * bytes even on arm64. Linux values describe the complete host process,
+ * including translations and native framework memory. */
+#pragma pack(push, 4)
+struct task_basic_record {
+    std::uint64_t virtual_size, resident_size, resident_peak;
+    std::int32_t user_seconds, user_microseconds, system_seconds, system_microseconds, policy, suspend_count;
+};
+struct task_legacy_record {
+    std::int32_t suspend_count;
+    std::uint64_t virtual_size, resident_size;
+    std::int32_t user_seconds, user_microseconds, system_seconds, system_microseconds, policy;
+};
+struct task_vm_record {
+    std::uint64_t virtual_size;
+    std::int32_t region_count, page_size;
+    std::uint64_t resident_size, resident_peak, device, device_peak, internal, internal_peak,
+        external, external_peak, reusable, reusable_peak, purgeable_pmap, purgeable_resident,
+        purgeable_virtual, compressed, compressed_peak, compressed_lifetime, phys_footprint,
+        min_address, max_address;
+};
+#pragma pack(pop)
+static_assert(sizeof(task_basic_record) == 48 && sizeof(task_legacy_record) == 40);
+static_assert(sizeof(task_vm_record) == 168 && offsetof(task_vm_record, phys_footprint) == 144);
+
+struct process_memory {
+    std::uint64_t virtual_size = 0, resident = 0, peak = 0, anonymous = 0, file = 0, swap = 0;
+};
+bool read_process_memory(process_memory &memory) {
+    FILE *status = std::fopen("/proc/self/status", "r");
+    if (!status) return false;
+    char line[256];
+    while (std::fgets(line, sizeof line, status)) {
+        char key[64];
+        unsigned long long kb;
+        if (std::sscanf(line, "%63s %llu kB", key, &kb) != 2) continue;
+        const std::uint64_t bytes = kb * 1024;
+        if (!std::strcmp(key, "VmSize:")) memory.virtual_size = bytes;
+        else if (!std::strcmp(key, "VmRSS:")) memory.resident = bytes;
+        else if (!std::strcmp(key, "VmHWM:")) memory.peak = bytes;
+        else if (!std::strcmp(key, "RssAnon:")) memory.anonymous = bytes;
+        else if (!std::strcmp(key, "RssFile:")) memory.file = bytes;
+        else if (!std::strcmp(key, "VmSwap:")) memory.swap = bytes;
+    }
+    std::fclose(status);
+    return memory.virtual_size != 0;
+}
+
 sem_t *semaphore_for(unsigned port) {
     std::lock_guard lock(g_semaphores_mu);
     auto it = g_semaphores.find(port);
@@ -367,9 +418,52 @@ int darwin_thread_info(unsigned, int, void *, unsigned *count) {
     return 4; /* KERN_INVALID_ARGUMENT: no thread info to report */
 }
 int darwin_task_info(unsigned, int, void *, unsigned *count) DARWIN(task_info);
-int darwin_task_info(unsigned, int, void *, unsigned *count) {
-    if (count) *count = 0;
-    return 4;
+int darwin_task_info(unsigned task, int flavor, void *out, unsigned *count) {
+    if (task != mach_task_self_storage || !out || !count) return 4;
+    unsigned words = 0;
+    if (flavor == 20) words = sizeof(task_basic_record) / 4;
+    else if (flavor == 5 || flavor == 18) words = sizeof(task_legacy_record) / 4;
+    else if (flavor == 22) {
+        if (*count >= 42) words = 42; /* TASK_VM_INFO_REV2 */
+        else if (*count >= 38) words = 38; /* REV1: footprint */
+        else if (*count >= 36) words = 36; /* REV0 */
+    }
+    if (!words || *count < words) return 4;
+    process_memory memory;
+    if (!read_process_memory(memory)) return 5; /* KERN_FAILURE */
+    if (flavor == 20) {
+        const task_basic_record info{memory.virtual_size, memory.resident, memory.peak, 0, 0, 0, 0, 1, 0};
+        std::memcpy(out, &info, sizeof info);
+    } else if (flavor == 5 || flavor == 18) {
+        const task_legacy_record info{0, memory.virtual_size, memory.resident, 0, 0, 0, 0, 1};
+        std::memcpy(out, &info, sizeof info);
+    } else {
+        task_vm_record info{};
+        info.virtual_size = memory.virtual_size;
+        info.resident_size = memory.resident;
+        info.resident_peak = memory.peak;
+        info.page_size = static_cast<std::int32_t>(sysconf(_SC_PAGESIZE));
+        info.internal = memory.anonymous;
+        info.external = memory.file;
+        /* Linux has no Mach footprint ledger; RSS plus swapped anonymous
+         * pages approximates the process's physical memory obligation. */
+        info.phys_footprint = memory.resident + memory.swap;
+        FILE *maps = std::fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[1024];
+            while (std::fgets(line, sizeof line, maps)) {
+                unsigned long long start, end;
+                if (std::sscanf(line, "%llx-%llx", &start, &end) != 2) continue;
+                ++info.region_count;
+                if (!info.min_address || start < info.min_address) info.min_address = start;
+                info.max_address = std::max(info.max_address, static_cast<std::uint64_t>(end));
+            }
+            std::fclose(maps);
+        }
+        std::memcpy(out, &info, words * 4);
+    }
+    *count = words;
+    return 0;
 }
 int darwin_host_info(unsigned, int, void *, unsigned *count) DARWIN(host_info);
 int darwin_host_info(unsigned, int, void *, unsigned *count) {

@@ -17,13 +17,29 @@ enum mm_x64_reg : int {
 
 struct mm_x64_buf {
     std::vector<std::uint8_t> bytes;
+    /* imm64 operands containing native helper addresses; rebased on cache load. */
+    std::vector<std::uint64_t> host_relocations;
+    /* Transient AOT state; XMM4/5 hold clean copies of guest V results.
+     * Cleared before returning a translation, never stored in the cache. */
+    struct vector_residency {
+        bool active = false;
+        int guest[2] = {-1, -1};
+        unsigned replace = 0;
+        std::uint32_t written = 0;
+    } vectors;
     std::size_t size() const { return bytes.size(); }
 };
+
+/* Optional instruction sets used by AOT emission. Include this mask in
+ * disk-cache identity. MACHOMAN_DISABLE_AVX2 selects the portable fallback. */
+inline constexpr std::uint64_t MM_X64_FEATURE_AVX2 = 1;
+std::uint64_t mm_x64_codegen_features();
 
 void mm_x64_emit(mm_x64_buf &buf, std::span<const std::uint8_t> bytes);
 
 /* mov r64, imm: picks the shortest encoding (sign-extended imm32, or imm64). */
 void mm_x64_emit_mov_imm(mm_x64_buf &buf, int reg, std::uint64_t imm);
+void mm_x64_emit_host_address(mm_x64_buf &buf, int reg, std::uintptr_t address);
 
 /* mov r64, [base + disp32] / mov [base + disp32], r64 */
 void mm_x64_emit_mov_load(mm_x64_buf &buf, int dst, int base, std::int32_t disp);
@@ -46,6 +62,8 @@ enum class mm_x64_alu : std::uint8_t { add = 0, or_ = 1, adc = 2, sbb = 3, and_ 
 void mm_x64_emit_alu_rr(mm_x64_buf &buf, mm_x64_alu op, int dst, int src, bool w64);
 void mm_x64_emit_alu_imm32(mm_x64_buf &buf, mm_x64_alu op, int reg, std::int32_t imm, bool w64);
 void mm_x64_emit_test_rr(mm_x64_buf &buf, int lhs, int rhs, bool w64);
+/* test dword [base + disp32], imm32; does not modify memory. */
+void mm_x64_emit_test_mem_imm32(mm_x64_buf &buf, int base, std::int32_t disp, std::uint32_t mask);
 
 /* Register-register 64-bit ALU ops, dst = dst OP src. */
 void mm_x64_emit_mov_reg(mm_x64_buf &buf, int dst, int src);
@@ -161,10 +179,14 @@ void mm_x64_emit_pshuflw(mm_x64_buf &buf, int dst, int src, std::uint8_t imm);
 void mm_x64_emit_pshufhw(mm_x64_buf &buf, int dst, int src, std::uint8_t imm);
 enum class mm_x64_vshift : std::uint8_t { psrlw, psraw, psllw, psrld, psrad, pslld, psrlq, psllq, psrldq, pslldq };
 void mm_x64_emit_sse_shift_imm(mm_x64_buf &buf, mm_x64_vshift op, int reg, std::uint8_t imm);
+/* AVX2, 128-bit lanes; shifts saturate rather than masking their count. */
+enum class mm_x64_vshift_var : std::uint8_t { psllvd, psrlvd, psravd, psllvq, psrlvq };
+void mm_x64_emit_vshift_var(mm_x64_buf &buf, mm_x64_vshift_var op, int dst, int value, int counts);
 void mm_x64_emit_movdqu_load(mm_x64_buf &buf, int xmm, int base, std::int32_t disp);
 void mm_x64_emit_movdqu_store(mm_x64_buf &buf, int base, std::int32_t disp, int xmm);
 void mm_x64_emit_movq_load(mm_x64_buf &buf, int xmm, int base, std::int32_t disp);   /* zero-extends to 128 */
 void mm_x64_emit_movq_store(mm_x64_buf &buf, int base, std::int32_t disp, int xmm);
+void mm_x64_emit_movq_rr(mm_x64_buf &buf, int dst, int src); /* copies low 64, zeroes upper 64 */
 void mm_x64_emit_movq_from_gpr(mm_x64_buf &buf, int xmm, int r64);
 void mm_x64_emit_movq_to_gpr(mm_x64_buf &buf, int r64, int xmm);
 void mm_x64_emit_pinsrq(mm_x64_buf &buf, int xmm, int r64, std::uint8_t idx);
@@ -172,7 +194,14 @@ void mm_x64_emit_pextrq(mm_x64_buf &buf, int r64, int xmm, std::uint8_t idx);
 void mm_x64_emit_pinsrb(mm_x64_buf &buf, int xmm, int r32, std::uint8_t idx);
 void mm_x64_emit_pinsrw(mm_x64_buf &buf, int xmm, int r32, std::uint8_t idx);
 void mm_x64_emit_pinsrd(mm_x64_buf &buf, int xmm, int r32, std::uint8_t idx);
+void mm_x64_emit_pextrd(mm_x64_buf &buf, int r32, int xmm, std::uint8_t idx);
 void mm_x64_emit_pmovmskb(mm_x64_buf &buf, int r32, int xmm);
+
+/* AES-NI: dst = MixColumns(SubBytes(ShiftRows(dst))) ^ src / the inverse /
+ * dst = InvMixColumns(src). */
+void mm_x64_emit_aesenc(mm_x64_buf &buf, int dst, int src);
+void mm_x64_emit_aesdec(mm_x64_buf &buf, int dst, int src);
+void mm_x64_emit_aesimc(mm_x64_buf &buf, int dst, int src);
 
 /* ---- SSE floating point ------------------------------------------------ */
 /* Lane kind: scalar single/double, packed single/double. Selects the

@@ -59,6 +59,13 @@ MM_OBJC_API mm_objc_class *mm_objc_define_class(const char *name, mm_objc_class 
 MM_OBJC_API mm_objc_class *mm_objc_class_named(const char *name);
 MM_OBJC_API void mm_objc_add_method(mm_objc_class *cls, const char *selector, void *imp, const char *types);
 MM_OBJC_API void mm_objc_add_class_method(mm_objc_class *cls, const char *selector, void *imp, const char *types);
+/* Enable lazy, stateful compatibility methods on a synthesized class.
+ * Typed contracts take precedence over selector heuristics. Registration
+ * copies the encoding; returns 0 for unsupported/malformed ABI layouts.
+ * Object properties retain their values; scalar/aggregate properties
+ * start at zero. Raw pointer returns stay NULL and are reported as risky. */
+MM_OBJC_API void mm_objc_enable_dynamic_stubs(mm_objc_class *cls);
+MM_OBJC_API int mm_objc_add_stub_method(mm_objc_class *cls, const char *selector, const char *types);
 MM_OBJC_API mm_SEL mm_objc_sel(const char *name);
 
 /* Sends a message from host code with up to six integer arguments after
@@ -76,6 +83,11 @@ MM_OBJC_API uint64_t mm_objc_send_super(mm_id receiver, mm_objc_class *cls, mm_S
 
 /* Allocation with the runtime's reference counting. */
 MM_OBJC_API mm_id mm_objc_alloc(mm_objc_class *cls, size_t extra_bytes);
+/* Host payloads must be constructed before guest C++ ivars. The raw
+ * allocation is finished with construct_instance after placement-new. */
+MM_OBJC_API mm_id mm_objc_alloc_raw(mm_objc_class *cls, size_t extra_bytes);
+MM_OBJC_API int mm_objc_construct_instance(mm_id obj);
+MM_OBJC_API void mm_objc_destruct_instance(mm_id obj);
 /* Frees an instance's storage and clears its weak references and
  * associations: what NSObject's -dealloc does. A host class whose
  * -dealloc destroys C++ members calls this last instead of [super dealloc]. */

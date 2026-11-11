@@ -61,8 +61,14 @@ mm_hostcall:
 
     mov  [rbx + 0*8], rax
 
+    cmp  dword ptr [rbx + 904], 0 /* typed dispatcher already wrote FP results */
+    je   .Lhost_fp_return
+    mov  dword ptr [rbx + 904], 0
+    jmp  .Lhost_return_done
+.Lhost_fp_return:
     movsd qword ptr [rbx + 384 + 0*16], xmm0
     movsd qword ptr [rbx + 384 + 1*16], xmm1
+.Lhost_return_done:
 
     pop  r12
     pop  rbx

@@ -1,5 +1,0 @@
-framework module ScreenSaver [system] {
-umbrella header "ScreenSaver.h"
-export *
-module * { export * }
-}

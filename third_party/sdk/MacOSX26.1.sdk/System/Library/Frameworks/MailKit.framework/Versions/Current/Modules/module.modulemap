@@ -1,6 +1,0 @@
-framework module MailKit [system] {
-  umbrella header "MailKit.h"
-
-  export *
-  module * { export * }
-}

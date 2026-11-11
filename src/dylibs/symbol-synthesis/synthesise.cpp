@@ -10,8 +10,9 @@
  *                                          subclass of NSObject, so the
  *                                          guest can reference and
  *                                          subclass it; a message it does
- *                                          not inherit aborts naming the
- *                                          selector (libobjc does that)
+ *                                          not inherit uses libobjc's
+ *                                          typed, stateful compatibility
+ *                                          methods when metadata exists
  *   k…, …Key, …Name, …Domain, …Notification, …                  an NSString
  *                                          whose value is the symbol name
  *                                          (Apple's constants are opaque
@@ -25,8 +26,10 @@
  * $MACHOMAN_STUB_TRACE=1 logs every synthesised symbol. */
 #include "machoman/objc_host.h"
 #include "machoman/runtime.h"
+#include "file_types.h"
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,24 +54,21 @@ bool trace() { static const bool on = std::getenv("MACHOMAN_STUB_TRACE") != null
 
 /* ---- function stubs ------------------------------------------------------ */
 
-struct stub_entry { std::string symbol; };
+struct stub_entry { std::string symbol; std::atomic<bool> reported{false}; };
 
 extern "C" std::uint64_t mm_stub_report(stub_entry *e) {
-    static std::mutex mu;
-    static std::unordered_map<std::string, int> seen;
-    std::lock_guard lock(mu);
-    if (seen[e->symbol]++ == 0)
-        std::fprintf(stderr, "stub: %s is not implemented (call returns 0)\n", e->symbol.c_str());
+    if (!e->reported.load(std::memory_order_relaxed) && !e->reported.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "stub: [risk:unknown-abi] %s is not implemented (zero register result; pointer/structure/out-parameter contract unknown)\n", e->symbol.c_str());
     return 0;
 }
 
-/* One trampoline per symbol so the report can name it:
- *   mov rdi, <entry>; mov rax, mm_stub_report; jmp rax
- * They are cut from a shared executable page. */
+/* One trampoline per symbol, cut from a shared executable page. Reporting
+ * has one relaxed atomic flag per entry and no warm-path lock/hash lookup;
+ * the trampoline clears integer and FP results after the report. */
 void *make_function_stub(const std::string &symbol) {
     static std::uint8_t *page = nullptr;
     static std::size_t used = 4096;
-    constexpr std::size_t slot = 32;
+    constexpr std::size_t slot = 64;
     if (used + slot > 4096) {
         void *p = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) return nullptr;
@@ -86,7 +86,16 @@ void *make_function_stub(const std::string &symbol) {
     code[i++] = 0x48; code[i++] = 0xB8;                       /* movabs rax, imm64 */
     const auto fn = reinterpret_cast<std::uint64_t>(&mm_stub_report);
     std::memcpy(code + i, &fn, 8); i += 8;
-    code[i++] = 0xFF; code[i++] = 0xE0;                       /* jmp rax */
+    const std::uint8_t tail[] = {
+        0x48, 0x83, 0xEC, 0x08, /* sub rsp, 8: align before call */
+        0xFF, 0xD0,             /* call rax */
+        0x48, 0x83, 0xC4, 0x08, /* add rsp, 8 */
+        0x31, 0xC0,             /* xor eax, eax */
+        0x66, 0x0F, 0xEF, 0xC0, /* pxor xmm0, xmm0 */
+        0x66, 0x0F, 0xEF, 0xC9, /* pxor xmm1, xmm1 */
+        0xC3
+    };
+    std::memcpy(code + i, tail, sizeof tail);
     return code;
 }
 
@@ -106,6 +115,7 @@ mm_objc_class *stub_class(const std::string &name, bool want_meta) {
         auto *p = new class_pair{};
         mm_objc_class *nsobject = mm_objc_class_named("NSObject");
         mm_objc_define_class(name.c_str(), nsobject, sizeof(void *), &p->cls, &p->meta);
+        mm_objc_enable_dynamic_stubs(&p->cls);
         it = classes.emplace(name, p).first;
     }
     return want_meta ? &it->second->meta : &it->second->cls;
@@ -114,12 +124,15 @@ mm_objc_class *stub_class(const std::string &name, bool want_meta) {
 /* A constant like `extern NSString *const kFoo` is a *variable*: the guest
  * loads the pointer out of it, so what a bind needs is the address of a
  * cell holding the object, not the object itself. The value is an NSString
- * of the symbol's own name — Apple's framework constants are opaque tokens
- * compared by pointer or by text, and the name is unique and printable. */
+ * of the symbol's own name for opaque keys. File type constants instead
+ * carry their public UTI values, consumed by CoreServices. */
 void *constant_string(const std::string &name) {
     mm_objc_class *nsstring = mm_objc_class_named("NSString");
     if (!nsstring) return nullptr;
-    const std::uint64_t arg = reinterpret_cast<std::uintptr_t>(name.c_str());
+    std::string_view text(name);
+    for (const auto &type : mm_av_file_types)
+        if (type.symbol == name) { text = type.identifier; break; }
+    const std::uint64_t arg = reinterpret_cast<std::uintptr_t>(text.data());
     mm_id s = reinterpret_cast<mm_id>(mm_objc_send(reinterpret_cast<mm_id>(nsstring), mm_objc_sel("stringWithUTF8String:"), 1, &arg));
     if (!s) return nullptr;
     auto *cell = new mm_id(mm_objc_retain(s));
@@ -135,6 +148,20 @@ void *constant_string(const std::string &name) {
  * address rather than called is the one case this misreads; it then behaves
  * as a constant and the guest fails where it calls it. */
 bool looks_like_function(unsigned flags) { return (flags & MM_SYMBOL_LAZY) != 0; }
+
+void *lookup_gl_symbol(const std::string &name) {
+    if (!name.starts_with("gl")) return nullptr;
+    static void *libgl = dlopen("libGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    if (libgl) {
+        if (void *sym = dlsym(libgl, name.c_str())) return sym;
+    }
+    using proc_fn = void (*)();
+    static auto egl_get_proc = reinterpret_cast<proc_fn (*)(const char *)>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+    if (egl_get_proc) {
+        if (void *sym = reinterpret_cast<void *>(egl_get_proc(name.c_str()))) return sym;
+    }
+    return nullptr;
+}
 
 } // namespace
 
@@ -160,6 +187,9 @@ void *mm_synthesise_symbol(const char *raw, unsigned flags) {
          * compared for identity by the personality routine. */
         value = stub_class(std::string(name.substr(14)), false);
         kind = "ehtype";
+    } else if (void *gl_sym = lookup_gl_symbol(std::string(name))) {
+        value = gl_sym;
+        kind = "host gl function";
     } else if (looks_like_function(flags)) {
         value = make_function_stub(symbol);
     } else {

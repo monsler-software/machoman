@@ -29,6 +29,7 @@
 namespace fnd {
 
 using id = mm_id;
+id date_from_epoch(double seconds);
 using Class = mm_objc_class *;
 using SEL = mm_SEL;
 using CFIndex = std::int64_t;
@@ -50,16 +51,20 @@ template <typename T> T *construct(id o) {
     Class isa = o->isa;
     T *t = new (static_cast<void *>(o)) T;
     t->base.isa = isa;
+    if (!mm_objc_construct_instance(o)) {
+        t->~T();
+        mm_objc_free_instance(o);
+        return nullptr;
+    }
     return t;
 }
 
 template <typename T> std::uint64_t alloc_imp(id cls, SEL) {
-    id o = mm_objc_alloc(reinterpret_cast<Class>(cls), 0);
-    construct<T>(o);
-    return reinterpret_cast<std::uintptr_t>(o);
+    return reinterpret_cast<std::uintptr_t>(construct<T>(mm_objc_alloc_raw(reinterpret_cast<Class>(cls), 0)));
 }
 
 template <typename T> std::uint64_t dealloc_imp(id self, SEL) {
+    mm_objc_destruct_instance(self);
     reinterpret_cast<T *>(self)->~T();
     mm_objc_free_instance(self);
     return 0;
@@ -74,7 +79,7 @@ template <typename T> void register_lifecycle(Class cls) {
 
 /* Allocates and constructs an instance of a host class from host code. */
 template <typename T> T *make(Class cls) {
-    id o = mm_objc_alloc(cls, 0);
+    id o = mm_objc_alloc_raw(cls, 0);
     return construct<T>(o);
 }
 
@@ -207,7 +212,11 @@ void register_plists();
 void register_bundle();
 void register_runloop();
 void register_misc();
+void register_threading();
+void enqueue_selector(id loop, id target, SEL selector, id argument, double delay, bool wait);
+void cancel_selectors(id target, SEL selector, id argument, bool match_argument);
 void register_task();      /* NSTask, NSPipe, NSFileHandle */
+void register_key_value(); /* Manual KVO and object-valued key access. */
 
 } // namespace fnd
 

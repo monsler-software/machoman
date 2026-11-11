@@ -1,8 +1,10 @@
 #include "machoman/runtime.h"
 #include "machoman/macho.h"
 #include "machoman/translator.h"
+#include "machoman/translation_cache.h"
 
 #include <algorithm>
+#include <atomic>
 #include <xmmintrin.h>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,7 @@
 #include <csetjmp>
 #include <csignal>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -32,10 +35,15 @@
 extern char **environ;
 
 extern "C" std::uint64_t mm_hostcall(mm_cpu_context *ctx, const void *fn);
-static_assert(offsetof(mm_cpu_context, x) == 0 && offsetof(mm_cpu_context, v) == 384,
+static_assert(offsetof(mm_cpu_context, x) == 0 && offsetof(mm_cpu_context, v) == 384 &&
+              offsetof(mm_cpu_context, host_result_in_context) == 904,
               "hostcall_x86_64.S hardcodes these offsets");
 
 namespace {
+
+/* Prepared callbacks retain an immutable image list on their owning
+ * thread, including a fault lookup that needs no global code-map mutex. */
+thread_local std::span<const mm_runtime_code *const> g_callback_fault_codes;
 
 std::vector<std::uint8_t> read_whole_file(const std::filesystem::path &path) {
     std::ifstream f(path, std::ios::binary);
@@ -46,6 +54,11 @@ std::vector<std::uint8_t> read_whole_file(const std::filesystem::path &path) {
 
 bool trace_enabled() {
     static const bool on = std::getenv("MACHOMAN_TRACE") != nullptr;
+    return on;
+}
+
+bool diagnostics_enabled() {
+    static const bool on = std::getenv("MACHOMAN_DIAGNOSTICS") != nullptr;
     return on;
 }
 
@@ -223,12 +236,23 @@ struct fault_guard {
     std::uintptr_t addr = 0;
 };
 thread_local fault_guard *g_guard = nullptr;
+thread_local unsigned g_fault_scope_depth = 0;
+std::mutex g_fault_handlers_mu;
+unsigned g_fault_handler_users = 0;
+struct sigaction g_previous_segv{}, g_previous_bus{};
 
-void on_fault(int, siginfo_t *info, void *uctx) {
+void on_fault(int signum, siginfo_t *info, void *uctx) {
     fault_guard *g = g_guard;
     if (!g) {
-        signal(SIGSEGV, SIG_DFL);
-        signal(SIGBUS, SIG_DFL);
+        /* A host fault outside translated code belongs to the handler that
+         * was installed before this runtime entered its execution scope. */
+        const auto &previous = signum == SIGBUS ? g_previous_bus : g_previous_segv;
+        if (previous.sa_handler == SIG_IGN) return;
+        if (previous.sa_handler == SIG_DFL) {
+            sigaction(signum, &previous, nullptr);
+            raise(signum);
+        } else if (previous.sa_flags & SA_SIGINFO) previous.sa_sigaction(signum, info, uctx);
+        else previous.sa_handler(signum);
         return;
     }
     auto *uc = static_cast<ucontext_t *>(uctx);
@@ -236,6 +260,33 @@ void on_fault(int, siginfo_t *info, void *uctx) {
     g->addr = reinterpret_cast<std::uintptr_t>(info->si_addr);
     siglongjmp(g->jump, 1);
 }
+
+/* Signal dispositions are process-wide; the jump target is thread-local.
+ * Keep the handlers installed across host calls and nested guest callbacks.
+ * Only the first active thread installs them and the last restores them. */
+class fault_handler_scope {
+public:
+    fault_handler_scope() {
+        if (g_fault_scope_depth++ != 0) return;
+        std::lock_guard lock(g_fault_handlers_mu);
+        if (g_fault_handler_users++ != 0) return;
+        struct sigaction sa{};
+        sa.sa_sigaction = on_fault;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_previous_segv);
+        sigaction(SIGBUS, &sa, &g_previous_bus);
+    }
+    ~fault_handler_scope() {
+        if (--g_fault_scope_depth != 0) return;
+        std::lock_guard lock(g_fault_handlers_mu);
+        if (--g_fault_handler_users != 0) return;
+        sigaction(SIGSEGV, &g_previous_segv, nullptr);
+        sigaction(SIGBUS, &g_previous_bus, nullptr);
+    }
+    fault_handler_scope(const fault_handler_scope &) = delete;
+    fault_handler_scope &operator=(const fault_handler_scope &) = delete;
+};
 #endif
 
 mm_runtime_status status_from_exit(mm_exit_reason r) {
@@ -299,8 +350,11 @@ mm_runtime_code::mm_runtime_code(const mm_translation_result &result) : result_(
     std::memcpy(code_, result.code.bytes.data(), result.code.size());
 
     code_map &map = code_map::instance();
-    for (const auto &n : result.notes)
-        map.set(result.text_base + n.source_offset, reinterpret_cast<std::uintptr_t>(code_ + n.output_offset));
+    for (const auto &n : result.notes) {
+        const auto entry = n.entry_offset ? n.entry_offset : n.output_offset;
+        map.set(result.text_base + n.source_offset, reinterpret_cast<std::uintptr_t>(code_ + entry));
+        if (entry != n.output_offset) entry_ranges_.emplace_back(entry, n.source_offset);
+    }
     std::lock_guard lock(g_codes_mu);
     g_codes.push_back(this);
 }
@@ -325,6 +379,11 @@ std::uint64_t mm_runtime_code::guest_pc(std::uintptr_t host_rip) const {
     if (!code_ || host_rip < reinterpret_cast<std::uintptr_t>(code_) || host_rip >= reinterpret_cast<std::uintptr_t>(mem_) + mem_size_)
         return 0;
     const std::uint64_t off = host_rip - reinterpret_cast<std::uintptr_t>(code_);
+    if (!entry_ranges_.empty() && off >= entry_ranges_.front().first) {
+        auto it = std::upper_bound(entry_ranges_.begin(), entry_ranges_.end(), off,
+            [](std::uint64_t offset, const auto &entry) { return offset < entry.first; });
+        return result_.text_base + std::prev(it)->second;
+    }
     const auto &notes = result_.notes;
     auto it = std::upper_bound(notes.begin(), notes.end(), off,
                                [](std::uint64_t o, const mm_translate_note &n) { return o < n.output_offset; });
@@ -347,6 +406,10 @@ std::uintptr_t mm_runtime_code::translation_of(std::uint64_t va) { return code_m
 mm_runtime_status mm_runtime_code::run(mm_cpu_context &ctx, std::uint64_t entry_va) {
     if (!mem_)
         return mm_runtime_status::exec_alloc_failed;
+    /* A nested run (host code calling back into the guest) shares the outer
+     * run's context, whose translated code still walks the same process-wide
+     * table — save and restore the outer value rather than clearing it. */
+    const std::uint64_t *const outer_branch_table = ctx.branch_table;
     ctx.branch_table = code_map::instance().l1();
     ctx.entry_va = entry_va;
     ctx.exit_reason = static_cast<std::uint64_t>(mm_exit_reason::running);
@@ -355,28 +418,33 @@ mm_runtime_status mm_runtime_code::run(mm_cpu_context &ctx, std::uint64_t entry_
 #if defined(_WIN32)
     reinterpret_cast<entry_fn>(mem_)(&ctx);
 #else
+    fault_handler_scope handlers;
     fault_guard guard;
-    struct sigaction sa{}, old_segv{}, old_bus{};
-    sa.sa_sigaction = on_fault;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS, &sa, &old_bus);
     fault_guard *prev = g_guard;
     g_guard = &guard;
-    if (sigsetjmp(guard.jump, 1) == 0) {
+    /* on_fault uses SA_NODEFER and an empty mask, so fault delivery does
+     * not change the thread's signal mask. Saving it here would add a
+     * sigprocmask syscall at every guest/host transition. */
+    if (sigsetjmp(guard.jump, 0) == 0) {
         reinterpret_cast<entry_fn>(mem_)(&ctx);
     } else {
+#ifdef MM_DBG_DUMP
+        std::fprintf(stderr, "FAULT rip=%llx\n", (unsigned long long)guard.rip);
+#endif
         ctx.exit_reason = static_cast<std::uint64_t>(mm_exit_reason::memory_fault);
-        ctx.fault_va = guest_pc_anywhere(guard.rip);
+        if (g_callback_fault_codes.empty()) {
+            ctx.fault_va = guest_pc_anywhere(guard.rip);
+        } else {
+            ctx.fault_va = 0;
+            for (const auto *code : g_callback_fault_codes)
+                if ((ctx.fault_va = code->guest_pc(guard.rip))) break;
+        }
         ctx.fault_addr = guard.addr;
     }
     g_guard = prev;
-    sigaction(SIGSEGV, &old_segv, nullptr);
-    sigaction(SIGBUS, &old_bus, nullptr);
 #endif
 
-    ctx.branch_table = nullptr;
+    ctx.branch_table = outer_branch_table;
     return status_from_exit(static_cast<mm_exit_reason>(ctx.exit_reason));
 }
 
@@ -959,6 +1027,15 @@ struct darwin_ucontext {
 
 struct guest_signal { std::uint64_t handler = 0; std::uint32_t flags = 0, mask = 0; };
 
+/* Diagnostic frames are local to the interrupted thread's host stack.
+ * Read them only while that same thread is stopped in the signal handler. */
+struct host_call_frame {
+    const void *function;
+    std::uint64_t caller;
+    std::uint64_t args[8];
+    const host_call_frame *outer;
+};
+
 /* One guest thread: its register file, stack and lifecycle. */
 struct guest_thread {
     std::uint64_t id = 0;
@@ -967,7 +1044,10 @@ struct guest_thread {
     std::thread host;
     mm_runtime_status status = mm_runtime_status::ok;
     std::uint64_t result = 0;
-    bool finished = false;
+    std::atomic<bool> finished{false};
+    bool prepared_execution = false;
+    mm_callback_result callback_failure;
+    const host_call_frame *host_calls = nullptr;
     /* Frames of signal handlers currently running on this thread. */
     struct signal_frame { mm_cpu_context saved; std::unique_ptr<darwin_siginfo> info; std::unique_ptr<darwin_ucontext> uc; std::unique_ptr<darwin_mcontext> mc; };
     std::vector<signal_frame> signal_frames;
@@ -999,6 +1079,21 @@ public:
 
     mm_runtime_status load(std::vector<std::uint8_t> file, const mm_macho_image &img);
     mm_runtime_status run_main();
+    ~guest_process() {
+#if !defined(_WIN32)
+        // Stop callback producers, then drain consumers while guest images,
+        // thread contexts and host dylibs are still available.
+        for (const char *name : {"machoman_dylib_quiesce", "machoman_dylib_stop"}) {
+            std::vector<void (*)()> called;
+            for (auto &library : linker_.host_libs()) if (library->handle) {
+                auto stop = reinterpret_cast<void (*)()>(dlsym(library->handle, name));
+                if (stop && std::find(called.begin(), called.end(), stop) == called.end()) {
+                    called.push_back(stop); stop();
+                }
+            }
+        }
+#endif
+    }
     /* dyld runs these before main, dependencies first. */
     std::vector<std::uint64_t> initializers(const guest_image &g) const;
 
@@ -1012,6 +1107,9 @@ public:
     static void api_fpcr_set(std::uint64_t fpcr);
     static std::uint64_t api_signal_install(int signum, std::uint64_t handler_va, std::uint32_t flags, std::uint32_t mask);
     static std::uint64_t api_call_guest(std::uint64_t fn_va, const std::uint64_t *args, int nargs);
+    static int api_prepare_guest_callback(std::uint64_t fn_va, std::size_t stack_size, void **handle);
+    static int api_invoke_guest_callback(void *handle, const std::uint64_t *args, int nargs, mm_callback_result *result);
+    static int api_release_guest_callback(void *handle);
     static bool api_is_guest_code(std::uint64_t va);
     static const char *api_unresolved_import_name(std::uint64_t va);
     static void api_atexit_register(std::uint64_t fn_va, std::uint64_t arg);
@@ -1023,7 +1121,7 @@ public:
     static std::ptrdiff_t api_image_for_address(std::uint64_t va);
     static void api_print_guest_backtrace();
     /* Prints every guest thread's stack (the SIGQUIT handler). */
-    void dump_threads();
+    void dump_threads(std::uintptr_t interrupted_rip = 0);
 
 private:
     mm_runtime_status run_thread(guest_thread &t, std::uint64_t pc);
@@ -1065,6 +1163,20 @@ private:
 
     static inline guest_process *g_process = nullptr;
     static inline thread_local guest_thread *g_current = nullptr;
+
+    struct callback_binding {
+        guest_process *process;
+        guest_thread *thread;
+        std::thread::id owner = std::this_thread::get_id();
+        std::size_t handles = 0;
+        bool active = false;
+        std::vector<const mm_runtime_code *> codes;
+#if !defined(_WIN32)
+        fault_handler_scope handlers;
+#endif
+    };
+    struct prepared_callback { callback_binding *binding; std::uint64_t function; };
+    static inline thread_local callback_binding *g_callback_binding = nullptr;
 };
 
 mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_macho_image &img) {
@@ -1108,20 +1220,22 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
         }
         std::memcpy(reinterpret_cast<void *>(imp.bind.address + imp.image->slide), &value, 8);
         if (trace_enabled())
-            std::fprintf(stderr, "bind: %s: %s -> %s\n", imp.image->path.filename().c_str(), symbol_name(imp).c_str(),
-                         imp.guest ? "guest" : imp.host ? "host" : imp.bind.weak_table ? "own" : imp.bind.weak ? "null" : "trap");
+            std::fprintf(stderr, "bind: %s: %s -> %s [slot %llx]\n", imp.image->path.filename().c_str(), symbol_name(imp).c_str(),
+                         imp.guest ? "guest" : imp.host ? "host" : imp.bind.weak_table ? "own" : imp.bind.weak ? "null" : "trap",
+                         static_cast<unsigned long long>(imp.bind.address));
     }
     if (dyld_trace_enabled())
         std::fprintf(stderr, "dyld: %zu images, %zu imports, %zu unresolved\n", linker_.images().size(), imports_.size(), unresolved);
 
-    api_ = mm_host_api{2, reinterpret_cast<const void *>(main_->header_va()),
+    api_ = mm_host_api{3, reinterpret_cast<const void *>(main_->header_va()),
                        static_cast<int>(arg_storage_.size()), argv_.data(), envp_.data(),
                        &api_thread_create, &api_thread_join, &api_thread_self, &api_thread_stack,
                        &api_fpcr_get, &api_fpcr_set, &api_current_context, &api_signal_install,
                        &api_call_guest, &api_is_guest_code, &api_unresolved_import_name,
                        &api_atexit_register, &api_atexit_run,
                        &api_image_count, &api_image_header, &api_image_slide, &api_image_path, &api_image_for_address,
-                       &api_print_guest_backtrace};
+                       &api_print_guest_backtrace,
+                       &api_prepare_guest_callback, &api_invoke_guest_callback, &api_release_guest_callback};
     g_process = this;
 #if !defined(_WIN32)
     /* SIGQUIT (^\ or `kill -QUIT`) dumps every guest thread's stack, which
@@ -1130,9 +1244,11 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
      * the trampoline. */
     {
         struct sigaction quit{};
-        quit.sa_handler = [](int) {
-            if (g_process) g_process->dump_threads();
+        quit.sa_sigaction = [](int, siginfo_t *, void *context) {
+            const auto *uc = static_cast<const ucontext_t *>(context);
+            if (g_process) g_process->dump_threads(static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]));
         };
+        quit.sa_flags = SA_SIGINFO;
         sigemptyset(&quit.sa_mask);
         sigaction(SIGQUIT, &quit, nullptr);
     }
@@ -1152,7 +1268,10 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
 #endif
 
     for (auto &g : linker_.images()) {
-        mm_translate_buffer(g->code.bytes, g->code.addr, g->result);
+        const auto cached = mm_translate_cached(g->path, g->file, g->code.bytes, g->code.addr, g->result);
+        if (trace_enabled() || std::getenv("MACHOMAN_CACHE_TRACE"))
+            std::fprintf(stderr, "translation cache: %s: %s\n", g->path.c_str(),
+                         cached == mm_cache_status::hit ? "hit" : cached == mm_cache_status::stored ? "stored" : "bypassed");
         g->runtime = std::make_unique<mm_runtime_code>(g->result);
         if (!g->runtime->ok())
             return mm_runtime_status::exec_alloc_failed;
@@ -1189,6 +1308,9 @@ const bound_import *guest_process::host_target(const void *target) {
 /* Runs guest code on the calling host thread until the guest exits,
  * servicing calls into host dylibs on the way. */
 mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
+#if !defined(_WIN32)
+    fault_handler_scope handlers;
+#endif
     /* Nested runs happen whenever host code calls back into the guest
      * (call_guest, +load, a block), so the previous current thread has to
      * come back afterwards rather than being cleared. */
@@ -1199,6 +1321,7 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
         st = main_->runtime->run(t.ctx, pc); /* any image's trampoline reaches every translation via the code map */
         if (st == mm_runtime_status::unsupported_insn || st == mm_runtime_status::memory_fault ||
             st == mm_runtime_status::brk) {
+            if (t.prepared_execution) break;
             int signum = 4, code = 1; /* SIGILL, ILL_ILLOPC */
             std::uint64_t addr = t.ctx.fault_va;
             if (st == mm_runtime_status::memory_fault) { signum = 11; code = 1; addr = t.ctx.fault_addr; } /* SIGSEGV, SEGV_MAPERR */
@@ -1221,6 +1344,7 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
         }
         const std::ptrdiff_t trap = traps_.index_of(t.ctx.fault_va);
         if (trap >= 0) {
+            if (t.prepared_execution) { st = mm_runtime_status::unresolved_import; break; }
             const auto &imp = imports_[static_cast<std::size_t>(trap)];
             const auto &dylibs = imp.image->img.dylibs;
             std::fprintf(stderr, "run: unresolved import %s (from %s), called from %s\n", symbol_name(imp).c_str(),
@@ -1231,8 +1355,15 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             break;
         }
         const void *target = reinterpret_cast<const void *>(t.ctx.fault_va);
-        const bound_import *it = host_target(target);
+        const bound_import *it = nullptr;
+        if (t.prepared_execution) {
+            if (const auto found = import_by_host_.find(target); found != import_by_host_.end())
+                it = &imports_[found->second];
+        } else {
+            it = host_target(target);
+        }
         if (!it) {
+            if (t.prepared_execution) break;
             std::fprintf(stderr, "run: branch to %s, x30=0x%llx\n", describe_pc(linker_, t.ctx.fault_va).c_str(),
                          static_cast<unsigned long long>(t.ctx.x[30]));
             for (int i = 0; i < 32; i += 4)
@@ -1242,7 +1373,7 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             print_backtrace(linker_, t.ctx);
             break;
         }
-        if (trace_enabled())
+        if (!t.prepared_execution && trace_enabled())
             std::fprintf(stderr, "call: %s(0x%llx, 0x%llx, 0x%llx)\n", symbol_name(*it).c_str(),
                          static_cast<unsigned long long>(t.ctx.x[0]), static_cast<unsigned long long>(t.ctx.x[1]),
                          static_cast<unsigned long long>(t.ctx.x[2]));
@@ -1251,29 +1382,58 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
          * guest arguments beyond eight are not forwarded yet. */
         t.ctx.resume_va = 0;
         t.ctx.host_tail_fn = 0;
+        auto call_host = [&](const void *fn) {
+            std::uint64_t argument_vectors[8][2];
+            std::memcpy(argument_vectors, t.ctx.v, sizeof argument_vectors);
+            host_call_frame frame;
+            if (!t.prepared_execution && diagnostics_enabled()) {
+                frame.function = fn;
+                frame.caller = t.ctx.x[30];
+                frame.outer = t.host_calls;
+                std::memcpy(frame.args, t.ctx.x, sizeof frame.args);
+                t.host_calls = &frame;
+            }
+            mm_hostcall(&t.ctx, fn);
+            if (!t.prepared_execution && diagnostics_enabled()) t.host_calls = frame.outer;
+            /* A dispatcher has selected an implementation; it has not
+             * returned to the guest yet. Its C return registers are
+             * scratch, so forward the original FP/SIMD arguments. */
+            if (t.ctx.resume_va || t.ctx.host_tail_fn)
+                std::memcpy(t.ctx.v, argument_vectors, sizeof argument_vectors);
+        };
         if (it->preserve_regs) {
             std::uint64_t saved_x[19], saved_v[8][2];
             std::memcpy(saved_x, t.ctx.x, sizeof saved_x);
             std::memcpy(saved_v, t.ctx.v, sizeof saved_v);
-            mm_hostcall(&t.ctx, target);
+            call_host(target);
             std::memcpy(t.ctx.x, saved_x, sizeof saved_x);
             std::memcpy(t.ctx.v, saved_v, sizeof saved_v);
         } else if (it->returns_this) {
             const std::uint64_t self = t.ctx.x[0];
-            mm_hostcall(&t.ctx, target);
+            call_host(target);
             t.ctx.x[0] = self;
         } else {
-            mm_hostcall(&t.ctx, target);
+            call_host(target);
         }
         /* A host function may chain to another host function with the
          * guest's original argument registers (objc_msgSend -> host IMP). */
         while (t.ctx.host_tail_fn) {
+            if (t.callback_failure.status != mm_runtime_status::ok) break;
             const auto fn = reinterpret_cast<const void *>(t.ctx.host_tail_fn);
             t.ctx.host_tail_fn = 0;
-            mm_hostcall(&t.ctx, fn);
+            call_host(fn);
+        }
+        if (t.callback_failure.status != mm_runtime_status::ok) {
+            st = t.callback_failure.status;
+            t.ctx.fault_va = t.callback_failure.fault_va;
+            t.ctx.fault_addr = t.callback_failure.fault_addr;
+            break;
         }
         pc = t.ctx.resume_va ? t.ctx.resume_va : t.ctx.x[30];
         t.ctx.resume_va = 0;
+        /* A top-level guest function can tail-call a host implementation;
+         * its host return then consumes the same zero LR as guest RET. */
+        if (!pc) { st = mm_runtime_status::ok; break; }
     }
     g_current = outer;
     return st;
@@ -1367,6 +1527,22 @@ mm_runtime_status guest_process::run_main() {
         std::lock_guard lock(threads_mu_);
         threads_.push_back(std::move(main_thread));
     }
+
+#if !defined(_WIN32)
+    /* +load and other startup callbacks need executable translations,
+     * initialized frameworks, and the same guest identity as main. */
+    guest_thread *const outer = g_current;
+    g_current = &t;
+    std::vector<mm_dylib_start_fn> started;
+    for (auto &h : linker_.host_libs()) {
+        if (!h->handle) continue;
+        auto start = reinterpret_cast<mm_dylib_start_fn>(dlsym(h->handle, "machoman_dylib_start"));
+        if (!start || std::find(started.begin(), started.end(), start) != started.end()) continue;
+        started.push_back(start);
+        start();
+    }
+    g_current = outer;
+#endif
 
     /* Static initializers, dependencies before dependents like dyld, with
      * the arguments dyld passes (argc, argv, envp, apple, ProgramVars). */
@@ -1541,7 +1717,31 @@ bool guest_process::sigreturn(guest_thread &t) {
 std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint64_t *args, int nargs) {
     guest_process *p = g_process;
     guest_thread *t = g_current;
-    if (!p || !t) return 0;
+    if (!p) return 0;
+    const bool host_callback = !t;
+    if (host_callback) {
+        /* Framework workers (dispatch queues, display links, etc.) are
+         * native threads. Give each a persistent guest identity and stack
+         * before its first callback, just as pthread_create does. A nested
+         * callback reuses g_current; a later work item on this native worker
+         * reuses this binding, preserving thread identity and native TLS. */
+        static thread_local guest_process *callback_owner = nullptr;
+        static thread_local guest_thread *callback_thread = nullptr;
+        if (callback_owner != p) {
+            auto created = std::make_unique<guest_thread>();
+            created->stack.resize(512 * 1024 / 8);
+            created->ctx.x[31] = reinterpret_cast<std::uintptr_t>(created->stack.data() + created->stack.size() - 64)
+                & ~std::uintptr_t{15};
+            std::lock_guard lock(p->threads_mu_);
+            created->id = p->next_thread_id_++;
+            callback_thread = created.get();
+            p->threads_.push_back(std::move(created));
+            callback_owner = p;
+        }
+        t = callback_thread;
+        std::lock_guard lock(p->threads_mu_);
+        t->finished = false;
+    }
     const mm_cpu_context saved = t->ctx;
     for (int i = 0; i < 8; i++) t->ctx.x[i] = i < nargs ? args[i] : 0;
     t->ctx.x[31] = (saved.x[31] - 256) & ~std::uint64_t{15};
@@ -1550,7 +1750,9 @@ std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint
     t->ctx.host_tail_fn = 0;
     const mm_runtime_status st = p->run_thread(*t, fn_va);
     const std::uint64_t result = t->ctx.x[0];
-    if (st != mm_runtime_status::ok) {
+    if (st != mm_runtime_status::ok && t->prepared_execution) {
+        t->callback_failure = {st, 0, t->ctx.fault_va, t->ctx.fault_addr};
+    } else if (st != mm_runtime_status::ok) {
         p->report(*t, st);
         std::fprintf(stderr, "run: guest callback 0x%llx failed inside a host function\n", static_cast<unsigned long long>(fn_va));
         std::abort();
@@ -1560,7 +1762,95 @@ std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint
     t->ctx = saved;
     t->ctx.x[0] = result;
     t->ctx.v[0][0] = v0[0]; t->ctx.v[0][1] = v0[1];
+    if (host_callback) {
+        std::lock_guard lock(p->threads_mu_);
+        t->status = st;
+        t->result = result;
+        t->finished = true;
+    }
     return result;
+}
+
+int guest_process::api_prepare_guest_callback(std::uint64_t fn_va, std::size_t stack_size, void **out) {
+    if (!out) return 22;
+    *out = nullptr;
+    guest_process *p = g_process;
+    if (!p) return 78;
+    if (g_current || (g_callback_binding && g_callback_binding->active)) return 16;
+    if (!api_is_guest_code(fn_va) || !mm_runtime_code::translation_of(fn_va) || stack_size > 8 * 1024 * 1024) return 22;
+    stack_size = std::max<std::size_t>(stack_size, 512 * 1024);
+    if (g_callback_binding && (g_callback_binding->process != p || g_callback_binding->thread->stack.size() * 8 < stack_size)) return 22;
+    if (!g_callback_binding) {
+        auto thread = std::make_unique<guest_thread>();
+        thread->stack.resize((stack_size + 7) / 8); // zero initialization touches stack pages before activation
+        thread->ctx.x[31] = reinterpret_cast<std::uintptr_t>(thread->stack.data() + thread->stack.size() - 64) & ~std::uintptr_t{15};
+        thread->prepared_execution = true;
+        thread->finished = true;
+        auto binding = std::make_unique<callback_binding>();
+        binding->process = p; binding->thread = thread.get();
+        for (const auto &image : p->linker_.images()) binding->codes.push_back(image->runtime.get());
+        {
+            std::lock_guard lock(p->threads_mu_);
+            thread->id = p->next_thread_id_++;
+            p->threads_.push_back(std::move(thread));
+        }
+        g_callback_binding = binding.release();
+    }
+    auto handle = std::make_unique<prepared_callback>();
+    handle->binding = g_callback_binding; handle->function = fn_va;
+    ++g_callback_binding->handles;
+    *out = handle.release();
+    return 0;
+}
+
+int guest_process::api_invoke_guest_callback(void *opaque, const std::uint64_t *args, int nargs, mm_callback_result *out) {
+    if (!out) return 22;
+    *out = {};
+    if (!opaque || nargs < 0 || nargs > 8 || (nargs && !args)) return 22;
+    auto *handle = static_cast<prepared_callback *>(opaque);
+    auto *binding = handle->binding;
+    if (binding->owner != std::this_thread::get_id()) return 1;
+    if (binding != g_callback_binding || binding->process != g_process) return 22;
+    if (binding->active || g_current) return 16;
+    binding->active = true;
+    auto &t = *binding->thread;
+    const auto saved = t.ctx;
+    const auto native_mxcsr = _mm_getcsr();
+    const auto old_codes = g_callback_fault_codes;
+    g_callback_fault_codes = binding->codes;
+    t.callback_failure = {};
+    t.finished.store(false, std::memory_order_release);
+    for (int i = 0; i < 8; ++i) t.ctx.x[i] = i < nargs ? args[i] : 0;
+    t.ctx.x[30] = t.ctx.resume_va = t.ctx.host_tail_fn = t.ctx.fault_va = t.ctx.fault_addr = 0;
+    t.ctx.x[31] = (saved.x[31] - 256) & ~std::uint64_t{15};
+    const auto status = binding->process->run_thread(t, handle->function);
+    *out = {status, status == mm_runtime_status::ok ? t.ctx.x[0] : 0, t.ctx.fault_va, t.ctx.fault_addr};
+    t.ctx = saved;
+    t.finished.store(true, std::memory_order_release);
+    g_callback_fault_codes = old_codes;
+    _mm_setcsr(native_mxcsr);
+    binding->active = false;
+    return 0;
+}
+
+int guest_process::api_release_guest_callback(void *opaque) {
+    if (!opaque) return 22;
+    auto *handle = static_cast<prepared_callback *>(opaque);
+    auto *binding = handle->binding;
+    if (binding->owner != std::this_thread::get_id()) return 1;
+    if (binding != g_callback_binding || binding->process != g_process) return 22;
+    if (binding->active || g_current) return 16;
+    delete handle;
+    if (--binding->handles == 0) {
+        {
+            std::lock_guard lock(binding->process->threads_mu_);
+            auto &threads = binding->process->threads_;
+            threads.erase(std::remove_if(threads.begin(), threads.end(), [&](const auto &t) { return t.get() == binding->thread; }), threads.end());
+        }
+        g_callback_binding = nullptr;
+        delete binding; // handler lifecycle and stack teardown are outside invocation
+    }
+    return 0;
 }
 
 const char *guest_process::api_unresolved_import_name(std::uint64_t va) {
@@ -1615,8 +1905,17 @@ const char *guest_process::api_image_path(std::size_t i) {
     return p->linker_.images()[i]->path.c_str();
 }
 
-void guest_process::dump_threads() {
+void guest_process::dump_threads(std::uintptr_t interrupted_rip) {
     std::fprintf(stderr, "\n--- guest threads ---\n");
+#if !defined(_WIN32)
+    if (diagnostics_enabled()) {
+        void *frames[48];
+        const int count = backtrace(frames, 48);
+        std::fprintf(stderr, "--- interrupted native stack ---\n");
+        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+        std::fprintf(stderr, "--- end native stack ---\n");
+    }
+#endif
     std::lock_guard lock(threads_mu_);
     for (const auto &t : threads_) {
         std::fprintf(stderr, "thread %llu%s:\n", static_cast<unsigned long long>(t->id),
@@ -1627,6 +1926,37 @@ void guest_process::dump_threads() {
          * which is close enough to name where it is. */
         mm_cpu_context ctx = t->ctx;
         ctx.fault_va = ctx.x[30];
+#if !defined(_WIN32)
+        if (interrupted_rip && t.get() == g_current) {
+            const auto pc = mm_runtime_code::guest_pc_anywhere(interrupted_rip);
+            if (pc) ctx.fault_va = pc;
+            Dl_info info{};
+            dladdr(reinterpret_cast<const void *>(interrupted_rip), &info);
+            std::fprintf(stderr, "  interrupted host PC=0x%llx %s+0x%llx; guest PC=0x%llx; guest LR=0x%llx\n",
+                static_cast<unsigned long long>(interrupted_rip), info.dli_sname ? info.dli_sname : "(translated or unknown)",
+                static_cast<unsigned long long>(info.dli_saddr ? interrupted_rip - reinterpret_cast<std::uintptr_t>(info.dli_saddr) : 0),
+                static_cast<unsigned long long>(pc), static_cast<unsigned long long>(ctx.x[30]));
+            if (diagnostics_enabled()) {
+                for (int i = 0; i < 32; i += 4)
+                    std::fprintf(stderr, "  x%d=%llx x%d=%llx x%d=%llx x%d=%llx\n", i,
+                        static_cast<unsigned long long>(ctx.x[i]), i + 1, static_cast<unsigned long long>(ctx.x[i + 1]),
+                        i + 2, static_cast<unsigned long long>(ctx.x[i + 2]), i + 3, static_cast<unsigned long long>(ctx.x[i + 3]));
+                for (auto *frame = t->host_calls; frame; frame = frame->outer) {
+                    Dl_info function{};
+                    dladdr(frame->function, &function);
+                    std::fprintf(stderr, "  active host call %s (%p) from guest 0x%llx args={%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx}\n",
+                        function.dli_sname ? function.dli_sname : "(unknown IMP)", frame->function,
+                        static_cast<unsigned long long>(frame->caller),
+                        static_cast<unsigned long long>(frame->args[0]), static_cast<unsigned long long>(frame->args[1]),
+                        static_cast<unsigned long long>(frame->args[2]), static_cast<unsigned long long>(frame->args[3]),
+                        static_cast<unsigned long long>(frame->args[4]), static_cast<unsigned long long>(frame->args[5]),
+                        static_cast<unsigned long long>(frame->args[6]), static_cast<unsigned long long>(frame->args[7]));
+                }
+            }
+        }
+#else
+        (void)interrupted_rip;
+#endif
         print_backtrace(linker_, ctx);
     }
     std::fprintf(stderr, "--- end of guest threads ---\n");
@@ -1704,10 +2034,12 @@ mm_runtime_status mm_runtime_launch(const mm_launch_request &request) {
      * an app bundle and everything the guest computes from its own path
      * (its bundle, @executable_path, an embedded interpreter's home) has to
      * land inside that bundle, as it would on macOS. */
-    std::error_code ec;
-    std::filesystem::path exe_path = std::filesystem::weakly_canonical(
-        request.venv->path(MM_VENV_DIR_BIN) / request.executable_path, ec);
-    if (ec) exe_path = request.venv->path(MM_VENV_DIR_BIN) / request.executable_path;
+    std::string launcher_error;
+    std::filesystem::path exe_path = mm_venv_resolve_executable(*request.venv, request.executable_path, launcher_error);
+    if (!launcher_error.empty()) {
+        std::fprintf(stderr, "run: %s\n", launcher_error.c_str());
+        return mm_runtime_status::bad_image;
+    }
     std::vector<std::uint8_t> data = read_whole_file(exe_path);
     if (data.empty())
         return mm_runtime_status::bad_image;

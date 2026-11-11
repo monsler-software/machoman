@@ -13,12 +13,18 @@ endif()
 add_library(machoman_core STATIC
     src/common/macho.cpp
     src/venv/venv.cpp
+    src/venv/install.cpp
     src/translator/arm64_decoder.cpp
     src/translator/x86_64_encoder.cpp
     src/translator/translator.cpp
     src/translator/translator_simd.cpp
+    src/translator/translator_simd_helpers.cpp
+    src/translator/translator_simd_crypto.cpp
+    src/translator/translator_simd_fp_helpers.cpp
+    src/translator/translator_simd_half.cpp
     src/translator/translator_fp.cpp
     src/runtime/loader.cpp
+    src/runtime/translation_cache.cpp
     src/runtime/hostcall_x86_64.S
     src/runtime/syscall_table.cpp
 )
@@ -38,10 +44,33 @@ target_link_libraries(machoman_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 enable_testing()
 
+add_library(machoman_audio_engine STATIC src/dylibs/audio/engine.cpp
+    src/dylibs/audio/format.cpp src/dylibs/audio/backend_null.cpp)
+target_include_directories(machoman_audio_engine PUBLIC src/dylibs/audio)
+target_link_libraries(machoman_audio_engine PUBLIC Threads::Threads)
+set_target_properties(machoman_audio_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MSVC)
+    target_compile_options(machoman_audio_engine PRIVATE /W4)
+else()
+    target_compile_options(machoman_audio_engine PRIVATE -Wall -Wextra)
+endif()
+
+# MEVK is developed separately from the CPU translator and host frameworks.
+# Enabling it also replaces the Metal framework stub on supported hosts.
+option(MACHOMAN_BUILD_MEVK "Build the experimental Metal-to-Vulkan module" OFF)
+if(MACHOMAN_BUILD_MEVK)
+    add_subdirectory(modules/MEVK)
+endif()
+
+option(MACHOMAN_BUILD_EVILCOCOA "Build the OpenGL Cocoa control renderer" ON)
+if(MACHOMAN_BUILD_EVILCOCOA AND NOT WIN32)
+    add_subdirectory(modules/evilcocoa)
+endif()
+
 # Host dylibs: real shared objects the runtime dlopen()s in place of Darwin
 # libraries, laid out like a macOS root under build/dylibs/.
 if(NOT WIN32)
-    add_library(libSystem SHARED src/dylibs/libSystem/libSystem.cpp src/dylibs/libSystem/stdio.cpp src/dylibs/libSystem/xlocale.cpp src/dylibs/libSystem/callbacks.cpp src/dylibs/libSystem/kqueue.cpp src/dylibs/libSystem/commoncrypto.cpp src/dylibs/libSystem/malloc_zone.cpp src/dylibs/libSystem/socket.cpp)
+    add_library(libSystem SHARED src/dylibs/libSystem/libSystem.cpp src/dylibs/libSystem/filesystem.cpp src/dylibs/libSystem/stdio.cpp src/dylibs/libSystem/xlocale.cpp src/dylibs/libSystem/callbacks.cpp src/dylibs/libSystem/kqueue.cpp src/dylibs/libSystem/commoncrypto.cpp src/dylibs/libSystem/malloc_zone.cpp src/dylibs/libSystem/socket.cpp)
     target_link_libraries(libSystem PRIVATE machoman_core)
     target_compile_options(libSystem PRIVATE -Wall -Wextra -fvisibility=hidden)
     set_target_properties(libSystem PROPERTIES
@@ -55,11 +84,15 @@ if(NOT WIN32)
         PREFIX "" OUTPUT_NAME "libobjc.A.dylib" SUFFIX ".so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/usr/lib")
 
+    # os_log handles participate in Objective-C reference counting.
+    target_link_libraries(libSystem PRIVATE libobjc)
+
     # CoreFoundation + Foundation: one object, since the types are the same
     # (toll-free bridging) and both frameworks' install names point at it.
     add_library(Foundation SHARED
         src/dylibs/Foundation/strings.cpp src/dylibs/Foundation/collections.cpp
         src/dylibs/Foundation/plists.cpp src/dylibs/Foundation/misc.cpp src/dylibs/Foundation/task.cpp src/dylibs/Foundation/dispatch.cpp
+        src/dylibs/Foundation/key_value.cpp src/dylibs/Foundation/threading.cpp
         src/dylibs/symbol-synthesis/synthesise.cpp)
     target_include_directories(Foundation PRIVATE src/dylibs/symbol-synthesis)
     target_link_libraries(Foundation PRIVATE machoman_core libobjc)
@@ -74,15 +107,29 @@ if(NOT WIN32)
             "../../../CoreFoundation.framework/Versions/A/CoreFoundation.so"
             "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation.so")
 
+    if(TARGET mevk)
+        add_subdirectory(modules/MEVK/src/metal)
+    endif()
+
     # AppKit: the object model plus a platform backend. Wayland when the
     # xdg-shell protocol definitions are available, headless otherwise.
     set(MM_APPKIT_SOURCES
         src/dylibs/AppKit/appkit_main.cpp src/dylibs/AppKit/responder.cpp
-        src/dylibs/AppKit/views.cpp src/dylibs/AppKit/application.cpp src/dylibs/AppKit/opengl.cpp
-        src/dylibs/AppKit/nib.cpp)
+        src/dylibs/AppKit/views.cpp src/dylibs/AppKit/controls.cpp src/dylibs/AppKit/application.cpp src/dylibs/AppKit/opengl.cpp
+        src/dylibs/AppKit/layers.cpp
+        src/dylibs/AppKit/app_icon.cpp
+        src/dylibs/AppKit/icon_image.cpp
+        src/dylibs/AppKit/native_menu.cpp
+        src/dylibs/AppKit/native_dialog.cpp src/dylibs/AppKit/file_panels.cpp
+        src/dylibs/AppKit/window_controller.cpp
+        src/dylibs/AppKit/nib.cpp src/dylibs/AppKit/nib_archive.cpp)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
-        pkg_check_modules(MM_WAYLAND QUIET wayland-client wayland-egl egl xkbcommon)
+        pkg_check_modules(MM_WAYLAND QUIET wayland-client wayland-cursor wayland-egl egl xkbcommon)
+        pkg_check_modules(MM_PANGO QUIET IMPORTED_TARGET pangocairo)
+        pkg_check_modules(MM_PIXBUF QUIET IMPORTED_TARGET gdk-pixbuf-2.0)
+        pkg_check_modules(MM_GIO QUIET IMPORTED_TARGET gio-2.0)
+        pkg_check_modules(MM_GTK QUIET IMPORTED_TARGET gtk+-3.0)
         pkg_get_variable(MM_WAYLAND_PROTOCOLS wayland-protocols pkgdatadir)
         find_program(MM_WAYLAND_SCANNER wayland-scanner)
     endif()
@@ -100,14 +147,70 @@ if(NOT WIN32)
             DEPENDS "${MM_XDG_XML}" VERBATIM)
         list(APPEND MM_APPKIT_SOURCES src/dylibs/AppKit/platform_wayland.cpp
              "${MM_XDG_DIR}/xdg-shell-protocol.c" "${MM_XDG_DIR}/xdg-shell-client-protocol.h")
+        set(MM_FOREIGN_XML "${MM_WAYLAND_PROTOCOLS}/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml")
+        if(EXISTS "${MM_FOREIGN_XML}")
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-foreign-v2-client-protocol.h"
+                COMMAND ${MM_WAYLAND_SCANNER} client-header "${MM_FOREIGN_XML}" "${MM_XDG_DIR}/xdg-foreign-v2-client-protocol.h"
+                DEPENDS "${MM_FOREIGN_XML}" VERBATIM)
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-foreign-v2-protocol.c"
+                COMMAND ${MM_WAYLAND_SCANNER} private-code "${MM_FOREIGN_XML}" "${MM_XDG_DIR}/xdg-foreign-v2-protocol.c"
+                DEPENDS "${MM_FOREIGN_XML}" VERBATIM)
+            list(APPEND MM_APPKIT_SOURCES "${MM_XDG_DIR}/xdg-foreign-v2-client-protocol.h" "${MM_XDG_DIR}/xdg-foreign-v2-protocol.c")
+        endif()
+        set(MM_ICON_XML "${MM_WAYLAND_PROTOCOLS}/staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml")
+        if(EXISTS "${MM_ICON_XML}")
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-toplevel-icon-v1-client-protocol.h"
+                COMMAND ${MM_WAYLAND_SCANNER} client-header "${MM_ICON_XML}" "${MM_XDG_DIR}/xdg-toplevel-icon-v1-client-protocol.h"
+                DEPENDS "${MM_ICON_XML}" VERBATIM)
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-toplevel-icon-v1-protocol.c"
+                COMMAND ${MM_WAYLAND_SCANNER} private-code "${MM_ICON_XML}" "${MM_XDG_DIR}/xdg-toplevel-icon-v1-protocol.c"
+                DEPENDS "${MM_ICON_XML}" VERBATIM)
+            list(APPEND MM_APPKIT_SOURCES "${MM_XDG_DIR}/xdg-toplevel-icon-v1-client-protocol.h" "${MM_XDG_DIR}/xdg-toplevel-icon-v1-protocol.c")
+        endif()
     else()
         message(STATUS "Wayland (wayland-client, wayland-egl, egl, xkbcommon, wayland-protocols) not found: AppKit runs without a display")
         list(APPEND MM_APPKIT_SOURCES src/dylibs/AppKit/platform_headless.cpp)
     endif()
     list(APPEND MM_APPKIT_SOURCES src/dylibs/symbol-synthesis/synthesise.cpp)
     add_library(AppKit SHARED ${MM_APPKIT_SOURCES})
+    if(MM_GIO_FOUND)
+        target_link_libraries(AppKit PRIVATE PkgConfig::MM_GIO)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_GIO=1)
+    endif()
+    if(MM_GTK_FOUND)
+        target_link_libraries(AppKit PRIVATE PkgConfig::MM_GTK)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_GTK=1)
+    endif()
+    if(MM_PIXBUF_FOUND)
+        target_link_libraries(AppKit PRIVATE PkgConfig::MM_PIXBUF)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_PIXBUF=1)
+    endif()
+    if(TARGET evilcocoa)
+        target_sources(AppKit PRIVATE src/dylibs/AppKit/evilcocoa_adapter.cpp)
+        target_link_libraries(AppKit PRIVATE evilcocoa::evilcocoa)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_EVILCOCOA=1)
+    endif()
+    find_package(PNG QUIET)
+    if(PNG_FOUND)
+        target_link_libraries(AppKit PRIVATE PNG::PNG)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_PNG=1)
+    endif()
+    if(EXISTS "${MM_FOREIGN_XML}")
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_XDG_FOREIGN=1)
+    endif()
+    if(EXISTS "${MM_ICON_XML}")
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_XDG_ICON=1)
+    endif()
     target_include_directories(AppKit PRIVATE src/dylibs/symbol-synthesis)
     target_link_libraries(AppKit PRIVATE machoman_core libobjc Foundation)
+    if(MM_PANGO_FOUND)
+        target_link_libraries(AppKit PRIVATE PkgConfig::MM_PANGO)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_PANGO=1)
+    endif()
+    if(TARGET MEVK_Metal)
+        target_link_libraries(AppKit PRIVATE MEVK_Metal MEVK::mevk)
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_MEVK=1)
+    endif()
     target_compile_options(AppKit PRIVATE -Wall -Wextra -fvisibility=hidden)
     if(MM_WAYLAND_FOUND AND MM_WAYLAND_PROTOCOLS AND MM_WAYLAND_SCANNER)
         target_include_directories(AppKit PRIVATE "${MM_XDG_DIR}" ${MM_WAYLAND_INCLUDE_DIRS})
@@ -119,6 +222,19 @@ if(NOT WIN32)
         INSTALL_RPATH "${CMAKE_BINARY_DIR}/dylibs/usr/lib;${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreFoundation.framework/Versions/A"
         PREFIX "" OUTPUT_NAME "AppKit" SUFFIX ".so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/AppKit.framework/Versions/C")
+    if(TARGET MEVK_Metal)
+        # Cocoa/QuartzCore can be loaded before the guest imports Metal. Their
+        # AppKit alias must be able to resolve its native Metal.so dependency.
+        set_property(TARGET AppKit APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:MEVK_Metal>")
+        set_property(TARGET AppKit APPEND PROPERTY INSTALL_RPATH "$<TARGET_FILE_DIR:MEVK_Metal>")
+    endif()
+
+    # Quartz re-exports AppKit, including NSApplicationMain.
+    add_custom_command(TARGET AppKit POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Quartz.framework/Versions/A"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "../../../AppKit.framework/Versions/C/AppKit.so"
+            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Quartz.framework/Versions/A/Quartz.so")
 
     # Cocoa is an umbrella over AppKit and Foundation; pointing it at AppKit
     # (which depends on Foundation) is what re-exporting means here.
@@ -126,13 +242,22 @@ if(NOT WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Cocoa.framework/Versions/A"
         COMMAND ${CMAKE_COMMAND} -E create_symlink
             "../../../AppKit.framework/Versions/C/AppKit.so"
-            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa.so")
+            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Cocoa.framework/Versions/A/Cocoa.so"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/QuartzCore.framework/Versions/A"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "../../../AppKit.framework/Versions/C/AppKit.so"
+            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore.so"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/OpenGL.framework/Versions/A"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "../../../AppKit.framework/Versions/C/AppKit.so"
+            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL.so")
 
 
-    # CoreMIDI/CoreAudio/AudioToolbox: no devices, but every call behaves.
-    # Audio is deliberately out of scope for now; this is what lets a program
-    # finish its audio setup and get to its interface.
-    add_library(audio SHARED src/dylibs/audio/coremidi.cpp src/dylibs/symbol-synthesis/synthesise.cpp)
+    # Shared PCM engine for the framework facades and platform transports.
+    # The null driver is offline only; physical device enumeration waits for
+    # the PipeWire start/render/stop path.
+    add_library(audio SHARED src/dylibs/audio/coremidi.cpp src/dylibs/audio/coreaudio_hal.cpp
+        src/dylibs/audio/audiounit.cpp src/dylibs/symbol-synthesis/synthesise.cpp)
     target_link_libraries(audio PRIVATE machoman_core libobjc)
     target_include_directories(audio PRIVATE src/dylibs/symbol-synthesis)
     target_compile_options(audio PRIVATE -Wall -Wextra -fvisibility=hidden)
@@ -152,7 +277,7 @@ if(NOT WIN32)
     # calls. Also stands in for ApplicationServices and CoreServices, which
     # re-export it and otherwise reach libSystem through the linker.
     add_library(carbon SHARED src/dylibs/carbon/carbon.cpp src/dylibs/symbol-synthesis/synthesise.cpp)
-    target_link_libraries(carbon PRIVATE machoman_core libobjc)
+    target_link_libraries(carbon PRIVATE machoman_core libobjc Foundation)
     target_include_directories(carbon PRIVATE src/dylibs/symbol-synthesis)
     target_compile_options(carbon PRIVATE -Wall -Wextra -fvisibility=hidden)
     set_target_properties(carbon PROPERTIES
@@ -189,6 +314,16 @@ if(NOT WIN32)
         PREFIX "" OUTPUT_NAME "CoreVideo" SUFFIX ".so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreVideo.framework/Versions/A")
 
+    # CoreText supplies font descriptors backed by the host's installed fonts.
+    find_package(Fontconfig REQUIRED)
+    add_library(CoreText SHARED src/dylibs/CoreText/fonts.cpp src/dylibs/symbol-synthesis/synthesise.cpp)
+    target_include_directories(CoreText PRIVATE src/dylibs/symbol-synthesis)
+    target_link_libraries(CoreText PRIVATE machoman_core libobjc Foundation Fontconfig::Fontconfig)
+    target_compile_options(CoreText PRIVATE -Wall -Wextra -fvisibility=hidden)
+    set_target_properties(CoreText PROPERTIES
+        PREFIX "" OUTPUT_NAME "CoreText" SUFFIX ".so"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreText.framework/Versions/A")
+
     # Stub frameworks: one object synthesising symbols from their names
     # (src/dylibs/stub-framework), installed under every framework machoman
     # does not implement yet. Adding a name here is all a new stub needs.
@@ -202,15 +337,26 @@ if(NOT WIN32)
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/usr/lib")
     set(MM_STUB_FRAMEWORKS
         AVFoundation:A CoreMedia:A VideoToolbox:A
-        CoreGraphics:A CoreText:A QuartzCore:A Metal:A MetalKit:A OpenGL:A GameController:A WebKit:A
+        CoreGraphics:A Metal:A MetalKit:A GameController:A WebKit:A
         Security:A SystemConfiguration:A DiskArbitration:A IOKit:A
         UniformTypeIdentifiers:A ImageIO:A)
+    if(TARGET MEVK_Metal)
+        list(REMOVE_ITEM MM_STUB_FRAMEWORKS Metal:A CoreGraphics:A)
+    endif()
     set(MM_STUB_COMMANDS)
     foreach(entry IN LISTS MM_STUB_FRAMEWORKS)
         string(REPLACE ":" ";" parts "${entry}")
         list(GET parts 0 fw)
         list(GET parts 1 ver)
         set(dir "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/${fw}.framework/Versions/${ver}")
+        if(fw STREQUAL "Metal" OR fw STREQUAL "CoreGraphics")
+            # A previous MEVK build can leave real framework binaries behind while
+            # Ninja considers stub_framework up to date. Restore the stub
+            # when configuring with MEVK disabled, even without a relink.
+            file(MAKE_DIRECTORY "${dir}")
+            file(CREATE_LINK "${CMAKE_BINARY_DIR}/dylibs/usr/lib/machoman-stub-framework.so"
+                "${dir}/${fw}.so" SYMBOLIC)
+        endif()
         list(APPEND MM_STUB_COMMANDS COMMAND ${CMAKE_COMMAND} -E make_directory "${dir}")
         list(APPEND MM_STUB_COMMANDS COMMAND ${CMAKE_COMMAND} -E create_symlink
             "${CMAKE_BINARY_DIR}/dylibs/usr/lib/machoman-stub-framework.so" "${dir}/${fw}.so")
@@ -220,7 +366,7 @@ if(NOT WIN32)
 
     # Plain /usr/lib dylibs a bundle links against that machoman does not
     # implement: the same stub object under their install names.
-    foreach(lib IN ITEMS libffi.dylib)
+    foreach(lib IN ITEMS libffi.dylib libbsm.0.dylib)
         add_custom_command(TARGET stub_framework POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E create_symlink
                 "machoman-stub-framework.so" "${CMAKE_BINARY_DIR}/dylibs/usr/lib/${lib}.so")

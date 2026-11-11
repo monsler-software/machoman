@@ -1,8 +1,12 @@
 #include "machoman/arch/x86_64_encoder.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace {
 
@@ -50,6 +54,29 @@ void shift_imm(mm_x64_buf &buf, int ext, int reg, std::uint8_t n) {
 
 } // namespace
 
+std::uint64_t mm_x64_codegen_features() {
+    static const bool avx2 = [] {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+        int info[4];
+        __cpuid(info, 0);
+        if (info[0] < 7) return false;
+        __cpuidex(info, 1, 0);
+        constexpr int required = (1 << 26) | (1 << 27) | (1 << 28); // XSAVE, OSXSAVE, AVX
+        if ((info[2] & required) != required || (_xgetbv(0) & 6) != 6) return false;
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 5)) != 0;
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+        __builtin_cpu_init();
+        // The builtin also checks OS support for saving XMM/YMM state.
+        return __builtin_cpu_supports("avx2") != 0;
+#else
+        return false;
+#endif
+    }();
+    const auto *disabled = std::getenv("MACHOMAN_DISABLE_AVX2");
+    return avx2 && !(disabled && *disabled && *disabled != '0') ? MM_X64_FEATURE_AVX2 : 0;
+}
+
 void mm_x64_emit(mm_x64_buf &buf, std::span<const std::uint8_t> bytes) {
     buf.bytes.insert(buf.bytes.end(), bytes.begin(), bytes.end());
 }
@@ -71,6 +98,15 @@ void mm_x64_emit_mov_imm(mm_x64_buf &buf, int reg, std::uint64_t imm) {
 
 void mm_x64_emit_mov_load(mm_x64_buf &buf, int dst, int base, std::int32_t disp) {
     mm_x64_emit_load(buf, dst, base, disp, mm_x64_load::u64);
+}
+
+void mm_x64_emit_host_address(mm_x64_buf &buf, int reg, std::uintptr_t address) {
+    /* Always imm64, including non-PIE builds whose addresses fit in imm32. */
+    put(buf, {rex(true, 0, 0, reg), static_cast<std::uint8_t>(0xB8 | (reg & 7))});
+    buf.host_relocations.push_back(buf.size());
+    std::uint8_t bytes[8];
+    std::memcpy(bytes, &address, 8);
+    mm_x64_emit(buf, bytes);
 }
 
 void mm_x64_emit_mov_store(mm_x64_buf &buf, int base, std::int32_t disp, int src) {
@@ -127,6 +163,13 @@ void mm_x64_emit_test_rr(mm_x64_buf &buf, int lhs, int rhs, bool w64) {
     if (w64 || ((lhs | rhs) & 8))
         buf.bytes.push_back(rex(w64, rhs, 0, lhs));
     put(buf, {0x85, modrm(3, rhs, lhs)});
+}
+
+void mm_x64_emit_test_mem_imm32(mm_x64_buf &buf, int base, std::int32_t disp, std::uint32_t mask) {
+    if (base & 8) buf.bytes.push_back(rex(false, 0, 0, base));
+    buf.bytes.push_back(0xF7); // /0 TEST r/m32, imm32
+    mem_disp32(buf, 0, base, disp);
+    put_imm32(buf, static_cast<std::int32_t>(mask));
 }
 
 void mm_x64_emit_mov_reg(mm_x64_buf &buf, int dst, int src)  { alu_rr(buf, 0x89, src, dst); }
@@ -461,6 +504,10 @@ void mm_x64_emit_movq_store(mm_x64_buf &buf, int base, std::int32_t disp, int xm
     put(buf, {0x0F, 0xD6});
     mem_disp32(buf, xmm, base, disp);
 }
+void mm_x64_emit_movq_rr(mm_x64_buf &buf, int dst, int src) {
+    sse_prefix(buf, 0xF3, dst, src);
+    put(buf, {0x0F, 0x7E, modrm(3, dst, src)});
+}
 void mm_x64_emit_movq_from_gpr(mm_x64_buf &buf, int xmm, int r64) {
     buf.bytes.push_back(0x66);
     put(buf, {rex(true, xmm, 0, r64), 0x0F, 0x6E, modrm(3, xmm, r64)});
@@ -489,6 +536,19 @@ void mm_x64_emit_pinsrd(mm_x64_buf &buf, int xmm, int r32, std::uint8_t idx) {
     sse_prefix(buf, 0x66, xmm, r32);
     put(buf, {0x0F, 0x3A, 0x22, modrm(3, xmm, r32), idx});
 }
+void mm_x64_emit_pextrd(mm_x64_buf &buf, int r32, int xmm, std::uint8_t idx) {
+    sse_prefix(buf, 0x66, xmm, r32); /* pextrd r32, xmm2, imm8 encodes reg=xmm, rm=r32 */
+    put(buf, {0x0F, 0x3A, 0x16, modrm(3, xmm, r32), idx});
+}
+
+/* AES-NI (all 66 0F 38-map, reg-reg). */
+static void aes_rr(mm_x64_buf &buf, std::uint8_t op, int dst, int src) {
+    sse_prefix(buf, 0x66, dst, src);
+    put(buf, {0x0F, 0x38, op, modrm(3, dst, src)});
+}
+void mm_x64_emit_aesenc(mm_x64_buf &buf, int dst, int src) { aes_rr(buf, 0xDC, dst, src); }
+void mm_x64_emit_aesdec(mm_x64_buf &buf, int dst, int src) { aes_rr(buf, 0xDE, dst, src); }
+void mm_x64_emit_aesimc(mm_x64_buf &buf, int dst, int src) { aes_rr(buf, 0xDB, dst, src); }
 void mm_x64_emit_pmovmskb(mm_x64_buf &buf, int r32, int xmm) {
     sse_prefix(buf, 0x66, r32, xmm);
     put(buf, {0x0F, 0xD7, modrm(3, r32, xmm)});
@@ -571,13 +631,20 @@ void mm_x64_emit_movd_to_gpr(mm_x64_buf &buf, int r32, int xmm) {
 
 namespace {
 /* VEX3: C4 [~R ~X ~B mmmmm] [W ~vvvv L pp] opcode modrm; map 2 = 0F38, pp 1 = 66 */
-void vex_fma(mm_x64_buf &buf, std::uint8_t opcode, bool w, int dst, int src1, int src2) {
+void vex_0f38_rrr(mm_x64_buf &buf, std::uint8_t opcode, bool w, int dst, int src1, int src2) {
     const unsigned d = static_cast<unsigned>(dst), s1 = static_cast<unsigned>(src1), s2 = static_cast<unsigned>(src2);
     const std::uint8_t b1 = static_cast<std::uint8_t>(((~(d >> 3) & 1u) << 7) | (1u << 6) | ((~(s2 >> 3) & 1u) << 5) | 2u);
     const std::uint8_t b2 = static_cast<std::uint8_t>(((w ? 1u : 0u) << 7) | ((~s1 & 0xFu) << 3) | 1u);
     put(buf, {0xC4, b1, b2, opcode, modrm(3, dst, src2)});
 }
 } // namespace
+
+void mm_x64_emit_vshift_var(mm_x64_buf &buf, mm_x64_vshift_var op, int dst, int value, int counts) {
+    const auto opcode = op == mm_x64_vshift_var::psllvd || op == mm_x64_vshift_var::psllvq ? 0x47 :
+        op == mm_x64_vshift_var::psravd ? 0x46 : 0x45;
+    const bool wide = op == mm_x64_vshift_var::psllvq || op == mm_x64_vshift_var::psrlvq;
+    vex_0f38_rrr(buf, static_cast<std::uint8_t>(opcode), wide, dst, value, counts);
+}
 
 void mm_x64_emit_fma213(mm_x64_buf &buf, mm_x64_fma op, bool is_double, int dst, int src1, int src2) {
     std::uint8_t opc;
@@ -587,7 +654,7 @@ void mm_x64_emit_fma213(mm_x64_buf &buf, mm_x64_fma op, bool is_double, int dst,
     case mm_x64_fma::fnmadd: opc = 0xAD; break;
     default:                 opc = 0xAF; break;
     }
-    vex_fma(buf, opc, is_double, dst, src1, src2);
+    vex_0f38_rrr(buf, opc, is_double, dst, src1, src2);
 }
 
 void mm_x64_emit_fma231(mm_x64_buf &buf, mm_x64_fma op, bool is_double, bool packed, int dst, int src1, int src2) {
@@ -598,7 +665,7 @@ void mm_x64_emit_fma231(mm_x64_buf &buf, mm_x64_fma op, bool is_double, bool pac
     case mm_x64_fma::fnmadd: opc = packed ? 0xBC : 0xBD; break;
     default:                 opc = packed ? 0xBE : 0xBF; break;
     }
-    vex_fma(buf, opc, is_double, dst, src1, src2);
+    vex_0f38_rrr(buf, opc, is_double, dst, src1, src2);
 }
 
 void mm_x64_emit_ldmxcsr(mm_x64_buf &buf, int base, std::int32_t disp) {

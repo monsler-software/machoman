@@ -12,6 +12,7 @@
  * global queues share a small pool, which is what the API promises:
  * ordering within a serial queue, concurrency between queues. */
 #include "foundation.h"
+#include "machoman/objc_framework.h"
 
 #include <atomic>
 #include <chrono>
@@ -52,6 +53,7 @@ void call_function(void *fn, const std::uint64_t *args, int n) {
 }
 
 void run_item(const work_item &item) {
+    mmfw::autorelease_pool pool;
     if (item.block) {
         mm_objc_block_invoke(item.block, 0, nullptr);
         release(reinterpret_cast<id>(item.block));

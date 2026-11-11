@@ -11,6 +11,7 @@
 #include "machoman/objc_host.h"
 #include "machoman/macho.h"
 #include "machoman/runtime.h"
+#include "stub_abi.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <memory>
+#include <array>
+
+extern "C" std::uint64_t mm_hostcall(mm_cpu_context *ctx, const void *fn);
 
 #define DARWIN(name) __attribute__((visibility("default"))) __asm__("_" #name)
 #define EXPORT __attribute__((visibility("default")))
@@ -95,7 +100,15 @@ struct category_t {
 
 /* ---- runtime-side class data ------------------------------------------- */
 
-struct method_entry { SEL sel; void *imp; const char *types; bool guest; };
+struct dynamic_method;
+struct method_entry { SEL sel; void *imp; const char *types; bool guest; dynamic_method *stub = nullptr; };
+struct dynamic_method {
+    method_entry entry{};
+    std::string encoding;
+    std::vector<stub_abi::type> signature;
+    SEL property = nullptr;
+    bool setter = false, initializer = false, inferred = false, placeholder = false;
+};
 
 struct class_rw {
     const class_ro_t *ro = nullptr;
@@ -106,6 +119,8 @@ struct class_rw {
     std::uint32_t instance_size = 0;
     bool realized = false, initializing = false, initialized = false, is_meta = false, host = false, guest_image = false;
     const char *missing_super = nullptr; /* unresolved superclass import: the class cannot be used */
+    bool dynamic_stubs = false;
+    std::unordered_map<SEL, std::unique_ptr<dynamic_method>> stubs;
 };
 
 class_rw *rw(Class c) { return reinterpret_cast<class_rw *>(c->bits & ~std::uintptr_t{7}); }
@@ -115,27 +130,42 @@ void set_rw(Class c, class_rw *r) { c->bits = reinterpret_cast<std::uintptr_t>(r
  * translation unit's dynamic initialisers would have run. */
 struct refcount_entry { std::int64_t count; bool owned; };
 struct assoc { id value; std::uintptr_t policy; };
+struct dynamic_value { std::vector<std::uint8_t> bytes; id object = nullptr; };
 struct tables {
     std::unordered_map<std::string_view, Class> classes;
+    std::unordered_set<Class> registered_classes; /* pointers handed out as isa: guards against retaining garbage */
     std::unordered_map<std::string_view, SEL> selectors;
     std::unordered_map<std::string_view, protocol_t *> protocols;
     std::vector<std::string *> selector_storage; /* host-registered selector strings */
     std::unordered_map<id, refcount_entry> refcounts;
     std::unordered_set<id> deallocating;
+    std::unordered_map<id, std::vector<method_entry>> cxx_destructors;
     std::unordered_map<id, std::vector<id *>> weak;
     std::unordered_map<id, std::unordered_map<const void *, assoc>> assoc_;
     std::unordered_map<id, std::recursive_mutex *> sync;
+    std::unordered_map<id, std::unordered_map<SEL, dynamic_value>> stub_values;
 };
 tables &T() { static tables *t = new tables; return *t; }
 #define g_classes (T().classes)
+#define g_registered_classes (T().registered_classes)
 #define g_selectors (T().selectors)
 #define g_protocols (T().protocols)
 #define g_selector_storage (T().selector_storage)
 #define g_refcounts (T().refcounts)
 #define g_deallocating (T().deallocating)
+#define g_cxx_destructors (T().cxx_destructors)
 #define g_weak (T().weak)
 #define g_assoc (T().assoc_)
 #define g_sync (T().sync)
+
+bool have_dynamic_methods = false;
+void invalidate_method_caches(class_rw *changed) {
+    changed->cache.clear();
+    if (!have_dynamic_methods) return;
+    /* A subclass's cached gap must not hide a new superclass implementation.
+     * Mutation is cold; existing descriptors remain alive for active calls. */
+    for (auto &[name, c] : g_classes) { rw(c)->cache.clear(); rw(c->isa)->cache.clear(); }
+}
 
 SEL sel_intern(const char *name) {
     std::lock_guard lock(g_lock);
@@ -190,7 +220,7 @@ void add_method_list(class_rw *r, const void *listp, bool guest_image) {
     }
     /* Later lists take precedence: insert at the front, preserving list order within. */
     r->methods.insert(r->methods.begin(), added.begin(), added.end());
-    r->cache.clear();
+    invalidate_method_caches(r);
 }
 
 void add_protocol_list(class_rw *r, const void *listp) {
@@ -266,6 +296,8 @@ void register_guest_class(Class c) {
     mr->guest_image = true;
     set_rw(meta, mr);
     g_classes[r->name] = c;
+    g_registered_classes.insert(c);
+    g_registered_classes.insert(meta);
     if (trace()) std::fprintf(stderr, "objc: class %s super=%p\n", r->name.c_str(), static_cast<void *>(c->superclass));
 }
 
@@ -304,6 +336,9 @@ const method_entry *lookup_in(Class c, SEL sel) {
     return nullptr;
 }
 
+const method_entry *resolve_stub(Class c, SEL sel);
+std::uint64_t invoke_stub(mm_cpu_context &ctx, dynamic_method &method);
+
 std::uint64_t send_host_or_guest(id receiver, const method_entry &m, int nargs, const std::uint64_t *args);
 
 void ensure_initialized(Class c) {
@@ -327,8 +362,33 @@ void ensure_initialized(Class c) {
 std::uint64_t send_host_or_guest(id receiver, const method_entry &m, int nargs, const std::uint64_t *args) {
     std::uint64_t a[8] = {reinterpret_cast<std::uintptr_t>(receiver), reinterpret_cast<std::uintptr_t>(m.sel)};
     for (int i = 0; i < nargs && i < 6; i++) a[2 + i] = args[i];
+    if (m.stub) {
+        mm_cpu_context *ctx = g_api && g_api->current_context ? g_api->current_context() : nullptr;
+        mm_cpu_context call{};
+        if (ctx) call = *ctx;
+        std::memcpy(call.x, a, sizeof a);
+        const auto result = invoke_stub(call, *m.stub);
+        if (ctx) {
+            ctx->x[1] = call.x[1];
+            std::memcpy(ctx->v, call.v, sizeof(call.v[0]) * 4);
+        }
+        return result;
+    }
     if (m.guest)
         return g_api->call_guest(reinterpret_cast<std::uintptr_t>(m.imp), a, 2 + nargs);
+    if (mm_cpu_context *ctx = g_api && g_api->current_context ? g_api->current_context() : nullptr) {
+        /* Host framework sends carry geometry in the guest's v registers,
+         * just like objc_msgSend. Use the ABI trampoline so host IMPs get
+         * those arguments too, and propagate their FP aggregate returns. */
+        mm_cpu_context call = *ctx;
+        std::memcpy(call.x, a, sizeof a);
+        mm_hostcall(&call, m.imp);
+        if (m.types && (m.types[0] == 'd' || m.types[0] == 'f' || m.types[0] == '{')) {
+            ctx->v[0][0] = call.v[0][0];
+            ctx->v[1][0] = call.v[1][0];
+        }
+        return call.x[0];
+    }
     using fn8 = std::uint64_t (*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
     return reinterpret_cast<fn8>(m.imp)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
 }
@@ -359,6 +419,12 @@ __attribute__((visibility("default"))) std::uintptr_t mm_objc_empty_cache[4] __a
 namespace {
 
 mm_objc_class g_block_stack_meta, g_block_malloc_meta, g_block_global_meta;
+void *block_copy(void *p);
+void block_release(void *p);
+bool is_block_object(id obj) {
+    const auto isa = obj->isa;
+    return isa == &mm_block_stack_class || isa == &mm_block_malloc_class || isa == &mm_block_global_class;
+}
 
 /* ---- NSObject ----------------------------------------------------------- */
 
@@ -399,6 +465,8 @@ mm_objc_class *mm_objc_define_class(const char *name, mm_objc_class *super, size
     }
     set_rw(meta_storage, mr);
     g_classes[r->name] = storage;
+    g_registered_classes.insert(storage);
+    g_registered_classes.insert(meta_storage);
     return storage;
 }
 
@@ -412,7 +480,7 @@ void mm_objc_add_method(mm_objc_class *cls, const char *selector, void *imp, con
     std::lock_guard lock(g_lock);
     class_rw *r = rw(cls);
     r->methods.insert(r->methods.begin(), method_entry{sel_intern_copy(selector), imp, types, is_guest(imp)});
-    r->cache.clear();
+    invalidate_method_caches(r);
 }
 
 void mm_objc_add_class_method(mm_objc_class *cls, const char *selector, void *imp, const char *types) {
@@ -423,36 +491,62 @@ mm_SEL mm_objc_sel(const char *name) { return sel_intern_copy(name); }
 
 uint64_t mm_objc_send(mm_id receiver, mm_SEL sel, int nargs, const uint64_t *args) {
     if (!receiver) return 0;
-    std::lock_guard lock(g_lock);
+    std::unique_lock lock(g_lock);
     Class c = receiver->isa;
+    if (!g_registered_classes.contains(c)) {
+        /* An object whose class the runtime never handed out — a corrupted
+         * or foreign pointer (Live hit this with a stale ARC reference).
+         * Dying here hides every later milestone, so answer nil instead. */
+        std::fprintf(stderr, "objc: send %s to object %p with an unregistered class %p — returning nil\n",
+                     static_cast<const char *>(sel), static_cast<const void *>(receiver), static_cast<const void *>(c));
+        if (std::getenv("MACHOMAN_OBJC_INVALID_BACKTRACE") && g_api && g_api->print_guest_backtrace)
+            g_api->print_guest_backtrace();
+        return 0;
+    }
     ensure_initialized(rw(c)->is_meta ? reinterpret_cast<Class>(receiver) : c);
     const method_entry *m = lookup_in(c, sel);
+    if (!m) m = resolve_stub(c, sel);
     if (!m) {
         std::fprintf(stderr, "objc: host send: %c[%s %s] unrecognized\n", rw(c)->is_meta ? '+' : '-', rw(c)->name.c_str(), sel);
         std::abort();
     }
-    return send_host_or_guest(receiver, *m, nargs, args);
+    const bool traced = backtrace_selector(sel);
+    if (traced) {
+        std::fprintf(stderr, "objc: host send [%s %s] from:\n", rw(c)->name.c_str(), sel);
+        if (g_api && g_api->print_guest_backtrace) g_api->print_guest_backtrace();
+    }
+    /* The metadata lock protects lookup, not execution. An IMP can wait
+     * for another thread that needs retain/release or its own message send.
+     * Copy the entry because another thread may mutate the method cache. */
+    const method_entry implementation = *m;
+    lock.unlock();
+    const std::uint64_t result = send_host_or_guest(receiver, implementation, nargs, args);
+    if (traced)
+        std::fprintf(stderr, "objc: host send %s returned 0x%llx\n", sel, static_cast<unsigned long long>(result));
+    return result;
 }
 
 uint64_t mm_objc_send_super(mm_id receiver, mm_objc_class *cls, mm_SEL sel, int nargs, const uint64_t *args) {
     if (!receiver || !cls || !cls->superclass) return 0;
-    const method_entry *m;
+    method_entry implementation{};
     {
         std::lock_guard lock(g_lock);
-        m = lookup_in(cls->superclass, sel_intern(sel));
+        const method_entry *m = lookup_in(cls->superclass, sel_intern(sel));
+        if (!m) m = resolve_stub(cls->superclass, sel_intern(sel));
         if (!m) {
             std::fprintf(stderr, "objc: host super send: [%s(super) %s] unrecognized\n", rw(cls)->name.c_str(), sel);
             std::abort();
         }
+        implementation = *m;
     }
-    return send_host_or_guest(receiver, *m, nargs, args);
+    return send_host_or_guest(receiver, implementation, nargs, args);
 }
 
 uint64_t mm_objc_send0(mm_id r, const char *sel) { return mm_objc_send(r, sel_intern_copy(sel), 0, nullptr); }
 uint64_t mm_objc_send1(mm_id r, const char *sel, uint64_t a) { return mm_objc_send(r, sel_intern_copy(sel), 1, &a); }
 uint64_t mm_objc_send2(mm_id r, const char *sel, uint64_t a, uint64_t b) { const uint64_t v[2] = {a, b}; return mm_objc_send(r, sel_intern_copy(sel), 2, v); }
 
-mm_id mm_objc_alloc(mm_objc_class *cls, size_t extra) {
+mm_id mm_objc_alloc_raw(mm_objc_class *cls, size_t extra) {
     std::lock_guard lock(g_lock);
     realize(cls);
     const std::size_t size = (rw(cls)->instance_size + extra + 15) & ~std::size_t{15};
@@ -460,6 +554,60 @@ mm_id mm_objc_alloc(mm_objc_class *cls, size_t extra) {
     obj->isa = cls;
     g_refcounts[obj] = {1, true};
     return obj;
+}
+
+int mm_objc_construct_instance(mm_id obj) {
+    if (!obj) return 0;
+    struct cxx_methods { method_entry ctor{}, dtor{}; };
+    std::vector<cxx_methods> classes;
+    {
+        std::lock_guard lock(g_lock);
+        for (Class c = realize(obj->isa); c; c = c->superclass) {
+            cxx_methods methods;
+            /* These methods describe only this class's ivars. An inherited
+             * lookup would construct/destruct the same superclass twice. */
+            for (const auto &m : rw(c)->methods) {
+                if (!methods.ctor.imp && std::strcmp(m.sel, ".cxx_construct") == 0) methods.ctor = m;
+                if (!methods.dtor.imp && std::strcmp(m.sel, ".cxx_destruct") == 0) methods.dtor = m;
+            }
+            if (methods.ctor.imp || methods.dtor.imp) classes.push_back(methods);
+        }
+    }
+    std::vector<method_entry> destructors;
+    /* Execute guest code outside the runtime lock, superclass first. */
+    for (auto it = classes.rbegin(); it != classes.rend(); ++it) {
+        if (it->ctor.imp && !send_host_or_guest(obj, it->ctor, 0, nullptr)) {
+            for (auto d = destructors.rbegin(); d != destructors.rend(); ++d)
+                send_host_or_guest(obj, *d, 0, nullptr);
+            return 0;
+        }
+        if (it->dtor.imp) destructors.push_back(it->dtor);
+    }
+    if (!destructors.empty()) {
+        std::lock_guard lock(g_lock);
+        g_cxx_destructors.emplace(obj, std::move(destructors));
+    }
+    return 1;
+}
+
+void mm_objc_destruct_instance(mm_id obj) {
+    std::vector<method_entry> destructors;
+    {
+        std::lock_guard lock(g_lock);
+        auto it = g_cxx_destructors.find(obj);
+        if (it == g_cxx_destructors.end()) return;
+        destructors = std::move(it->second);
+        g_cxx_destructors.erase(it);
+    }
+    for (auto it = destructors.rbegin(); it != destructors.rend(); ++it)
+        send_host_or_guest(obj, *it, 0, nullptr);
+}
+
+mm_id mm_objc_alloc(mm_objc_class *cls, size_t extra) {
+    id obj = mm_objc_alloc_raw(cls, extra);
+    if (mm_objc_construct_instance(obj)) return obj;
+    mm_objc_free_instance(obj);
+    return nullptr;
 }
 
 const char *mm_objc_class_name(mm_objc_class *cls) { return cls && rw(cls) ? rw(cls)->name.c_str() : "?"; }
@@ -471,6 +619,7 @@ namespace {
 
 id do_retain(id obj) {
     if (!obj) return obj;
+    if (is_block_object(obj)) return static_cast<id>(block_copy(obj));
     std::lock_guard lock(g_lock);
     auto it = g_refcounts.find(obj);
     if (it == g_refcounts.end()) g_refcounts[obj] = {2, false}; /* not ours (constant/static): count but never free */
@@ -487,6 +636,7 @@ void do_dealloc(id obj) {
 
 void do_release(id obj) {
     if (!obj) return;
+    if (is_block_object(obj)) { block_release(obj); return; }
     bool dealloc = false;
     {
         std::lock_guard lock(g_lock);
@@ -501,7 +651,13 @@ void do_release(id obj) {
 }
 
 void free_instance(id obj) {
+    mm_objc_destruct_instance(obj);
     std::lock_guard lock(g_lock);
+    if (auto it = T().stub_values.find(obj); it != T().stub_values.end()) {
+        auto values = std::move(it->second);
+        T().stub_values.erase(it);
+        for (auto &[key, value] : values) do_release(value.object);
+    }
     /* zero weak references */
     if (auto w = g_weak.find(obj); w != g_weak.end()) {
         for (id *slot : w->second) *slot = nullptr;
@@ -522,7 +678,7 @@ void free_instance(id obj) {
 /* NSObject methods (host IMPs: (self, _cmd, ...)) */
 std::uint64_t NSObject_alloc(id cls, SEL) { return reinterpret_cast<std::uintptr_t>(mm_objc_alloc(reinterpret_cast<Class>(cls), 0)); }
 std::uint64_t NSObject_new(id cls, SEL) {
-    id obj = mm_objc_alloc(reinterpret_cast<Class>(cls), 0);
+    id obj = reinterpret_cast<id>(mm_objc_send(cls, sel_intern("alloc"), 0, nullptr));
     return mm_objc_send(obj, sel_intern("init"), 0, nullptr);
 }
 std::uint64_t NSObject_init(id self, SEL) { return reinterpret_cast<std::uintptr_t>(self); }
@@ -592,7 +748,7 @@ std::uint64_t NSObject_description(id self, SEL) {
     std::snprintf(buf, sizeof buf, "<%s: %p>", rw(self->isa)->name.c_str(), static_cast<void *>(self));
     return reinterpret_cast<std::uintptr_t>(buf);
 }
-std::uint64_t NSObject_copy(id self, SEL) { return mm_objc_send(self, sel_intern("copyWithZone:"), 1, nullptr); }
+std::uint64_t NSObject_copy(id self, SEL) { return mm_objc_send1(self, "copyWithZone:", 0); }
 std::uint64_t NSObject_zone(id, SEL) { return 0; }
 std::uint64_t NSObject_noop(id self, SEL) { return reinterpret_cast<std::uintptr_t>(self); }
 std::uint64_t NSObject_forwardingTarget(id, SEL, SEL) { return 0; }
@@ -674,11 +830,16 @@ std::uint64_t Block_release(id self, SEL) { block_release(self); return 0; }
 
 struct image_sections { const mm_section_64 *selrefs = nullptr, *classlist = nullptr, *nlclslist = nullptr, *catlist = nullptr, *nlcatlist = nullptr, *protolist = nullptr; };
 
-void load_image(const void *header) {
+struct load_callback { Class receiver; void *imp; };
+std::vector<load_callback> g_class_loads, g_category_loads;
+
+void load_image(const void *header, std::uint64_t slide) {
     const auto *hdr = static_cast<const mm_mach_header_64 *>(header);
     std::span<const std::uint8_t> bytes(static_cast<const std::uint8_t *>(header), sizeof(mm_mach_header_64) + hdr->sizeofcmds);
     mm_macho_image img;
     if (mm_macho_parse(bytes, img) != mm_macho_status::ok) return;
+    /* Section vmaddres are unslid; the executable maps at slide 0 and the
+     * dylibs carry their own, so every address below reads through it. */
     image_sections s;
     for (const auto *seg : img.segments)
         for (const auto &sect : img.sections(*seg)) {
@@ -692,12 +853,12 @@ void load_image(const void *header) {
         }
     std::lock_guard lock(g_lock);
     if (s.selrefs) {
-        auto *refs = reinterpret_cast<const char **>(s.selrefs->addr);
+        auto *refs = reinterpret_cast<const char **>(s.selrefs->addr + slide);
         for (std::uint64_t i = 0; i < s.selrefs->size / 8; i++)
             refs[i] = sel_intern(refs[i]);
     }
     if (s.protolist) {
-        auto *protos = reinterpret_cast<protocol_t **>(s.protolist->addr);
+        auto *protos = reinterpret_cast<protocol_t **>(s.protolist->addr + slide);
         for (std::uint64_t i = 0; i < s.protolist->size / 8; i++) {
             protocol_t *p = protos[i];
             if (!p->base.isa) p->base.isa = MM_OBJC_CLASS_REF(Protocol);
@@ -706,7 +867,7 @@ void load_image(const void *header) {
     }
     std::vector<Class> classes;
     if (s.classlist) {
-        auto *list = reinterpret_cast<Class *>(s.classlist->addr);
+        auto *list = reinterpret_cast<Class *>(s.classlist->addr + slide);
         for (std::uint64_t i = 0; i < s.classlist->size / 8; i++) {
             register_guest_class(list[i]);
             classes.push_back(list[i]);
@@ -714,12 +875,12 @@ void load_image(const void *header) {
     }
     std::vector<const category_t *> cats;
     if (s.catlist) {
-        auto *list = reinterpret_cast<const category_t **>(s.catlist->addr);
+        auto *list = reinterpret_cast<const category_t **>(s.catlist->addr + slide);
         for (std::uint64_t i = 0; i < s.catlist->size / 8; i++) cats.push_back(list[i]);
     }
     for (Class c : classes) realize(c);
-    for (const category_t *cat : cats) attach_category(cat);
-    /* +load: classes first (superclass before subclass), then categories */
+    /* Save the class's own +load before categories override method lookup.
+     * Execute only after all images and translations are ready. */
     SEL load_sel = sel_intern("load");
     for (Class c : classes) {
         if (rw(c)->missing_super || unresolved_name(c->isa)) continue;
@@ -727,11 +888,11 @@ void load_image(const void *header) {
         for (const auto &m : rw(c->isa)->methods)
             if (m.sel == load_sel && m.guest) {
                 if (trace()) std::fprintf(stderr, "objc: +[%s load]\n", rw(c)->name.c_str());
-                const std::uint64_t args[2] = {reinterpret_cast<std::uintptr_t>(c), reinterpret_cast<std::uintptr_t>(load_sel)};
-                g_api->call_guest(reinterpret_cast<std::uintptr_t>(m.imp), args, 2);
+                g_class_loads.push_back({c, m.imp});
                 break;
             }
     }
+    for (const category_t *cat : cats) attach_category(cat);
     for (const category_t *cat : cats) {
         if (!cat->classMethods || unresolved_name(cat->cls) || rw(cat->cls)->missing_super) continue;
         const auto *list = cat->classMethods;
@@ -751,8 +912,7 @@ void load_image(const void *header) {
             }
             if (sel_intern(sel) == load_sel) {
                 if (trace()) std::fprintf(stderr, "objc: +[%s(%s) load]\n", rw(cat->cls)->name.c_str(), cat->name);
-                const std::uint64_t args[2] = {reinterpret_cast<std::uintptr_t>(cat->cls), reinterpret_cast<std::uintptr_t>(load_sel)};
-                g_api->call_guest(reinterpret_cast<std::uintptr_t>(imp), args, 2);
+                g_category_loads.push_back({cat->cls, imp});
             }
         }
     }
@@ -761,11 +921,18 @@ void load_image(const void *header) {
 
 /* ---- message dispatch --------------------------------------------------- */
 
+#include "dynamic_stubs.inc"
+
 /* Resolves receiver/selector and hands the IMP to the runtime. Returns the
  * receiver so x0 is unchanged when the guest resumes at the IMP. */
 std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
-    if (!receiver) { ctx->v[0][0] = ctx->v[0][1] = 0; return 0; }
-    const method_entry *m;
+    if (!receiver) {
+        std::memset(ctx->v, 0, sizeof(ctx->v[0]) * 4);
+        ctx->x[1] = 0;
+        ctx->host_result_in_context = 1;
+        return 0;
+    }
+    method_entry implementation{};
     {
         std::lock_guard lock(g_lock);
         Class c = start;
@@ -780,7 +947,7 @@ std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
             std::abort();
         }
         ensure_initialized(r->is_meta ? reinterpret_cast<Class>(receiver) : c);
-        m = lookup_in(c, sel);
+        const method_entry *m = lookup_in(c, sel);
         if (!m) {
             SEL fwd = sel_intern("forwardingTargetForSelector:");
             if (const method_entry *f = lookup_in(c, fwd); f && f->imp != reinterpret_cast<void *>(&NSObject_forwardingTarget)) {
@@ -791,6 +958,9 @@ std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
                     return dispatch(ctx, target, sel, target->isa);
                 }
             }
+            m = resolve_stub(c, sel);
+        }
+        if (!m) {
             /* A class machoman implements is always partial: Apple's have
              * hundreds of methods and this has the ones programs were seen
              * to use. Stopping the process at the first one that is missing
@@ -813,10 +983,22 @@ std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
                          host_class && !strict ? "; answering nil" : "");
             if (!host_class || strict) std::abort();
             ctx->x[0] = 0;
+            ctx->x[1] = 0;
+            std::memset(ctx->v, 0, sizeof(ctx->v[0]) * 4);
             ctx->host_tail_fn = 0;
             ctx->resume_va = 0;
+            ctx->host_result_in_context = 1;
             return 0;
         }
+        implementation = *m;
+    }
+    const auto *m = &implementation;
+    if (m->stub) {
+        ctx->host_tail_fn = 0;
+        ctx->resume_va = 0;
+        auto result = invoke_stub(*ctx, *m->stub);
+        ctx->host_result_in_context = 1;
+        return result;
     }
     if (trace()) std::fprintf(stderr, "objc: %c[%s %s] -> %s %p\n", rw(start)->is_meta ? '+' : '-', rw(start)->name.c_str(), sel,
                               m->guest ? "guest" : "host", m->imp);
@@ -911,7 +1093,31 @@ extern "C" {
 
 EXPORT void machoman_dylib_init(const mm_host_api *api) {
     g_api = api;
-    if (api->main_image) load_image(api->main_image);
+    /* Register the objc metadata of every mapped guest image — the
+     * executable first, then the dylibs, whose classes the guest allocates
+     * and retains just like the executable's own. */
+    if (api->image_count)
+        for (std::size_t i = 0, n = api->image_count(); i < n; i++)
+            if (const void *header = api->image_header(i)) load_image(header, api->image_slide(i));
+    if (g_classes.empty() && api->main_image) load_image(api->main_image, 0);
+}
+
+EXPORT void machoman_dylib_start() {
+    std::vector<load_callback> classes, categories;
+    SEL load_sel;
+    {
+        std::lock_guard lock(g_lock);
+        classes.swap(g_class_loads);
+        categories.swap(g_category_loads);
+        load_sel = sel_intern("load");
+    }
+    /* Call guest code outside the metadata lock, classes before categories. */
+    for (const auto *callbacks : {&classes, &categories})
+        for (const auto &callback : *callbacks) {
+            const std::uint64_t args[2] = {reinterpret_cast<std::uintptr_t>(callback.receiver),
+                                         reinterpret_cast<std::uintptr_t>(load_sel)};
+            g_api->call_guest(reinterpret_cast<std::uintptr_t>(callback.imp), args, 2);
+        }
 }
 
 static void objc_ctor() __attribute__((constructor));
@@ -1121,10 +1327,25 @@ void *class_getMethodImplementation(Class cls, SEL sel) DARWIN(class_getMethodIm
 void *class_getMethodImplementation(Class cls, SEL sel) {
     std::lock_guard lock(g_lock);
     const method_entry *m = cls ? lookup_in(cls, sel_intern(sel)) : nullptr;
+    if (!m && cls) m = resolve_stub(cls, sel_intern(sel));
     return m ? m->imp : nullptr;
 }
 const method_entry *class_getInstanceMethod(Class cls, SEL sel) DARWIN(class_getInstanceMethod);
-const method_entry *class_getInstanceMethod(Class cls, SEL sel) { std::lock_guard lock(g_lock); return cls ? lookup_in(cls, sel_intern(sel)) : nullptr; }
+const method_entry *class_getInstanceMethod(Class cls, SEL sel) {
+    std::lock_guard lock(g_lock);
+    if (!cls) return nullptr;
+    SEL s = sel_intern(sel);
+    const method_entry *found = lookup_in(cls, s);
+    if (!found) {
+        for (Class c = cls; c; c = c->superclass)
+            if (auto it = rw(c)->stubs.find(s); it != rw(c)->stubs.end()) return &it->second->entry;
+        return nullptr;
+    }
+    if (found->stub) return &found->stub->entry;
+    for (Class c = cls; c; c = c->superclass)
+        for (auto &method : rw(c)->methods) if (method.sel == s) return &method;
+    return nullptr;
+}
 const method_entry *class_getClassMethod(Class cls, SEL sel) DARWIN(class_getClassMethod);
 const method_entry *class_getClassMethod(Class cls, SEL sel) { return cls ? class_getInstanceMethod(cls->isa, sel) : nullptr; }
 void *method_getImplementation(const method_entry *m) DARWIN(method_getImplementation);
@@ -1136,7 +1357,7 @@ const char *method_getTypeEncoding(const method_entry *m) { return m ? m->types 
 void *method_setImplementation(method_entry *m, void *imp) DARWIN(method_setImplementation);
 void *method_setImplementation(method_entry *m, void *imp) {
     std::lock_guard lock(g_lock);
-    void *old = m->imp; m->imp = imp; m->guest = is_guest(imp);
+    void *old = m->imp; m->imp = imp; m->guest = is_guest(imp); m->stub = nullptr;
     for (auto &[name, c] : g_classes) { rw(c)->cache.clear(); rw(c->isa)->cache.clear(); }
     return old;
 }
@@ -1144,6 +1365,7 @@ void method_exchangeImplementations(method_entry *a, method_entry *b) DARWIN(met
 void method_exchangeImplementations(method_entry *a, method_entry *b) {
     std::lock_guard lock(g_lock);
     std::swap(a->imp, b->imp); std::swap(a->guest, b->guest);
+    std::swap(a->stub, b->stub);
     for (auto &[name, c] : g_classes) { rw(c)->cache.clear(); rw(c->isa)->cache.clear(); }
 }
 bool class_addMethod(Class cls, SEL sel, void *imp, const char *types) DARWIN(class_addMethod);
@@ -1153,8 +1375,9 @@ bool class_addMethod(Class cls, SEL sel, void *imp, const char *types) {
     class_rw *r = rw(cls);
     SEL s = sel_intern(sel);
     for (const auto &m : r->methods) if (m.sel == s) return false;
+    /* A real implementation replaces a lazily cached compatibility method. */
     r->methods.insert(r->methods.begin(), method_entry{s, imp, types, is_guest(imp)});
-    r->cache.clear();
+    invalidate_method_caches(r);
     return true;
 }
 void *class_replaceMethod(Class cls, SEL sel, void *imp, const char *types) DARWIN(class_replaceMethod);
@@ -1163,9 +1386,9 @@ void *class_replaceMethod(Class cls, SEL sel, void *imp, const char *types) {
     realize(cls);
     class_rw *r = rw(cls);
     SEL s = sel_intern(sel);
-    for (auto &m : r->methods) if (m.sel == s) { void *old = m.imp; m.imp = imp; m.guest = is_guest(imp); r->cache.clear(); return old; }
+    for (auto &m : r->methods) if (m.sel == s) { void *old = m.imp; m.imp = imp; m.guest = is_guest(imp); m.stub = nullptr; invalidate_method_caches(r); return old; }
     r->methods.insert(r->methods.begin(), method_entry{s, imp, types, is_guest(imp)});
-    r->cache.clear();
+    invalidate_method_caches(r);
     return nullptr;
 }
 SEL sel_registerName(const char *name) DARWIN(sel_registerName);
@@ -1245,7 +1468,7 @@ void objc_setProperty_nonatomic(id self, SEL, id value, std::ptrdiff_t offset) {
 }
 void objc_setProperty_nonatomic_copy(id self, SEL, id value, std::ptrdiff_t offset) DARWIN(objc_setProperty_nonatomic_copy);
 void objc_setProperty_nonatomic_copy(id self, SEL, id value, std::ptrdiff_t offset) {
-    id copy = value ? reinterpret_cast<id>(mm_objc_send(value, sel_intern("copyWithZone:"), 1, nullptr)) : nullptr;
+    id copy = value ? reinterpret_cast<id>(mm_objc_send1(value, "copyWithZone:", 0)) : nullptr;
     id *slot = reinterpret_cast<id *>(reinterpret_cast<std::uint8_t *>(self) + offset);
     id old = *slot; *slot = copy; objc_release(old);
 }

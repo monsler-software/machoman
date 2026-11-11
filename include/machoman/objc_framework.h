@@ -41,9 +41,14 @@ template <typename T> T *construct(id o) {
     Class isa = o->isa;
     T *t = new (static_cast<void *>(o)) T;
     reinterpret_cast<mm_objc_object *>(t)->isa = isa;
+    if (!mm_objc_construct_instance(o)) {
+        t->~T();
+        mm_objc_free_instance(o);
+        return nullptr;
+    }
     return t;
 }
-template <typename T> T *make(Class cls) { return construct<T>(mm_objc_alloc(cls, 0)); }
+template <typename T> T *make(Class cls) { return construct<T>(mm_objc_alloc_raw(cls, 0)); }
 template <typename T> T *as(id o) { return reinterpret_cast<T *>(o); }
 
 inline std::uint64_t ret(const void *p) { return reinterpret_cast<std::uintptr_t>(p); }
@@ -51,6 +56,7 @@ inline id obj(std::uint64_t v) { return reinterpret_cast<id>(v); }
 
 template <typename T> std::uint64_t alloc_imp(id cls, SEL) { return ret(make<T>(reinterpret_cast<Class>(cls))); }
 template <typename T> std::uint64_t dealloc_imp(id self, SEL) {
+    mm_objc_destruct_instance(self);
     reinterpret_cast<T *>(self)->~T();
     mm_objc_free_instance(self);
     return 0;
@@ -119,6 +125,17 @@ inline void release(id o) { mm_objc_release(o); }
 inline id autorelease(id o) { return mm_objc_autorelease(o); }
 inline bool is_kind(id o, Class c) { return mm_objc_is_kind_of(o, c) != 0; }
 inline Class cls(const char *name) { return mm_objc_class_named(name); }
+
+/* Event-loop turns and dispatch work items own their temporary objects.
+ * An outer guest pool may remain active for the lifetime of the app. */
+class autorelease_pool {
+    id pool_;
+public:
+    autorelease_pool() : pool_(obj(send(reinterpret_cast<id>(cls("NSAutoreleasePool")), "new"))) {}
+    ~autorelease_pool() { if (pool_) send(pool_, "drain"); }
+    autorelease_pool(const autorelease_pool &) = delete;
+    autorelease_pool &operator=(const autorelease_pool &) = delete;
+};
 
 } // namespace mmfw
 

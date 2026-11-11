@@ -40,6 +40,12 @@ void vconst(mm_x64_buf &buf, int xmm, std::uint64_t lo, std::uint64_t hi);
 /* AdvSIMD integer data processing (translator_simd.cpp). Returns false
  * when the operation has no emission yet. */
 bool emit_vector_op(mm_x64_buf &buf, const mm_a64_insn &insn);
+bool emit_simd_helper(mm_x64_buf &buf, const mm_a64_insn &insn);
+bool emit_simd_native(mm_x64_buf &buf, void (*function)(mm_cpu_context *, std::uint32_t), std::uint32_t raw);
+bool emit_half_fp(mm_x64_buf &buf, const mm_a64_insn &insn);
+
+/* ARMv8 crypto extension (translator_simd.cpp). */
+bool emit_crypto_op(mm_x64_buf &buf, const mm_a64_insn &insn);
 
 /* Loads rn/rm and leaves the even lanes of the (rn ++ rm) stream in X2 and
  * the odd lanes in X3, laid out as the pairwise result expects

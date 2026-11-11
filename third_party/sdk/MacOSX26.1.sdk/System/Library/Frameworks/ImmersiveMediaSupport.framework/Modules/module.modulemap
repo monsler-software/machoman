@@ -1,9 +1,0 @@
-//
-//  ImmersiveMediaSupport.modulemap
-//  ImmersiveMediaSupport
-//
-//  Created by Leena Kora on 2/26/25.
-//
-
-framework module ImmersiveMediaSupport [system] {
-}

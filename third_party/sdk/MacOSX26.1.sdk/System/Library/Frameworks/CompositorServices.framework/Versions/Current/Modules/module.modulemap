@@ -1,6 +1,0 @@
-framework module CompositorServices [system] {
-  umbrella header "CompositorServices.h"
-
-  export *
-  module * { export * }
-}

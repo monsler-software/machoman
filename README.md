@@ -25,6 +25,23 @@ with NEON, correct output and exit codes. C++ programs cross-compiled for
 arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
 (unwound through translated frames by a guest-side libunwind).
 
+- **Linux dialogs and Cocoa controls**: `NSOpenPanel` and `NSSavePanel` use
+  `org.freedesktop.portal.FileChooser` over GIO, including folder selection,
+  multiple files, filters, cancellation and asynchronous completion handlers.
+  `NSAlert` uses GTK message dialogs. No helper command is spawned. Portal
+  dialogs need a running session bus and a file chooser portal implementation.
+  The optional GTK and GIO development packages enable the corresponding
+  backends; headless requests cancel instead of claiming a selection.
+  [`modules/evilcocoa`](modules/evilcocoa/README.md) renders standard labels and
+  buttons with OpenGL, Pango text masks and an independent EGL context. Build
+  with `MACHOMAN_BUILD_EVILCOCOA=OFF` to omit it; its dependencies are libepoxy
+  and pangocairo. Images, tables and custom guest drawing remain incomplete.
+- **Cocoa application entry point**: AppKit's `NSApplicationMain`, re-exported
+  by Quartz and Cocoa, honors `NSPrincipalClass` and `NSMainNibFile`, loads
+  keyed plists and compiled `NIBArchive` graphs, and enters the event loop.
+  `NSWindowController` provides lazy nib loading and window ownership.
+  GrandPerspective reaches its Welcome window and native folder chooser;
+  its background scanning still needs additional Foundation thread/lock APIs.
 - **Process and launch semantics**: the Carbon Process Manager reports
   this one application (with the bundle's signature), and AppKit sends the
   delegate the launch messages macOS sends — `applicationDidFinishLaunching:`
@@ -119,6 +136,14 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   (`src/dylibs/accelerate/`) is a real vDSP: FFTs (split-complex, packed
   real), vector arithmetic and the `vv*` transcendentals;
   `/usr/lib/libiconv.2.dylib` is glibc's iconv under Apple's names.
+- **PCM engine** (`src/dylibs/audio/engine.cpp`): preallocated float32
+  planar/interleaved buffers, variable block sizes, stop/quiescence and
+  silence on callback failure. An offline null adapter and ARM64 guest
+  sample test exercise the Darwin audio ABI. Host API v3 prepares callbacks
+  on their processing thread with a persistent guest identity/stack and
+  returns faults without aborting the process. Physical PipeWire output,
+  HAL devices and AudioUnit output are still pending; the null adapter is
+  never advertised as a default audio device.
 - **Stub frameworks** (`src/dylibs/symbol-synthesis/`): one object standing
   in for every framework that is not implemented yet, installed under each
   of their paths. It defines nothing; the runtime asks it for each bind
@@ -127,6 +152,10 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   that reports the call once and returns 0 — so a program only fails where
   it actually depends on the missing behaviour, and the message names the
   symbol.
+  Synthesized classes also support cached, typed stateful properties and
+  ARM64 aggregate returns. Potential pointer, output-parameter and unknown
+  ABI hazards are marked with `risk:` in stderr. See
+  [dynamic compatibility stubs](docs/dynamic-stubs.md) for contracts and limits.
 - **AOT translator**: the complete integer A64 ISA plus AdvSIMD integer
   and floating point (scalar and vector, FMA, conversions, compares,
   FPCR rounding mode and flush-to-zero mirrored into MXCSR). Against
@@ -167,6 +196,22 @@ cp third_party/samples/rg-arm64 /tmp/venv/bin/
 ./build/machoman run /tmp/venv rg-arm64 -n "pattern" some/dir
 ```
 
+Installing an application from a DMG:
+
+```sh
+./build/machoman install /tmp/venv "/path/to/Application.dmg"
+./build/machoman run /tmp/venv Application
+```
+
+`install` requires 7-Zip (`7zz` or `7z` on PATH, or `MACHOMAN_7ZIP` pointing
+to its executable). A packaged copy can also live in `tools/` beside
+machoman. It extracts the image, installs all outermost `.app` bundles in
+`Applications/`, and prints their actual launch names from `Info.plist`.
+Nested helper apps remain inside their parent bundle. Resources and bundle
+symlinks are preserved, and portable records under `bin/` keep launch paths
+working when the venv moves. Conflicting bundle/command names fail before
+publication; encrypted images and `.pkg` installers are not supported.
+
 `MACHOMAN_TRACE=1` logs dylib resolution, every bind, every host call and
 every static initializer; `MACHOMAN_OSLOG=1` prints the guest's own
 `os_log` messages (decoded, not just the format string);
@@ -177,17 +222,62 @@ system (windows, nib loading, the Wayland connection), which is
 into `bin/`; `@executable_path`/`@loader_path` then find the bundle's
 `Frameworks/`.
 
-Requires a C++26 compiler (clang 22 / GCC 16 are known to work) and CMake ≥ 3.25.
+Requires a C++26 compiler (clang 22 / GCC 16 are known to work), CMake ≥ 3.25
+and Fontconfig development files for CoreText font lookup.
+
+The experimental [MEVK module](modules/MEVK/README.md) translates precompiled
+Metal AIR shaders and render/blit commands to Vulkan at runtime.
+`-DMACHOMAN_BUILD_MEVK=ON` replaces the Metal framework stub with its host bridge
+and connects CAMetalLayer drawables to AppKit/Wayland. It requires Vulkan,
+LLVM 23+ and shaderc development files. The backend also builds standalone.
+The initial renderer supports a subset of Metal; MetalKit remains a stub.
 
 ## CLI
 
 ```
 machoman inspect   <arm64-macho-binary>            # dump header/segments/dylibs
 machoman venv-init <venv-dir>                      # create a venv
-machoman translate [--stats] <arm64-macho-binary>   # run the AOT translator, report coverage
+machoman install   <venv-dir> <path-to-dmg>         # install .app bundles and register launch names
+machoman translate [--stats] [--cache] <arm64-macho-binary> # translate, optionally populate/read the disk cache
 machoman run       <venv-dir> <binary-in-venv-bin>   # run until the first thing we cannot do, and say what it was
 machoman disasm    <arm64-macho-binary> <va> [n]     # decode n instructions at a guest VA, with symbols
 ```
+
+`run` caches each translated Mach-O in `.machoman-cache` beside its source
+file, using a separate `<binary-name>.x86_64.aot` file for every executable
+and library. Cached code is checked against the complete source file,
+guest load address, translator build and watch instrumentation; native
+helper addresses are relocated for the current process. Corrupt or
+unwritable caches fall back to translation. Set `MACHOMAN_TRANSLATION_CACHE=0`
+to disable caching, or `MACHOMAN_CACHE_TRACE=1` to print hits and misses.
+
+Wayland windows use the main bundle's identifier and icon from
+`CFBundleIconFile`. PNG files and PNG images embedded in ICNS are supported.
+When available, the compositor receives the icon through
+`xdg-toplevel-icon-v1`; a hidden desktop association and a PNG icon under
+`XDG_DATA_HOME` (or `~/.local/share`) also let desktop panels resolve it.
+Classic ICNS bitmap and JPEG2000 payloads are not decoded yet.
+
+On Wayland, normal titled, resizable windows show `NSApplication.mainMenu`
+in a 28-point host menu bar when pangocairo is available. Menus are painted
+on the CPU into shared-memory surfaces. Application drawing has a separate
+content surface below the bar; compositor sizes are reduced by the bar's
+height before reaching AppKit, EGL or Metal layer placement. Menu actions
+use the responder chain, with validation, disabled/hidden items, checkmarks,
+submenus, keyboard navigation and Ctrl equivalents for Cmd menu shortcuts.
+Interface Builder's `_NSMainMenu` archive role also installs the main menu.
+
+Keyboard input swaps host Ctrl and Super into Darwin Command and Control,
+including modifier-key codes and `flagsChanged` events. This normalization
+is shared code for native shortcut modifiers; the Wayland backend applies
+it to all keyboard and pointer modifier flags. Set
+`MACHOMAN_NATIVE_SHORTCUTS=0` to disable the keyboard swap.
+
+`NSCursor` supports standard system shapes using the host cursor theme,
+current cursor, nested push/pop, hide/unhide and hiding until mouse motion.
+File-backed PNG/ICNS cursor images up to 256 pixels preserve their hotspot
+and ownership. Cursor rendering uses Wayland surfaces independently of the
+application's graphics API.
 
 ## Next steps
 
@@ -198,9 +288,11 @@ machoman disasm    <arm64-macho-binary> <va> [n]     # decode n instructions at 
    renders reaches the window.
 3. `LC_DYLD_CHAINED_FIXUPS` (newer binaries), stack-passed host call
    arguments beyond eight, `posix_spawn`, guest `dlopen`/`dlsym`, a
-   translation cache on disk (Live takes ~20 s to translate).
-4. Performance: flags save/restore peephole (producer directly followed by
-   its consumer), then a register allocator for both GPRs and xmm (for
+   additional guest process and dynamic loading support.
+4. Performance: B.cond tests saved NZCV directly, Q loads/stores use 128-bit
+   SSE moves, selected USHL/SSHL forms use AVX2 when available, and native
+   FP chains retain two clean V results in XMM4/5. Next: GPR allocation
+   and delayed context writes with precise side-exit/fault state (for
    FMA: `fmla` maps to `vfmadd231` with no copies once vd lives in a
    register; 4-operand `fmadd d,n,m,a` picks 231/213/132 by which source
    aliases the destination, else one `vmovaps`).

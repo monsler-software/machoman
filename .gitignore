@@ -1,1 +1,9 @@
 build/
+work/
+# AOT cache artifacts live beside their source Mach-O files.
+**/.machoman-cache/
+.cache/
+.codex/
+.aws/
+.agents/
+third_party/sdk/MacOSX26.1.sdk/

@@ -1,0 +1,7 @@
+if(NOT EXISTS "${VENV}/machoman-venv.json")
+    execute_process(COMMAND "${MACHOMAN}" venv-init "${VENV}"
+        RESULT_VARIABLE result)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "Could not create guest test venv: ${result}")
+    endif()
+endif()

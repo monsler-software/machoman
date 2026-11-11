@@ -22,12 +22,33 @@
 #include "appkit.h"
 
 #include <chrono>
+#include <atomic>
 #include <cstdio>
+#include <dlfcn.h>
+#include <cmath>
+#ifdef MM_APPKIT_MEVK
+#include "mevk/render.h"
+extern "C" void machoman_mevk_register_layer();
+#endif
 
 MM_FW_CLASS(CALayer);
 MM_FW_CLASS(CATransaction);
+MM_FW_CLASS(NSOpenGLLayer);
+MM_FW_CLASS(CAMetalLayer);
 
 namespace ak {
+
+view_object::~view_object() {
+    for(id sub:subviews){auto *child=as<view_object>(sub);child->superview=nullptr;child->window=nullptr;release(sub);}
+    if (layer) {
+        if (is_kind(layer, cls("CALayer"))) {
+            auto *lo = as<layer_object>(layer);
+            lo->view = nullptr;
+            platform::release_metal(lo);
+        }
+        mm_objc_release(layer);
+    }
+}
 
 namespace {
 
@@ -109,9 +130,32 @@ std::uint64_t layer_setPosition(id self, SEL, double x, double y) { l(self)->pos
 mm_two_doubles layer_anchorPoint(id self, SEL) { return {l(self)->anchor.x, l(self)->anchor.y}; }
 std::uint64_t layer_setAnchorPoint(id self, SEL, double x, double y) { l(self)->anchor = {x, y}; return 0; }
 double layer_contentsScale(id self, SEL) { return l(self)->contents_scale; }
-std::uint64_t layer_setContentsScale(id self, SEL, double s) { l(self)->contents_scale = s > 0 ? s : 1.0; return 0; }
+std::uint64_t layer_setContentsScale(id self, SEL, double s) { l(self)->contents_scale = std::isfinite(s) && s > 0 ? s : 1.0; return 0; }
+constexpr const char *gravity_names[] = {"resize", "resizeAspect", "resizeAspectFill", "center", "top", "topRight",
+    "right", "bottomRight", "bottom", "bottomLeft", "left", "topLeft"};
+std::uint64_t layer_contentsGravity(id self, SEL) { return ret(string(gravity_names[l(self)->contents_placement])); }
+std::uint64_t layer_setContentsGravity(id self, SEL, id gravity) {
+    const auto name = to_utf8(gravity);
+    for (unsigned i = 0; i < 12; ++i) if (name == gravity_names[i]) {
+        l(self)->contents_placement = i;
+        break;
+    }
+    return 0;
+}
 
-std::uint64_t layer_setNeedsDisplay(id self, SEL) { l(self)->needs_display = true; return 0; }
+std::uint64_t layer_setNeedsDisplay(id self, SEL) {
+    layer_object *o = l(self);
+    o->needs_display = true;
+    const rect &b = o->bounds;
+    if (mm_cpu_context *ctx = api()->current_context()) {
+        std::memcpy(&ctx->v[0][0], &b.x, 8);
+        std::memcpy(&ctx->v[1][0], &b.y, 8);
+        std::memcpy(&ctx->v[2][0], &b.w, 8);
+        std::memcpy(&ctx->v[3][0], &b.h, 8);
+    }
+    send(self, "setNeedsDisplayInRect:");
+    return 0;
+}
 std::uint64_t layer_setNeedsDisplayInRect(id self, SEL, double, double, double, double) {
     l(self)->needs_display = true;
     return 0;
@@ -138,11 +182,12 @@ std::uint64_t layer_addSublayer(id self, SEL, id sub) {
     return 0;
 }
 std::uint64_t layer_removeFromSuperlayer(id self, SEL) {
+    platform::release_metal(l(self));
     if (id super = l(self)->superlayer) {
+        l(self)->superlayer = nullptr;
         auto &subs = l(super)->sublayers;
         for (auto it = subs.begin(); it != subs.end(); ++it)
             if (*it == self) { subs.erase(it); release(self); break; }
-        l(self)->superlayer = nullptr;
     }
     return 0;
 }
@@ -150,7 +195,11 @@ std::uint64_t layer_removeFromSuperlayer(id self, SEL) {
 std::uint64_t layer_isOpaque(id self, SEL) { return l(self)->opaque ? 1 : 0; }
 std::uint64_t layer_setOpaque(id self, SEL, std::uint64_t flag) { l(self)->opaque = (flag & 0xFF) != 0; return 0; }
 std::uint64_t layer_isHidden(id self, SEL) { return l(self)->hidden ? 1 : 0; }
-std::uint64_t layer_setHidden(id self, SEL, std::uint64_t flag) { l(self)->hidden = (flag & 0xFF) != 0; return 0; }
+std::uint64_t layer_setHidden(id self, SEL, std::uint64_t flag) {
+    l(self)->hidden = (flag & 0xFF) != 0;
+    if (l(self)->hidden) platform::release_metal(l(self));
+    return 0;
+}
 std::uint64_t layer_contents(id self, SEL) { return ret(l(self)->contents); }
 std::uint64_t layer_setContents(id self, SEL, id c) {
     layer_object *o = l(self);
@@ -204,9 +253,36 @@ std::uint64_t gllayer_draw(id, SEL, id, id, id) { return 0; }
  * visible window is given its context, asked whether it wants to draw and,
  * if it does, told to. This is what a CVDisplayLink does on macOS for an
  * asynchronous layer. */
+namespace {
+thread_local std::uint64_t current_display_pass = 0, next_display_pass = 0;
+}
+layer_display_pass::layer_display_pass() : previous(current_display_pass) {
+    current_display_pass = ++next_display_pass;
+}
+layer_display_pass::~layer_display_pass() { current_display_pass = previous; }
+
 void draw_layer(id view, id layer) {
     layer_object *o = l(layer);
     static std::int64_t frame_number = 0;
+    static const bool profile = std::getenv("MACHOMAN_APPKIT_FRAME_TIMING") != nullptr;
+    if (current_display_pass && o->last_display_pass == current_display_pass) return;
+    const double layer_time = now_seconds();
+    if (layer_time - o->last_frame_time < 0.016) {
+        return;
+    }
+    o->last_frame_time = layer_time;
+    o->last_display_pass = current_display_pass;
+
+    const rect &vf = as<view_object>(view)->frame;
+    if (o->bounds.w == 0 && vf.w > 0) {
+        o->bounds = {0, 0, vf.w, vf.h};
+        o->frame = {0, 0, vf.w, vf.h};
+        if (mm_cpu_context *ctx = api()->current_context()) {
+            const double values[4] = {0, 0, vf.w, vf.h};
+            for (int i = 0; i < 4; i++) std::memcpy(&ctx->v[i][0], &values[i], 8);
+        }
+        send(layer, "setBounds:");
+    }
 
     if (!o->gl_format) {
         const std::uint64_t mask = 1;
@@ -228,19 +304,89 @@ void draw_layer(id view, id layer) {
     send(context, "setView:", ret(view));
     send(context, "makeCurrentContext");
 
+    if (responds(view, "ensureValidSize")) {
+        send(view, "ensureValidSize");
+    }
+    if (responds(view, "updateContents")) {
+        send(view, "updateContents");
+    }
+
     cv_time_stamp ts = frame_timestamp(frame_number++);
-    const double layer_time = now_seconds();
     const std::uint64_t args[3] = {ret(context), ret(o->gl_format), ret(&ts)};
-    if (!send_layer_time(layer, "canDrawInOpenGLContext:pixelFormat:forLayerTime:displayTime:", layer_time, args, 3))
+    uint64_t can_draw = send_layer_time(layer, "canDrawInOpenGLContext:pixelFormat:forLayerTime:displayTime:", layer_time, args, 3);
+    if (trace()) std::fprintf(stderr, "AppKit: draw_layer: canDraw=%llu\n", (unsigned long long)can_draw);
+    if (!can_draw)
         return;
+    const double updated_at = profile ? now_seconds() : 0;
     send_layer_time(layer, "drawInOpenGLContext:pixelFormat:forLayerTime:displayTime:", layer_time, args, 3);
+    const double drawn_at = profile ? now_seconds() : 0;
+    if (trace()) std::fprintf(stderr, "AppKit: draw_layer: drawInOpenGLContext finished, flushing buffer\n");
+    static int probes = 0;
+    if (trace() && probes < 4) {
+        ++probes;
+        /* What state did the guest leave the context in? If it drew into an
+         * FBO of its own, the default framebuffer we present stays black. */
+        using intp_fn = void (*)(unsigned, int *);
+        auto get_iv = reinterpret_cast<intp_fn>(dlsym(RTLD_DEFAULT, "glGetIntegerv"));
+        auto get_err = reinterpret_cast<unsigned (*)()>(dlsym(RTLD_DEFAULT, "glGetError"));
+        using wide_fn = unsigned (*)(void *, void *, int, int *);
+        auto query_surface = reinterpret_cast<wide_fn>(dlsym(RTLD_DEFAULT, "eglQuerySurface"));
+        if (get_iv && get_err && query_surface) {
+            int fbo = 0, vp[4] = {}, sw = 0, sh = 0;
+            get_err();
+            get_iv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &fbo);
+            get_iv(0x0BA2 /* GL_VIEWPORT */, vp);
+            window_object *wo = as<view_object>(view)->window ? as<window_object>(as<view_object>(view)->window) : nullptr;
+            void *egl = wo && wo->platform ? platform::egl_surface_of(wo->platform) : nullptr;
+            void *edpy = platform::egl_display_of();
+            if (egl && edpy) {
+                query_surface(edpy, egl, 0x3057 /* EGL_WIDTH */, &sw);
+                query_surface(edpy, egl, 0x3056 /* EGL_HEIGHT */, &sh);
+            }
+            const unsigned err = get_err();
+            using read_fn = void (*)(int, int, int, int, unsigned, unsigned, void *);
+            auto read_px = reinterpret_cast<read_fn>(dlsym(RTLD_DEFAULT, "glReadPixels"));
+            unsigned char center[4] = {}, corner[4] = {};
+            if (read_px && sw > 0 && sh > 0) {
+                read_px(sw / 2, sh / 2, 1, 1, 0x1907 /* GL_RGB */, 0x1401 /* GL_UNSIGNED_BYTE */, center);
+                read_px(2, 2, 1, 1, 0x1907, 0x1401, corner);
+            }
+            std::fprintf(stderr, "AppKit: post-draw GL: fbo=%d viewport={%d,%d,%d,%d} surface=%dx%d center={%u,%u,%u} corner={%u,%u,%u} err=%u\n",
+                             fbo, vp[0], vp[1], vp[2], vp[3], sw, sh, center[0], center[1], center[2],
+                             corner[0], corner[1], corner[2], err);
+        }
+    }
     send(context, "flushBuffer");
+    if (profile) {
+        const double finished_at = now_seconds();
+        ++o->profile_frames;
+        o->profile_update_ms += (updated_at - layer_time) * 1000;
+        o->profile_draw_ms += (drawn_at - updated_at) * 1000;
+        o->profile_present_ms += (finished_at - drawn_at) * 1000;
+        o->profile_max_ms = std::max(o->profile_max_ms, (finished_at - layer_time) * 1000);
+        if (!o->profile_report_time) o->profile_report_time = layer_time;
+        if (finished_at - o->profile_report_time >= 3) {
+            std::fprintf(stderr, "AppKit frame timing: layer=%p size=%gx%g frames=%u update=%.2f draw=%.2f present=%.2f ms average, max=%.2f ms\n",
+                         static_cast<void *>(layer), vf.w, vf.h, o->profile_frames,
+                         o->profile_update_ms / o->profile_frames, o->profile_draw_ms / o->profile_frames,
+                         o->profile_present_ms / o->profile_frames, o->profile_max_ms);
+            o->profile_frames = 0;
+            o->profile_update_ms = o->profile_draw_ms = o->profile_present_ms = o->profile_max_ms = 0;
+            o->profile_report_time = finished_at;
+        }
+    }
     o->needs_display = false;
 }
 
 void draw_layers(id view) {
     if (!view) return;
     view_object *o = as<view_object>(view);
+    if (trace()) {
+        std::fprintf(stderr, "AppKit: draw_layers: view=%s (frame %gx%g) layer=%s (%zu subviews)\n",
+                     mm_objc_class_name(mm_objc_object_class(view)), o->frame.w, o->frame.h,
+                     o->layer ? mm_objc_class_name(mm_objc_object_class(o->layer)) : "(none)",
+                     o->subviews.size());
+    }
     if (o->layer && is_kind(o->layer, cls("NSOpenGLLayer"))) draw_layer(view, o->layer);
     for (id sub : o->subviews) draw_layers(sub);
 }
@@ -251,13 +397,25 @@ id make_backing_layer(id view) {
                                                   : obj(send(reinterpret_cast<id>(g_layer), "layer"));
     if (!layer) return nullptr;
     retain(layer);
-    if (responds(layer, "setView:")) send(layer, "setView:", ret(view));
+    layer_object *lo = l(layer);
+    lo->view = view;
     const rect &f = as<view_object>(view)->frame;
+    lo->bounds = {0, 0, f.w, f.h};
+    lo->frame = {0, 0, f.w, f.h};
+    lo->contents_placement = as<view_object>(view)->contents_placement;
+    if (responds(layer, "setView:")) send(layer, "setView:", ret(view));
     if (mm_cpu_context *ctx = api()->current_context()) {
         const double values[4] = {0, 0, f.w, f.h};
         for (int i = 0; i < 4; i++) std::memcpy(&ctx->v[i][0], &values[i], 8);
     }
     send(layer, "setBounds:");
+    if (mm_cpu_context *ctx = api()->current_context()) {
+        const double values[4] = {0, 0, f.w, f.h};
+        for (int i = 0; i < 4; i++) std::memcpy(&ctx->v[i][0], &values[i], 8);
+    }
+    send(layer, "setNeedsDisplayInRect:");
+    if (as<view_object>(view)->window && responds(layer, "viewDidMoveToWindow"))
+        send(layer, "viewDidMoveToWindow");
     if (trace())
         std::fprintf(stderr, "AppKit: %s is layer-backed by a %s\n", mm_objc_class_name(mm_objc_object_class(view)),
                      mm_objc_class_name(mm_objc_object_class(layer)));
@@ -269,6 +427,7 @@ void register_layers() {
 
     g_layer = mm_objc_define_class("CALayer", nsobject, sizeof(layer_object), MM_FW_CLASS_REF(CALayer), MM_FW_META_REF(CALayer));
     register_lifecycle<layer_object>(g_layer);
+    mm_objc_add_class_method(g_layer, "layer", MM_IMP(layerc_layer), "@16@0:8");
     MM_METHODS(g_layer,
         {"init", MM_IMP(layer_init), "@16@0:8"},
         {"bounds", MM_IMP(layer_bounds), "{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8"},
@@ -281,6 +440,8 @@ void register_layers() {
         {"setAnchorPoint:", MM_IMP(layer_setAnchorPoint), "v32@0:8{CGPoint=dd}16"},
         {"contentsScale", MM_IMP(layer_contentsScale), "d16@0:8"},
         {"setContentsScale:", MM_IMP(layer_setContentsScale), "v24@0:8d16"},
+        {"contentsGravity", MM_IMP(layer_contentsGravity), "@16@0:8"},
+        {"setContentsGravity:", MM_IMP(layer_setContentsGravity), "v24@0:8@16"},
         {"setNeedsDisplay", MM_IMP(layer_setNeedsDisplay), "v16@0:8"},
         {"setNeedsDisplayInRect:", MM_IMP(layer_setNeedsDisplayInRect), "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16"},
         {"needsDisplay", MM_IMP(layer_needsDisplay), "B16@0:8"},
@@ -301,11 +462,12 @@ void register_layers() {
     /* Appearance and animation settings a layer accepts and this one has
      * nothing to do with; answering them keeps the program's setup code on
      * its normal path. */
-    for (const char *sel : {"setBackgroundColor:", "setContentsGravity:", "setContentsFormat:", "setActions:",
+    for (const char *sel : {"setBackgroundColor:", "setContentsFormat:", "setActions:",
                             "setMasksToBounds:", "setAutoresizingMask:", "setDrawsAsynchronously:", "setNeedsLayout",
                             "layoutIfNeeded", "setAllowsNextDrawableTimeout:", "setOpacity:", "setZPosition:",
                             "setEdgeAntialiasingMask:", "setGeometryFlipped:", "removeAllAnimations", "setMagnificationFilter:",
-                            "setMinificationFilter:", "setShouldRasterize:", "setRasterizationScale:"})
+                            "setMinificationFilter:", "setShouldRasterize:", "setRasterizationScale:",
+                            "setNeedsDisplayOnBoundsChange:", "needsDisplayOnBoundsChange"})
         mm_objc_add_method(g_layer, sel, MM_IMP(layer_noop), "v24@0:8@16");
 
     Class gl_layer = mm_objc_define_class("NSOpenGLLayer", g_layer, sizeof(layer_object),
@@ -331,6 +493,77 @@ void register_layers() {
     for (const char *sel : {"begin", "commit", "flush", "setDisableActions:", "setAnimationDuration:",
                             "setValue:forKey:", "setCompletionBlock:"})
         mm_objc_add_class_method(transaction, sel, MM_IMP(layer_noop), "v24@0:8@16");
+
+    Class metal_layer = mm_objc_define_class("CAMetalLayer", g_layer, sizeof(layer_object),
+                                             MM_FW_CLASS_REF(CAMetalLayer), MM_FW_META_REF(CAMetalLayer));
+    register_lifecycle<layer_object>(metal_layer);
+    for (const char *sel : {"device", "setDevice:", "pixelFormat", "setPixelFormat:",
+                            "framebufferOnly", "setFramebufferOnly:", "drawableSize", "setDrawableSize:",
+                            "nextDrawable", "presentsWithTransaction", "setPresentsWithTransaction:"})
+        mm_objc_add_method(metal_layer, sel, MM_IMP(layer_noop), "v24@0:8@16");
+#ifdef MM_APPKIT_MEVK
+    machoman_mevk_register_layer();
+#endif
 }
 
 } // namespace ak
+
+// Native bridge called after the Vulkan fence signals. Keep platform details
+// in AppKit; MEVK only supplies a complete BGRA frame.
+static int present_metal_layer(mm_id layer, const void *pixels,
+        std::uint32_t width, std::uint32_t height, std::uint64_t stride, const void *gpu_texture) {
+    using namespace ak;
+    if (!layer || (!pixels && !gpu_texture) || !width || !height || stride < std::uint64_t{width} * 4 ||
+        !is_kind(layer, cls("CAMetalLayer"))) return 0;
+    auto *lo = as<layer_object>(layer);
+    rect frame = lo->frame;
+    id ancestor = layer;
+    for (unsigned depth = 0; !as<layer_object>(ancestor)->view && depth < 128; ++depth) {
+        id parent = as<layer_object>(ancestor)->superlayer;
+        if (!parent) break;
+        frame.x += as<layer_object>(parent)->frame.x - as<layer_object>(parent)->bounds.x;
+        frame.y += as<layer_object>(parent)->frame.y - as<layer_object>(parent)->bounds.y;
+        ancestor = parent;
+    }
+    id view = as<layer_object>(ancestor)->view;
+    if (lo->hidden) { platform::release_metal(lo); return 1; }
+    if (!view) return platform::available() ? 0 : 1;
+    auto *vo = as<view_object>(view);
+    id window = vo->window;
+    if (!window) return platform::available() ? 0 : 1;
+    if (as<window_object>(window)->alpha == 0) { platform::release_metal(lo); return 1; }
+    for (unsigned depth = 0; view && depth < 128; ++depth) {
+        auto *v = as<view_object>(view);
+        if (v->hidden) { platform::release_metal(lo); return 1; }
+        frame.x += v->frame.x - v->bounds.x;
+        frame.y += v->frame.y - v->bounds.y;
+        view = v->superview;
+    }
+    if (!std::isfinite(frame.x) || !std::isfinite(frame.y) || !std::isfinite(frame.w) || !std::isfinite(frame.h)) return 0;
+    static std::atomic<unsigned> placement_traces{0};
+    if (trace() && placement_traces.fetch_add(1, std::memory_order_relaxed) < 24)
+        std::fprintf(stderr, "AppKit Metal: layer=%p pixels=%ux%u frame={%g,%g,%g,%g} window=%gx%g scale=%g gravity=%s\n",
+            static_cast<void *>(layer), width, height, frame.x, frame.y, frame.w, frame.h,
+            as<window_object>(window)->frame.w, as<window_object>(window)->frame.h,
+            lo->contents_scale, gravity_names[lo->contents_placement]);
+    ensure_platform_window(window);
+#ifdef MM_APPKIT_MEVK
+    if (gpu_texture) return platform::present_metal_texture(as<window_object>(window)->platform, lo, frame,
+        *static_cast<const std::shared_ptr<mevk::Texture> *>(gpu_texture), lo->contents_scale, lo->contents_placement) ? 1 : -1;
+#endif
+    return platform::present_metal(as<window_object>(window)->platform, lo, frame, pixels, width, height, stride,
+        lo->contents_scale, lo->contents_placement) ? 1 : 0;
+}
+extern "C" MM_FW_EXPORT int machoman_appkit_present_metal(mm_id layer, const void *pixels,
+        std::uint32_t width, std::uint32_t height, std::uint64_t stride) {
+    return present_metal_layer(layer, pixels, width, height, stride, nullptr);
+}
+extern "C" MM_FW_EXPORT double machoman_appkit_display_refresh_hz() { return ak::platform::screen_refresh(); }
+#ifdef MM_APPKIT_MEVK
+extern "C" MM_FW_EXPORT int machoman_appkit_present_metal_texture(mm_id layer, const void *texture) {
+    if (!texture) return 0;
+    const auto &t = *static_cast<const std::shared_ptr<mevk::Texture> *>(texture);
+    if (!t) return 0;
+    return present_metal_layer(layer, nullptr, t->width(), t->height(), std::uint64_t{t->width()} * 4, texture);
+}
+#endif

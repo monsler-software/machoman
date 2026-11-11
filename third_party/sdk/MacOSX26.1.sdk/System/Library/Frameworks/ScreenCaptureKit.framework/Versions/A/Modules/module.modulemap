@@ -1,6 +1,0 @@
-framework module ScreenCaptureKit {
-  umbrella header "ScreenCaptureKit.h"
-
-  export *
-  module * { export * }
-}

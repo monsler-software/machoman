@@ -112,7 +112,7 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
     if (v->hidden)
         return true;
     const auto method = cocoa_method(mm_objc_object_class(view), mm_objc_sel("drawRect:"));
-    if (v->layer || (api() && api()->is_guest_code(reinterpret_cast<std::uintptr_t>(method))))
+    if (v->layer)
         return false;
     clip = intersect(clip, frame);
     if (clip.w <= 0 || clip.h <= 0)
@@ -160,14 +160,17 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
         if (is_kind(view, cls("NSImageView")))
             i.type = evilcocoa::kind::image;
         else if (is_kind(view, cls("NSButton"))) {
-            i.type = c->button_type == 3   ? evilcocoa::kind::checkbox
+            i.type = c->menu_row ? evilcocoa::kind::menu_item
+                     : c->button_type == 3   ? evilcocoa::kind::checkbox
                      : c->button_type == 4 ? evilcocoa::kind::radio
                                            : evilcocoa::kind::button;
             i.help_button = c->bezel_style == 9;
             i.default_button = c->key_equivalent && to_utf8(c->key_equivalent) == "\r";
-        } else if (is_kind(view, cls("NSPopUpButton")))
+        } else if (is_kind(view, cls("NSPopUpButton"))) {
             i.type = evilcocoa::kind::popup;
-        else if (is_kind(view, cls("NSComboBox")))
+            i.text = to_utf8(obj(send(view, "titleOfSelectedItem")));
+            i.bordered = true;
+        } else if (is_kind(view, cls("NSComboBox")))
             i.type = evilcocoa::kind::combo_box;
         else if (is_kind(view, cls("NSSlider")))
             i.type = evilcocoa::kind::slider;
@@ -206,6 +209,14 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
     }
     if (supported)
         out.push_back(i);
+    if (api() && api()->is_guest_code(reinterpret_cast<std::uintptr_t>(method)) && v->drawing) {
+        evilcocoa::item drawing;
+        drawing.type = evilcocoa::kind::image;
+        drawing.frame = frame; drawing.clip = clip;
+        drawing.scaling = evilcocoa::image_scaling::stretch;
+        drawing.pixels = v->drawing;
+        out.push_back(std::move(drawing));
+    }
     if (is_kind(view, cls("NSTableView"))) {
         auto *table = as<table_object>(view);
         const double h = std::max(1., table->row_height);

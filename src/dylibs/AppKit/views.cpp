@@ -116,8 +116,11 @@ std::uint64_t view_setFrame(id self, SEL, double x, double y, double width, doub
             const auto children = o->subviews;
             for (id child : children) {
                 auto *cv = v(child); auto f = cv->frame;
+                if (!cv->translates_mask) continue;
                 layout::resize_axis(f.x, f.w, previous.w, width-previous.w, cv->autoresizing_mask & 7);
                 layout::resize_axis(f.y, f.h, previous.h, height-previous.h, (cv->autoresizing_mask >> 3) & 7);
+                auto aligned = layout::align_edges({f.x, f.y, f.w, f.h});
+                f = {aligned.x, aligned.y, aligned.w, aligned.h};
                 view_setFrame(child, nullptr, f.x, f.y, f.w, f.h);
             }
         }
@@ -274,7 +277,9 @@ std::uint64_t view_display(id self, SEL) {
         std::memcpy(&ctx->v[2][0], &b.w, 8);
         std::memcpy(&ctx->v[3][0], &b.h, 8);
     }
+    id previous_drawing = begin_bitmap_drawing(self);
     send(self, "drawRect:");
+    end_bitmap_drawing(previous_drawing);
     for (id sub : o->subviews) send(sub, "display");
     if (o->layer && is_kind(o->layer, cls("NSOpenGLLayer"))) draw_layers(self);
     return 0;
@@ -497,6 +502,9 @@ std::uint64_t control_setTitle(id self, SEL, id title) {
     view_setNeedsDisplay(self, nullptr, 1);
     return 0;
 }
+std::uint64_t control_setAttributedTitle(id self, SEL, id title) {
+    return control_setTitle(self,nullptr,title?obj(send(title,"string")):nullptr);
+}
 std::uint64_t control_target(id self, SEL) { return ret(control_of(self)->target); }
 std::uint64_t control_setTarget(id self, SEL, id target) { control_of(self)->target = target; return 0; }
 std::uint64_t control_action(id self, SEL) { return reinterpret_cast<std::uintptr_t>(control_of(self)->action); }
@@ -700,7 +708,9 @@ void ensure_platform_window(id self) {
     if (o->platform || o->alpha == 0 || !platform::available()) return;
     if (o->parent_window) ensure_platform_window(o->parent_window);
     const bool decorated = (o->style & 1) != 0; /* NSWindowStyleMaskTitled */
-    o->platform = platform::create_window(self, o->frame, o->title, decorated, (o->style & (1u << 3)) != 0);
+    o->platform = platform::create_window(self, o->frame, o->title, decorated, (o->style & (1u << 3)) != 0,
+                                         o->popup && o->parent_window ? w(o->parent_window)->platform : nullptr,
+                                         o->popup_anchor, o->popup_serial);
     if (o->platform) {
         if (o->parent_window) platform::set_parent(o->platform, as<window_object>(o->parent_window)->platform);
         platform::set_size_limits(o->platform, o->minimum_size, o->maximum_size);
@@ -1197,6 +1207,7 @@ void register_views() {
         {"setTitle:", MM_IMP(control_setTitle), "v24@0:8@16"},
         {"stringValue", MM_IMP(control_title), "@16@0:8"},
         {"setStringValue:", MM_IMP(control_setTitle), "v24@0:8@16"},
+        {"setAttributedStringValue:", MM_IMP(control_setAttributedTitle), "v24@0:8@16"},
         {"target", MM_IMP(control_target), "@16@0:8"},
         {"setTarget:", MM_IMP(control_setTarget), "v24@0:8@16"},
         {"action", MM_IMP(control_action), ":16@0:8"},

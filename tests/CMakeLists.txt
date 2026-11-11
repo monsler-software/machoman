@@ -33,6 +33,8 @@ if(TARGET machoman_audio_engine)
     set_tests_properties(audio_engine PROPERTIES TIMEOUT 10)
 endif()
 
+
+
 add_executable(test_translation_cache test_translation_cache.cpp)
 add_executable(test_native_menu test_native_menu.cpp ../src/dylibs/AppKit/native_menu.cpp)
 target_link_libraries(test_native_menu PRIVATE machoman_core)
@@ -204,6 +206,61 @@ if(MM_TEST_MACOS_SDK AND TARGET AppKit)
         DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_scanning_smoke.m VERBATIM)
     add_custom_target(guest_scanning_smoke_binary ALL DEPENDS "${MM_SCANNING_BINARY}")
     add_test(NAME guest_scanning_smoke COMMAND ${CMAKE_COMMAND} -E env MACHOMAN_APPKIT_HEADLESS=1
+        "MACHOMAN_TEST_PALETTE=${CMAKE_CURRENT_SOURCE_DIR}/fixtures/rgb-palette.clr"
         MACHOMAN_STRICT_SELECTORS=1 $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" scanning-smoke)
     set_tests_properties(guest_scanning_smoke PROPERTIES TIMEOUT 20)
+    if(TARGET evilcocoa)
+        add_library(bitmap_drawing_probe SHARED bitmap_drawing_probe.cpp)
+        target_include_directories(bitmap_drawing_probe PRIVATE "${CMAKE_SOURCE_DIR}/include" "${CMAKE_SOURCE_DIR}/modules/evilcocoa/include")
+        target_compile_definitions(bitmap_drawing_probe PRIVATE MM_APPKIT_EVILCOCOA=1)
+        set_target_properties(bitmap_drawing_probe PROPERTIES PREFIX "lib" OUTPUT_NAME "bitmap_drawing_probe.dylib" SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY "${MM_SMOKE_VENV}/usr/lib")
+        set(MM_BITMAP_BINARY "${MM_SMOKE_VENV}/bin/bitmap-smoke")
+        add_custom_command(OUTPUT "${MM_BITMAP_BINARY}"
+            COMMAND ${MM_TEST_CLANG} --target=arm64-apple-macos12 -isysroot "${MM_TEST_MACOS_SDK}"
+                -fuse-ld=lld -framework AppKit -L "${CMAKE_CURRENT_SOURCE_DIR}" -lbitmap_drawing_probe
+                -Wl,-rpath,@executable_path/../usr/lib "${CMAKE_CURRENT_SOURCE_DIR}/guest_bitmap_drawing.m" -o "${MM_BITMAP_BINARY}"
+            DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_bitmap_drawing.m libbitmap_drawing_probe.tbd VERBATIM)
+        add_custom_target(guest_bitmap_binary ALL DEPENDS "${MM_BITMAP_BINARY}")
+        add_dependencies(guest_bitmap_binary bitmap_drawing_probe)
+        add_test(NAME guest_bitmap_drawing COMMAND ${CMAKE_COMMAND} -E env MACHOMAN_APPKIT_HEADLESS=1 MACHOMAN_STRICT_SELECTORS=1 $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" bitmap-smoke)
+        set_tests_properties(guest_bitmap_drawing PROPERTIES TIMEOUT 20)
+    endif()
+endif()
+
+if(MM_TEST_MACOS_SDK AND TARGET Foundation)
+    set(MM_RPATH_ROOT "${MM_SMOKE_VENV}/rpath-fixture")
+    file(MAKE_DIRECTORY "${MM_RPATH_ROOT}/a" "${MM_RPATH_ROOT}/b" "${MM_RPATH_ROOT}/ancestor")
+    add_library(rpath_late_host SHARED rpath_late_host.cpp)
+    set_target_properties(rpath_late_host PROPERTIES PREFIX "lib" OUTPUT_NAME "local.dylib" SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY "${MM_RPATH_ROOT}")
+    set(MM_RPATH_CLANG ${MM_TEST_CLANG} --target=arm64-apple-macos12 -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld)
+    add_custom_command(OUTPUT "${MM_RPATH_ROOT}/rpath-loader" "${MM_RPATH_ROOT}/rpath-executable"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=local_value -DVALUE=11
+            -Wl,-install_name,@rpath/liblocal.dylib "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_leaf.c" -o "${MM_RPATH_ROOT}/a/liblocal.dylib"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=local_value -DVALUE=22
+            -Wl,-install_name,@rpath/liblocal.dylib "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_leaf.c" -o "${MM_RPATH_ROOT}/b/liblocal.dylib"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=inherited_value -DVALUE=33
+            -Wl,-install_name,@rpath/libinherited.dylib "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_leaf.c" -o "${MM_RPATH_ROOT}/ancestor/libinherited.dylib"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=exact_value -DVALUE=7
+            -Wl,-install_name,@rpath/libexact.dylib "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_leaf.c" -o "${MM_RPATH_ROOT}/libexact.dylib"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=parent_a -DINHERITED=1
+            -L "${MM_RPATH_ROOT}/a" -llocal -L "${MM_RPATH_ROOT}/ancestor" -linherited
+            -Wl,-install_name,@rpath/libparent_a.dylib -Wl,-rpath,@loader_path
+            "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_parent.c" -o "${MM_RPATH_ROOT}/a/libparent_a.dylib"
+        COMMAND ${MM_RPATH_CLANG} -dynamiclib -DFUNCTION=parent_b
+            -L "${MM_RPATH_ROOT}/b" -llocal -Wl,-install_name,@rpath/libparent_b.dylib -Wl,-rpath,@loader_path
+            "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_parent.c" -o "${MM_RPATH_ROOT}/b/libparent_b.dylib"
+        COMMAND ${MM_RPATH_CLANG} -L "${MM_RPATH_ROOT}/a" -lparent_a -L "${MM_RPATH_ROOT}/b" -lparent_b -L "${MM_RPATH_ROOT}" -lexact
+            -Wl,-rpath,@loader_path -Wl,-rpath,@loader_path/a -Wl,-rpath,@loader_path/b -Wl,-rpath,@loader_path/ancestor
+            "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_main.c" -o "${MM_RPATH_ROOT}/rpath-loader"
+        COMMAND ${MM_RPATH_CLANG} -L "${MM_RPATH_ROOT}/a" -lparent_a -L "${MM_RPATH_ROOT}/b" -lparent_b -L "${MM_RPATH_ROOT}" -lexact
+            -Wl,-rpath,@executable_path -Wl,-rpath,@executable_path/a -Wl,-rpath,@executable_path/b -Wl,-rpath,@executable_path/ancestor
+            "${CMAKE_CURRENT_SOURCE_DIR}/guest_rpath_main.c" -o "${MM_RPATH_ROOT}/rpath-executable"
+        DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_rpath_leaf.c guest_rpath_parent.c guest_rpath_main.c
+        BYPRODUCTS "${MM_RPATH_ROOT}/a/liblocal.dylib" "${MM_RPATH_ROOT}/b/liblocal.dylib" "${MM_RPATH_ROOT}/ancestor/libinherited.dylib" "${MM_RPATH_ROOT}/libexact.dylib" "${MM_RPATH_ROOT}/a/libparent_a.dylib" "${MM_RPATH_ROOT}/b/libparent_b.dylib" VERBATIM)
+    add_custom_target(guest_rpath_binaries ALL DEPENDS "${MM_RPATH_ROOT}/rpath-loader" "${MM_RPATH_ROOT}/rpath-executable")
+    add_dependencies(guest_rpath_binaries rpath_late_host)
+    foreach(token IN ITEMS loader executable)
+        add_test(NAME guest_rpath_${token} COMMAND $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" "${MM_RPATH_ROOT}/rpath-${token}")
+        set_tests_properties(guest_rpath_${token} PROPERTIES TIMEOUT 20)
+    endforeach()
 endif()

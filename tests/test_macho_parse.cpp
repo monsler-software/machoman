@@ -113,6 +113,25 @@ int main(int argc, char **argv) {
         check(mm_macho_parse(bad, tmp) == mm_macho_status::bad_load_command, "oversized nsects rejected");
     }
 
+    /* LC_RPATH strings are bounded by the command, never its header. */
+    {
+        mm_mach_header_64 header{MM_MH_MAGIC_64,MM_CPU_TYPE_ARM64,0,MM_MH_DYLIB,1,32,0,0};
+        std::vector<std::uint8_t> bytes(sizeof(header)+32);
+        std::memcpy(bytes.data(),&header,sizeof header);
+        std::uint32_t command[]={MM_LC_RPATH,32,12};
+        std::memcpy(bytes.data()+sizeof header,command,sizeof command);
+        std::memcpy(bytes.data()+sizeof header+12,"@loader_path",13);
+        mm_macho_image tmp;
+        check(mm_macho_parse(bytes,tmp)==mm_macho_status::ok&&tmp.rpaths.size()==1&&tmp.rpaths[0]=="@loader_path","LC_RPATH exact token parsed");
+        command[2]=8;std::memcpy(bytes.data()+sizeof header,command,sizeof command);
+        check(mm_macho_parse(bytes,tmp)==mm_macho_status::bad_load_command,"LC_RPATH offset into header rejected");
+        command[2]=32;std::memcpy(bytes.data()+sizeof header,command,sizeof command);
+        check(mm_macho_parse(bytes,tmp)==mm_macho_status::bad_load_command,"LC_RPATH offset outside command rejected");
+        command[2]=12;std::memcpy(bytes.data()+sizeof header,command,sizeof command);
+        std::memset(bytes.data()+sizeof header+12,'x',20);
+        check(mm_macho_parse(bytes,tmp)==mm_macho_status::bad_load_command,"LC_RPATH missing terminator rejected");
+    }
+
     if (failures)
         return 1;
     std::printf("PASS: %s is arm64 Mach-O, %zu segments, %zu dylibs\n", argv[1], img.segments.size(),

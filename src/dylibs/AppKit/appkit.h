@@ -62,13 +62,15 @@ struct platform_event {
     std::string characters, characters_ignoring_modifiers;
     size new_size;
     std::uintptr_t menu_token = 0;
+    std::uint32_t input_serial = 0;
 };
 
 /* The display connection. Everything is a no-op when there is none, so an
  * app can run headless (MACHOMAN_APPKIT_HEADLESS=1 or no compositor). */
 struct platform {
     static bool available();
-    static platform_window *create_window(id ns_window, rect frame, const std::string &title, bool decorated, bool resizable);
+    static platform_window *create_window(id ns_window, rect frame, const std::string &title, bool decorated, bool resizable,
+                                          platform_window *popup_parent = nullptr, rect popup_anchor = {}, std::uint32_t popup_serial = 0);
     static void destroy_window(platform_window *w);
     static void show_window(platform_window *w, bool show);
     static void set_title(platform_window *w, const std::string &title);
@@ -124,6 +126,7 @@ struct event_object {
     std::uint64_t type = 0, modifiers = 0, click_count = 0, button = 0, keycode = 0;
     double timestamp = 0, dx = 0, dy = 0;
     bool repeat = false;
+    std::uint32_t input_serial = 0;
     point where;
     id window = nullptr;
     std::string characters, characters_ignoring_modifiers;
@@ -152,6 +155,9 @@ struct view_object {
     std::int64_t next_tooltip_tag=1;
     bool needs_display = true, hidden = false, wants_layer = false;
     bool posts_frame_notifications = true, posts_bounds_notifications = false;
+#ifdef MM_APPKIT_EVILCOCOA
+    std::shared_ptr<evilcocoa::bitmap> drawing;
+#endif
     ~view_object();
 };
 
@@ -166,7 +172,9 @@ struct control_object {
     bool enabled = true, highlighted = false, bordered = true, bezeled = true;
     bool editable = false, selectable = false, draws_background = false, bold = false, wraps = false;
     bool indeterminate = false, animating = false, vertical = false;
+    bool menu_row = false;
     std::vector<id> choices;
+    id choice_menu = nullptr, choice_selection = nullptr;
     std::int64_t selected = -1;
     ~control_object();
 };
@@ -205,6 +213,9 @@ struct window_object {
     platform_window *platform = nullptr;
     bool visible = false, key = false, needs_display = true, accepts_mouse_moved = false;
     bool pending_configure_notification = false;
+    bool popup = false;
+    rect popup_anchor; /* top-left coordinates in the parent's content view */
+    std::uint32_t popup_serial = 0;
     ~window_object();
 };
 
@@ -249,6 +260,8 @@ struct view_controller_object { mm_objc_object base; id next = nullptr; id view 
 
 struct image_object {
     mm_objc_object base; std::string name; size size;
+    std::vector<id> representations;
+    ~image_object() { for (id representation : representations) release(representation); }
 #ifdef MM_APPKIT_EVILCOCOA
     std::shared_ptr<const evilcocoa::bitmap> pixels;
     bool decoded = false;
@@ -257,6 +270,10 @@ struct image_object {
 #ifdef MM_APPKIT_EVILCOCOA
 void decode_cocoa_image(id image);
 #endif
+void register_bitmap_drawing();
+id begin_bitmap_drawing(id view);
+void end_bitmap_drawing(id previous);
+void set_bitmap_fill_color(const color_object &color);
 
 /* NSGraphicsContext's current context, per process (AppKit's is per thread,
  * but nothing here draws from more than one thread yet). */

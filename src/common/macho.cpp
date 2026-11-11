@@ -129,7 +129,7 @@ mm_macho_status parse_thin(std::span<const std::uint8_t> data, mm_macho_image &o
             if (lc->cmdsize < 12)
                 return mm_macho_status::bad_load_command;
             const std::uint32_t str_off = read_le<std::uint32_t>(p + 8);
-            if (str_off >= lc->cmdsize)
+            if (str_off < 12 || str_off >= lc->cmdsize)
                 return mm_macho_status::bad_load_command;
             const char *s = reinterpret_cast<const char *>(p + str_off);
             const void *nul = std::memchr(s, '\0', lc->cmdsize - str_off);

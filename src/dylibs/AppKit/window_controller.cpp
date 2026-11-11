@@ -2,8 +2,72 @@
 #include <cstdio>
 
 MM_FW_CLASS(NSWindowController);
+MM_FW_CLASS(NSDocumentController);
 namespace ak {
 namespace {
+struct document_controller_object {
+    mm_objc_object base;
+    std::vector<id> recent;
+    std::uint64_t maximum = 10;
+    ~document_controller_object() { for (id url : recent) release(url); }
+};
+id history_defaults() { return obj(send(reinterpret_cast<id>(cls("NSUserDefaults")), "standardUserDefaults")); }
+id history_key() { return string("NSRecentDocumentURLs"); }
+std::uint64_t document_controller_init(id self, SEL) {
+    auto *c = as<document_controller_object>(self);
+    for (id url : c->recent) release(url);
+    c->recent.clear();
+    id saved = obj(send(history_defaults(), "arrayForKey:", ret(history_key())));
+    for (std::uint64_t i = 0; i < send(saved, "count") && c->recent.size() < c->maximum; ++i) {
+        id text = obj(send(saved, "objectAtIndex:", i));
+        if (!is_kind(text, cls("NSString"))) continue;
+        if (id url = obj(send(reinterpret_cast<id>(cls("NSURL")), "URLWithString:", ret(text))))
+            c->recent.push_back(retain(url));
+    }
+    return ret(self);
+}
+void save_history(document_controller_object *c) {
+    id saved = obj(send(reinterpret_cast<id>(cls("NSMutableArray")), "array"));
+    for (id url : c->recent) send(saved, "addObject:", send(url, "absoluteString"));
+    id defaults = history_defaults();
+    send(defaults, "setObject:forKey:", ret(saved), ret(history_key()));
+    send(defaults, "synchronize");
+}
+std::uint64_t recent_urls(id self, SEL) {
+    auto &recent = as<document_controller_object>(self)->recent;
+    return send(reinterpret_cast<id>(cls("NSArray")), "arrayWithObjects:count:", ret(recent.data()), recent.size());
+}
+std::uint64_t note_recent_url(id self, SEL, id url) {
+    if (!url || !is_kind(url, cls("NSURL"))) return 0;
+    auto *c = as<document_controller_object>(self);
+    const auto identity = to_utf8(obj(send(url, "absoluteString")));
+    if (identity.empty()) return 0;
+    id owned = retain(url);
+    std::erase_if(c->recent, [&](id old) {
+        if (to_utf8(obj(send(old, "absoluteString"))) != identity) return false;
+        release(old); return true;
+    });
+    c->recent.insert(c->recent.begin(), owned);
+    while (c->recent.size() > c->maximum) { release(c->recent.back()); c->recent.pop_back(); }
+    save_history(c);
+    return 0;
+}
+std::uint64_t clear_recent(id self, SEL, id) {
+    auto *c = as<document_controller_object>(self);
+    for (id url : c->recent) release(url);
+    c->recent.clear(); save_history(c); return 0;
+}
+std::uint64_t maximum_recent(id self, SEL) { return as<document_controller_object>(self)->maximum; }
+std::uint64_t set_maximum_recent(id self, SEL, std::uint64_t maximum) {
+    auto *c = as<document_controller_object>(self);
+    c->maximum = std::min(maximum, std::uint64_t(100));
+    while (c->recent.size() > c->maximum) { release(c->recent.back()); c->recent.pop_back(); }
+    save_history(c); return 0;
+}
+std::uint64_t shared_document_controller(id klass, SEL) {
+    static id controller = obj(send(klass, "new"));
+    return ret(controller);
+}
 struct controller_object {
     mm_objc_object base;
     id next = nullptr, window = nullptr, document = nullptr;
@@ -49,6 +113,16 @@ std::uint64_t set_document(id self, SEL, id document) {
 std::uint64_t noop(id, SEL) { return 0; }
 }
 void register_window_controller() {
+    Class documents = mm_objc_define_class("NSDocumentController", cls("NSObject"), sizeof(document_controller_object),
+                                           MM_FW_CLASS_REF(NSDocumentController), MM_FW_META_REF(NSDocumentController));
+    register_lifecycle<document_controller_object>(documents);
+    MM_CLASS_METHODS(documents, {"sharedDocumentController", MM_IMP(shared_document_controller), "@16@0:8"});
+    MM_METHODS(documents, {"init", MM_IMP(document_controller_init), "@16@0:8"},
+        {"recentDocumentURLs", MM_IMP(recent_urls), "@16@0:8"},
+        {"noteNewRecentDocumentURL:", MM_IMP(note_recent_url), "v24@0:8@16"},
+        {"clearRecentDocuments:", MM_IMP(clear_recent), "v24@0:8@16"},
+        {"maximumRecentDocumentCount", MM_IMP(maximum_recent), "Q16@0:8"},
+        {"setMaximumRecentDocumentCount:", MM_IMP(set_maximum_recent), "v24@0:8Q16"});
     Class c = mm_objc_define_class("NSWindowController", cls("NSResponder"), sizeof(controller_object),
         MM_FW_CLASS_REF(NSWindowController), MM_FW_META_REF(NSWindowController));
     register_lifecycle<controller_object>(c);

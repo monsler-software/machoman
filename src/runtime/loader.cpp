@@ -488,6 +488,8 @@ struct guest_image {
     std::string install_name;
     std::filesystem::path path;
     std::vector<std::uint8_t> file;
+    // Expanded in the declaring image's context, nearest loader first.
+    std::vector<std::filesystem::path> runpaths;
     mm_macho_image img;               /* aliases `file` */
     std::uint64_t slide = 0;
     image_mapping mapping;
@@ -595,16 +597,30 @@ public:
     /* Loads (or finds) the dylib with `install_name` as referenced by
      * `referrer`. Null if nothing provides it. */
     dependency load_dependency(std::string_view install_name, const guest_image &referrer) {
-        for (auto &g : images_)
-            if (g->install_name == install_name) return {g.get(), nullptr};
-        for (auto &h : host_libs_)
-            if (h->install_name == install_name) return {nullptr, h.get()};
+        // Token paths can name different libraries from different referrers.
+        // Resolve them before reusing an image by its filesystem identity.
+        if (!install_name.starts_with('@')) {
+            for (auto &g : images_)
+                if (g->install_name == install_name) return {g.get(), nullptr};
+            for (auto &h : host_libs_)
+                if (h->install_name == install_name) return {nullptr, h.get()};
+        }
 
         const auto [host_path, guest_path] = locate(install_name, referrer);
+        const auto &selected = host_path.empty() ? guest_path : host_path;
+        if (!selected.empty()) {
+            std::error_code ec;
+            const auto identity = std::filesystem::weakly_canonical(selected, ec);
+            for (auto &g : images_)
+                if (g->path == identity) return {g.get(), nullptr};
+            for (auto &h : host_libs_)
+                if (h->path == identity) return {nullptr, h.get()};
+        }
         if (!host_path.empty()) {
             auto lib = std::make_unique<host_lib>();
             lib->install_name = std::string(install_name);
-            lib->path = host_path;
+            std::error_code ec;
+            lib->path = std::filesystem::weakly_canonical(host_path, ec);
 #if !defined(_WIN32)
             lib->handle = dlopen(host_path.c_str(), RTLD_NOW | RTLD_LOCAL);
             if (!lib->handle)
@@ -616,7 +632,7 @@ public:
             return {nullptr, host_libs_.back().get()};
         }
         if (!guest_path.empty()) {
-            if (guest_image *g = load_dylib(install_name, guest_path))
+            if (guest_image *g = load_dylib(install_name, guest_path, referrer.runpaths))
                 return {g, nullptr};
         }
         if (dyld_trace_enabled())
@@ -705,30 +721,31 @@ public:
     }
 
 private:
-    /* Host .so and guest Mach-O candidates for an install name; the first
-     * existing one of each kind is returned (host preferred by the caller). */
+    static bool path_token(std::string_view path, std::string_view token) {
+        return path == token || (path.starts_with(token) && path.size() > token.size() && path[token.size()] == '/');
+    }
+    std::vector<std::filesystem::path> expand_path(std::string_view p, const guest_image &referrer) const {
+        namespace fs=std::filesystem;
+        auto suffix = [&](std::string_view token) { return std::string(p.size()==token.size()?std::string_view{}:p.substr(token.size()+1)); };
+        if (path_token(p,"@executable_path"))
+            return {exe_dir_/suffix("@executable_path"),fs::path(std::string(MM_VENV_DIR_BIN))/suffix("@executable_path")};
+        if (path_token(p,"@loader_path")) return {referrer.path.parent_path()/suffix("@loader_path")};
+        if (p.starts_with('@')) return {};
+        return {fs::path(std::string(p.starts_with('/')?p.substr(1):p))};
+    }
+    /* Search in candidate order; a later host shim must not override an
+     * earlier guest dylib selected by the image's runpath stack. */
     std::pair<std::filesystem::path, std::filesystem::path> locate(std::string_view install_name, const guest_image &referrer) const {
         namespace fs = std::filesystem;
         std::vector<fs::path> candidates; /* absolute, or venv-relative */
         auto strip_root = [](std::string_view p) { return p.starts_with('/') ? p.substr(1) : p; };
-        constexpr std::string_view rpath = "@rpath/", exe = "@executable_path/", loader = "@loader_path/";
-        const fs::path loader_dir = referrer.path.parent_path();
-
-        auto expand = [&](std::string_view p) -> std::vector<fs::path> {
-            if (p.starts_with(exe))
-                return {exe_dir_ / std::string(p.substr(exe.size())), fs::path(std::string(MM_VENV_DIR_BIN)) / std::string(p.substr(exe.size()))};
-            if (p.starts_with(loader))
-                return {loader_dir / std::string(p.substr(loader.size()))};
-            return {fs::path(std::string(strip_root(p)))};
-        };
+        constexpr std::string_view rpath = "@rpath/";
         if (install_name.starts_with(rpath)) {
             const std::string rest(install_name.substr(rpath.size()));
-            for (std::string_view rp : referrer.img.rpaths)
-                for (const auto &base : expand(rp))
-                    candidates.push_back(base / rest);
+            for (const auto &base : referrer.runpaths) candidates.push_back(base / rest);
             candidates.push_back(fs::path(std::string(MM_VENV_DIR_USR_LIB)) / rest); /* last resort */
         } else {
-            for (const auto &c : expand(install_name))
+            for (const auto &c : expand_path(install_name,referrer))
                 candidates.push_back(c);
         }
 
@@ -777,24 +794,29 @@ private:
             roots.push_back(self.parent_path() / "dylibs");
 #endif
         fs::path host, guest;
-        auto consider = [&](fs::path p) {
+        auto consider = [&](fs::path p) -> bool {
             p = p.lexically_normal();
             fs::path so = p;
             so += ".so";
             if (host.empty() && fs::is_regular_file(so, ec)) host = so;
             if (guest.empty() && fs::is_regular_file(p, ec)) guest = p;
+            return !host.empty() || !guest.empty();
         };
         for (const auto &c : candidates) {
-            if (c.is_absolute()) { consider(c); continue; }
+            if (c.is_absolute()) { if(consider(c))break; continue; }
             for (const auto &root : roots)
-                consider(root / c);
+                if(consider(root / c))break;
+            if(!host.empty()||!guest.empty())break;
         }
         return {host, guest};
     }
 
-    guest_image *load_dylib(std::string_view install_name, const std::filesystem::path &path) {
+    guest_image *load_dylib(std::string_view install_name, const std::filesystem::path &path,
+                           const std::vector<std::filesystem::path> &inherited_runpaths) {
         auto image = std::make_unique<guest_image>();
-        image->path = path;
+        std::error_code ec;
+        image->path = std::filesystem::weakly_canonical(path, ec);
+        image->runpaths = inherited_runpaths;
         image->install_name = std::string(install_name);
         image->file = read_whole_file(path);
         if (image->file.empty() || mm_macho_parse(image->file, image->img) != mm_macho_status::ok ||
@@ -836,6 +858,14 @@ private:
 
     /* Rebases, indexes exports and loads dependencies of a mapped image. */
     void finish_image(guest_image &g) {
+        std::vector<std::filesystem::path> paths;
+        for(auto rp:g.img.rpaths) for(auto base:expand_path(rp,g)) {
+            base=base.lexically_normal();
+            if(std::find(paths.begin(),paths.end(),base)==paths.end())paths.push_back(std::move(base));
+        }
+        for(auto &base:g.runpaths)
+            if(std::find(paths.begin(),paths.end(),base)==paths.end())paths.push_back(base);
+        g.runpaths=std::move(paths);
         for (const std::uint64_t slot : g.img.rebases()) {
             std::uint64_t v;
             std::memcpy(&v, reinterpret_cast<const void *>(slot + g.slide), 8);
@@ -1473,6 +1503,10 @@ void guest_process::report(const guest_thread &t, mm_runtime_status st) {
             std::fprintf(stderr, "run: memory fault at guest %s accessing 0x%llx; sp=0x%llx x30=0x%llx\n",
                          describe_pc(linker_, ctx.fault_va).c_str(), static_cast<unsigned long long>(ctx.fault_addr),
                          static_cast<unsigned long long>(ctx.x[31]), static_cast<unsigned long long>(ctx.x[30]));
+            if (std::getenv("MACHOMAN_TRACE_FAULT_REGISTERS")) {
+                for (int i=0;i<31;++i)std::fprintf(stderr," x%d=0x%llx",i,static_cast<unsigned long long>(ctx.x[i]));
+                std::fputc('\n',stderr);
+            }
             print_backtrace(linker_, ctx);
         }
         break;

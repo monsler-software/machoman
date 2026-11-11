@@ -102,9 +102,11 @@ struct dispatch_queue {
     }
 };
 
+extern "C" EXPORT dispatch_queue mm_dispatch_main_q __asm__("__dispatch_main_q");
+
 dispatch_queue &main_queue() {
     static auto *q = [] {
-        auto *queue = new dispatch_queue;
+        auto *queue = &mm_dispatch_main_q;
         queue->label = "com.apple.main-thread";
         queue->is_main = true;
         return queue;
@@ -155,7 +157,7 @@ extern "C" {
 
 /* dispatch_get_main_queue() is a macro over this symbol, so the guest
  * binds to the object itself rather than calling anything. */
-EXPORT dispatch_queue *mm_dispatch_main_q __asm__("__dispatch_main_q") = &main_queue();
+EXPORT dispatch_queue mm_dispatch_main_q __asm__("__dispatch_main_q");
 
 dispatch_queue *darwin_dispatch_get_main_queue() DARWIN(dispatch_get_main_queue);
 dispatch_queue *darwin_dispatch_get_main_queue() { return &main_queue(); }

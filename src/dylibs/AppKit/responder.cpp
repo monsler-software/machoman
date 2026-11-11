@@ -20,6 +20,7 @@
 MM_FW_CLASS(NSResponder);
 MM_FW_CLASS(NSEvent);
 MM_FW_CLASS(NSColor);
+MM_FW_CLASS(NSColorList);
 MM_FW_CLASS(NSColorSpace);
 MM_FW_CLASS(NSCursor);
 MM_FW_CLASS(NSAppearance);
@@ -297,6 +298,25 @@ std::uint64_t color_make(id, SEL, double r, double g, double b, double a) {
     return ret(autorelease(reinterpret_cast<id>(c)));
 }
 std::uint64_t color_white(id, SEL, double w, double a) { return color_make(nullptr, nullptr, w, w, w, a); }
+std::uint64_t color_hsb(id, SEL, double h, double s, double b, double a) {
+    h = (h - std::floor(h)) * 6; s = std::clamp(s, 0., 1.); b = std::clamp(b, 0., 1.);
+    const double p=b*(1-s), q=b*(1-s*(h-std::floor(h))), t=b*(1-s*(1-h+std::floor(h)));
+    switch(int(h)) {
+    case 0:return color_make(nullptr,nullptr,b,t,p,a);
+    case 1:return color_make(nullptr,nullptr,q,b,p,a);
+    case 2:return color_make(nullptr,nullptr,p,b,t,a);
+    case 3:return color_make(nullptr,nullptr,p,q,b,a);
+    case 4:return color_make(nullptr,nullptr,t,p,b,a);
+    default:return color_make(nullptr,nullptr,b,p,q,a);
+    }
+}
+std::uint64_t color_getHSBA(id self, SEL, double *h, double *s, double *b, double *a) {
+    const auto *c=as<color_object>(self);
+    const double hi=std::max({c->r,c->g,c->b}), lo=std::min({c->r,c->g,c->b}), d=hi-lo;
+    double hue=0;
+    if(d>0) { if(hi==c->r)hue=(c->g-c->b)/d;else if(hi==c->g)hue=2+(c->b-c->r)/d;else hue=4+(c->r-c->g)/d; hue/=6;if(hue<0)hue+=1; }
+    if(h)*h=hue;if(s)*s=hi>0?d/hi:0;if(b)*b=hi;if(a)*a=c->a;return 0;
+}
 double color_redComponent(id self, SEL) { return as<color_object>(self)->r; }
 double color_greenComponent(id self, SEL) { return as<color_object>(self)->g; }
 double color_blueComponent(id self, SEL) { return as<color_object>(self)->b; }
@@ -309,13 +329,96 @@ std::uint64_t color_getRGBA(id self, SEL, double *r, double *g, double *b, doubl
     if (a) *a = c->a;
     return 0;
 }
-std::uint64_t color_named(id cls, SEL) {
-    /* +blackColor, +windowBackgroundColor, ...: one opaque colour each is
-     * enough until something actually draws with them. */
-    return color_make(cls, nullptr, 0.5, 0.5, 0.5, 1.0);
+std::uint64_t color_named(id klass, SEL selector) {
+    struct named { const char *name; double r, g, b; };
+    static constexpr named colors[] = {
+        {"blackColor",0,0,0},{"whiteColor",1,1,1},{"grayColor",.5,.5,.5},
+        {"redColor",1,0,0},{"greenColor",0,1,0},{"blueColor",0,0,1},
+        {"cyanColor",0,1,1},{"magentaColor",1,0,1},{"yellowColor",1,1,0},
+        {"orangeColor",1,.5,0},{"purpleColor",.5,0,.5},{"brownColor",.6,.4,.2},
+        {"lightGrayColor",2./3,2./3,2./3},{"darkGrayColor",1./3,1./3,1./3},
+        {"textColor",0,0,0},{"controlTextColor",0,0,0},{"labelColor",0,0,0}
+    };
+    for (const auto &color : colors) if (!std::strcmp(selector, color.name)) return color_make(klass, nullptr, color.r, color.g, color.b, 1.);
+    return color_make(klass, nullptr, .5, .5, .5, 1.);
 }
 std::uint64_t color_clear(id cls, SEL) { return color_make(cls, nullptr, 0, 0, 0, 0); }
-std::uint64_t color_set(id, SEL) { return 0; }
+std::uint64_t color_set(id self, SEL) { set_bitmap_fill_color(*as<color_object>(self)); return 0; }
+std::uint64_t color_convert(id self, SEL, id) { return ret(self); }
+
+struct color_list_object {
+    mm_objc_object base;
+    id name = nullptr;
+    std::vector<std::pair<id, id>> entries;
+    ~color_list_object() { release(name); for (auto [key, color] : entries) { release(key); release(color); } }
+};
+std::uint64_t color_list_init(id self, SEL, id name) {
+    auto *list = as<color_list_object>(self); id next = retain(name); release(list->name); list->name = next; return ret(self);
+}
+std::uint64_t color_list_init_file(id self, SEL, id name, id path) {
+    color_list_init(self,nullptr,name);
+    id data=obj(send(reinterpret_cast<id>(cls("NSData")),"dataWithContentsOfFile:",ret(path)));
+    if(!data){release(self);return 0;}
+    const std::uint64_t args[]={ret(data),0,0,0};
+    id archive=obj(mm_objc_send(reinterpret_cast<id>(cls("NSPropertyListSerialization")),mm_objc_sel("propertyListWithData:options:format:error:"),4,args));
+    auto field=[](id d,const char *key){return is_kind(d,cls("NSDictionary"))?obj(send(d,"objectForKey:",ret(string(key)))):nullptr;};
+    id objects=field(archive,"$objects");
+    if(!is_kind(objects,cls("NSArray"))){release(self);return 0;}
+    auto resolve=[&](id ref){
+        if(!is_kind(ref,cls("__NSCFKeyedArchiverUID")))return ref;
+        const auto index=send(ref,"value");return index<send(objects,"count")?obj(send(objects,"objectAtIndex:",index)):nullptr;
+    };
+    id top=field(archive,"$top");
+    id keys=field(resolve(field(top,"NSKeys")),"NS.objects"), colors=field(resolve(field(top,"NSColors")),"NS.objects");
+    const auto count=send(keys,"count");
+    if(!is_kind(keys,cls("NSArray"))||!is_kind(colors,cls("NSArray"))||count>4096||count!=send(colors,"count")){release(self);return 0;}
+    auto *list=as<color_list_object>(self);
+    for(std::uint64_t i=0;i<count;++i){
+        id key=resolve(obj(send(keys,"objectAtIndex:",i))), color=resolve(obj(send(colors,"objectAtIndex:",i)));
+        id rgb=field(color,"NSRGB");bool gray=false;if(!rgb){rgb=field(color,"NSWhite");gray=true;}
+        if(!is_kind(key,cls("NSString"))||!is_kind(rgb,cls("NSData"))){release(self);return 0;}
+        const auto length=send(rgb,"length");if(length>1024){release(self);return 0;}
+        std::string components(reinterpret_cast<const char *>(send(rgb,"bytes")),length);
+        double r=0,g=0,b=0,a=1;const int parsed=gray?std::sscanf(components.c_str(),"%lf %lf",&r,&a):std::sscanf(components.c_str(),"%lf %lf %lf %lf",&r,&g,&b,&a);
+        if(parsed<(gray?1:3)||!std::isfinite(r)||!std::isfinite(g)||!std::isfinite(b)||!std::isfinite(a)){release(self);return 0;}
+        if(gray)g=b=r;
+        id value=obj(color_make(nullptr,nullptr,r,g,b,a));
+        list->entries.emplace_back(obj(send(key,"copy")),retain(value));
+    }
+    return ret(self);
+}
+std::uint64_t color_list_name(id self, SEL) { return ret(as<color_list_object>(self)->name); }
+std::uint64_t color_list_keys(id self, SEL) {
+    id keys = obj(send(reinterpret_cast<id>(cls("NSMutableArray")), "array"));
+    for (auto [key, color] : as<color_list_object>(self)->entries) send(keys, "addObject:", ret(key));
+    return ret(keys);
+}
+std::uint64_t color_list_get(id self, SEL, id key) {
+    const auto text = to_utf8(key);
+    for (auto [stored, color] : as<color_list_object>(self)->entries) if (to_utf8(stored) == text) return ret(color);
+    return 0;
+}
+std::uint64_t color_list_remove(id self, SEL, id key) {
+    auto &entries = as<color_list_object>(self)->entries;
+    const auto text = to_utf8(key);
+    for (auto it = entries.begin(); it != entries.end(); ++it) if (to_utf8(it->first) == text) {
+        auto previous = *it; entries.erase(it); release(previous.first); release(previous.second); break;
+    }
+    return 0;
+}
+std::uint64_t color_list_insert(id self, SEL, id color, id key, std::uint64_t index) {
+    if (!key || !color) return 0;
+    auto &entries = as<color_list_object>(self)->entries;
+    id next_key = obj(send(key, "copy")), next_color = retain(color);
+    color_list_remove(self, nullptr, key);
+    entries.insert(entries.begin() + std::min<std::uint64_t>(index, entries.size()), {next_key, next_color}); return 0;
+}
+std::uint64_t color_list_set(id self, SEL, id color, id key) {
+    auto &entries = as<color_list_object>(self)->entries;
+    const auto text = to_utf8(key);
+    for (std::size_t i = 0; i < entries.size(); ++i) if (to_utf8(entries[i].first) == text) return color_list_insert(self, nullptr, color, key, i);
+    return color_list_insert(self, nullptr, color, key, entries.size());
+}
 
 } // namespace
 
@@ -420,7 +523,10 @@ void register_responder() {
         {"greenComponent", MM_IMP(color_greenComponent), "d16@0:8"},
         {"blueComponent", MM_IMP(color_blueComponent), "d16@0:8"},
         {"alphaComponent", MM_IMP(color_alphaComponent), "d16@0:8"},
+        {"colorUsingColorSpace:", MM_IMP(color_convert), "@24@0:8@16"},
+        {"colorUsingColorSpaceName:", MM_IMP(color_convert), "@24@0:8@16"},
         {"getRed:green:blue:alpha:", MM_IMP(color_getRGBA), "v48@0:8^d16^d24^d32^d40"},
+        {"getHue:saturation:brightness:alpha:", MM_IMP(color_getHSBA), "v48@0:8^d16^d24^d32^d40"},
         {"set", MM_IMP(color_set), "v16@0:8"},
         {"setFill", MM_IMP(color_set), "v16@0:8"},
         {"setStroke", MM_IMP(color_set), "v16@0:8"});
@@ -429,13 +535,29 @@ void register_responder() {
         {"colorWithDeviceRed:green:blue:alpha:", MM_IMP(color_make), "@48@0:8d16d24d32d40"},
         {"colorWithSRGBRed:green:blue:alpha:", MM_IMP(color_make), "@48@0:8d16d24d32d40"},
         {"colorWithRed:green:blue:alpha:", MM_IMP(color_make), "@48@0:8d16d24d32d40"},
+        {"colorWithDeviceHue:saturation:brightness:alpha:", MM_IMP(color_hsb), "@48@0:8d16d24d32d40"},
+        {"colorWithCalibratedHue:saturation:brightness:alpha:", MM_IMP(color_hsb), "@48@0:8d16d24d32d40"},
         {"colorWithCalibratedWhite:alpha:", MM_IMP(color_white), "@32@0:8d16d24"},
         {"colorWithDeviceWhite:alpha:", MM_IMP(color_white), "@32@0:8d16d24"},
         {"clearColor", MM_IMP(color_clear), "@16@0:8"});
     for (const char *sel : {"blackColor", "whiteColor", "grayColor", "redColor", "greenColor", "blueColor",
+                            "cyanColor", "magentaColor", "yellowColor", "orangeColor", "purpleColor", "brownColor", "lightGrayColor", "darkGrayColor",
                             "windowBackgroundColor", "controlColor", "textColor", "highlightColor", "shadowColor",
                             "selectedTextBackgroundColor", "controlTextColor", "labelColor"})
         mm_objc_add_class_method(color, sel, MM_IMP(color_named), "@16@0:8");
+
+    Class color_list = mm_objc_define_class("NSColorList", nsobject, sizeof(color_list_object), MM_FW_CLASS_REF(NSColorList), MM_FW_META_REF(NSColorList));
+    register_lifecycle<color_list_object>(color_list);
+    MM_METHODS(color_list,
+        {"initWithName:", MM_IMP(color_list_init), "@24@0:8@16"},
+        {"initWithName:fromFile:", MM_IMP(color_list_init_file), "@32@0:8@16@24"},
+        {"name", MM_IMP(color_list_name), "@16@0:8"},
+        {"isEditable", MM_IMP(+[](id, SEL) -> std::uint64_t { return 1; }), "B16@0:8"},
+        {"allKeys", MM_IMP(color_list_keys), "@16@0:8"},
+        {"colorWithKey:", MM_IMP(color_list_get), "@24@0:8@16"},
+        {"insertColor:key:atIndex:", MM_IMP(color_list_insert), "v40@0:8@16@24Q32"},
+        {"setColor:forKey:", MM_IMP(color_list_set), "v32@0:8@16@24"},
+        {"removeColorWithKey:", MM_IMP(color_list_remove), "v24@0:8@16"});
 
     /* Classes the app only passes around so far; they exist so its
      * references resolve and `isKindOfClass:` works. */
@@ -564,6 +686,7 @@ void register_responder() {
         {"name", MM_IMP(+image_name), "@16@0:8"},
         {"setTemplate:", MM_IMP(+image_noop), "v24@0:8B16"},
         {"isValid", MM_IMP(+image_valid), "B16@0:8"});
+    register_bitmap_drawing();
 
     /* NSAppearance: one appearance, named by whatever was asked for. */
     Class appearance = cls("NSAppearance");

@@ -210,6 +210,7 @@ void deliver(const platform_event &pe) {
         id event = make_event(type, window, pe.where, pe.modifiers);
         auto *e = as<event_object>(event);
         e->button = static_cast<std::uint64_t>(pe.button);
+        e->input_serial = pe.input_serial;
         e->click_count = pe.kind == event_kind::mouse_down ? 1 : 0;
         e->dx = pe.dx;
         e->dy = pe.dy;
@@ -221,6 +222,7 @@ void deliver(const platform_event &pe) {
         id event = make_event(pe.kind == event_kind::key_down ? ev_key_down : ev_key_up, window, pe.where, pe.modifiers);
         auto *e = as<event_object>(event);
         e->keycode = pe.keycode;
+        e->input_serial = pe.input_serial;
         e->characters = pe.characters;
         e->characters_ignoring_modifiers = pe.characters_ignoring_modifiers;
         if (trace()) std::fprintf(stderr, "AppKit: key %s window=%p macCode=%u modifiers=0x%x text=%s\n",
@@ -257,6 +259,10 @@ void deliver(const platform_event &pe) {
         break;
     case event_kind::close_requested:
         if (window) {
+            if (as<window_object>(window)->popup) {
+                send(window, "close");
+                break;
+            }
             id delegate = obj(send(window, "delegate"));
             bool close = true;
             if (responds(delegate, "windowShouldClose:")) close = send(delegate, "windowShouldClose:", ret(window)) != 0;
@@ -557,6 +563,15 @@ std::uint64_t menu_addItem(id self, SEL, id item) {
     ++menu_generation; return 0;
 }
 std::uint64_t menu_numberOfItems(id self, SEL) { return as<menu_object>(self)->items.size(); }
+std::uint64_t menu_itemArray(id self, SEL) {
+    auto &items = as<menu_object>(self)->items;
+    return send(reinterpret_cast<id>(cls("NSArray")), "arrayWithObjects:count:", ret(items.data()), items.size());
+}
+std::uint64_t menu_indexOfItem(id self, SEL, id item) {
+    auto &items = as<menu_object>(self)->items;
+    auto it = std::find(items.begin(), items.end(), item);
+    return it == items.end() ? std::uint64_t(-1) : std::uint64_t(it - items.begin());
+}
 std::uint64_t menu_itemAtIndex(id self, SEL, std::uint64_t i) {
     auto &items = as<menu_object>(self)->items; return i < items.size() ? ret(items[i]) : 0;
 }
@@ -1000,6 +1015,8 @@ void register_application() {
         {"addItem:", MM_IMP(menu_addItem), "v24@0:8@16"},
         {"addItemWithTitle:action:keyEquivalent:", MM_IMP(menu_addItemWithTitle), "@40@0:8@16:24@32"},
         {"numberOfItems", MM_IMP(menu_numberOfItems), "q16@0:8"},
+        {"itemArray", MM_IMP(menu_itemArray), "@16@0:8"},
+        {"indexOfItem:", MM_IMP(menu_indexOfItem), "q24@0:8@16"},
         {"itemAtIndex:", MM_IMP(menu_itemAtIndex), "@24@0:8q16"},
         {"title", MM_IMP(menu_title), "@16@0:8"},
         {"setTitle:", MM_IMP(menu_setTitle), "v24@0:8@16"},

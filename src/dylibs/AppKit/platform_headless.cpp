@@ -36,7 +36,7 @@ void platform::present_cocoa(platform_window *, const std::vector<evilcocoa::ite
 
 bool platform::available() { return false; }
 
-platform_window *platform::create_window(id ns_window, rect frame, const std::string &title, bool, bool) {
+platform_window *platform::create_window(id ns_window, rect frame, const std::string &title, bool, bool, platform_window *, rect, std::uint32_t) {
     auto *w = new platform_window{ns_window, frame, title, false};
     g_windows.push_back(w);
     return w;

@@ -93,6 +93,8 @@ if(NOT WIN32)
         src/dylibs/Foundation/strings.cpp src/dylibs/Foundation/collections.cpp
         src/dylibs/Foundation/plists.cpp src/dylibs/Foundation/misc.cpp src/dylibs/Foundation/task.cpp src/dylibs/Foundation/dispatch.cpp
         src/dylibs/Foundation/key_value.cpp src/dylibs/Foundation/threading.cpp
+        src/dylibs/Foundation/geometry.cpp
+        src/dylibs/Foundation/formatting.cpp
         src/dylibs/symbol-synthesis/synthesise.cpp)
     target_include_directories(Foundation PRIVATE src/dylibs/symbol-synthesis)
     target_link_libraries(Foundation PRIVATE machoman_core libobjc)
@@ -117,6 +119,7 @@ if(NOT WIN32)
         src/dylibs/AppKit/appkit_main.cpp src/dylibs/AppKit/responder.cpp
         src/dylibs/AppKit/views.cpp src/dylibs/AppKit/controls.cpp src/dylibs/AppKit/application.cpp src/dylibs/AppKit/opengl.cpp
         src/dylibs/AppKit/layers.cpp
+        src/dylibs/AppKit/bitmap_drawing.cpp
         src/dylibs/AppKit/app_icon.cpp
         src/dylibs/AppKit/icon_image.cpp
         src/dylibs/AppKit/native_menu.cpp

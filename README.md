@@ -35,13 +35,15 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   [`modules/evilcocoa`](modules/evilcocoa/README.md) renders standard labels and
   buttons with OpenGL, Pango text masks and an independent EGL context. Build
   with `MACHOMAN_BUILD_EVILCOCOA=OFF` to omit it; its dependencies are libepoxy
-  and pangocairo. Images, tables and custom guest drawing remain incomplete.
+  and pangocairo. Packed Cocoa bitmap drawing, RGB/RGBA images and popup
+  controls are supported; other image formats and table features remain partial.
 - **Cocoa application entry point**: AppKit's `NSApplicationMain`, re-exported
   by Quartz and Cocoa, honors `NSPrincipalClass` and `NSMainNibFile`, loads
   keyed plists and compiled `NIBArchive` graphs, and enters the event loop.
   `NSWindowController` provides lazy nib loading and window ownership.
-  GrandPerspective reaches its Welcome window and native folder chooser;
-  its background scanning still needs additional Foundation thread/lock APIs.
+  GrandPerspective can scan directories in the background, report progress,
+  cancel scans and draw its treemap with bundled color palettes. Recent scans
+  are persisted through `NSDocumentController`. Cocoa coverage remains partial.
 - **Process and launch semantics**: the Carbon Process Manager reports
   this one application (with the bundle's signature), and AppKit sends the
   delegate the launch messages macOS sends — `applicationDidFinishLaunching:`
@@ -58,7 +60,9 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   `Frameworks/`), which is loaded at a free base, rebased, bound and
   translated like the executable. `@rpath`, `@executable_path` and
   `@loader_path` work as on macOS, and so do dyld's environment
-  variables: `DYLD_FRAMEWORK_PATH` and `DYLD_LIBRARY_PATH` are searched
+  variables. Run-path lookup follows the loading image's `LC_RPATH` entries
+  and its ancestors, expanding `@loader_path` relative to the image that
+  declared the entry. `DYLD_FRAMEWORK_PATH` and `DYLD_LIBRARY_PATH` are searched
   *before* the install name the binary was linked with (they override
   even an absolute one, as Apple documents), the `DYLD_FALLBACK_*` pair
   after it, `DYLD_ROOT_PATH` adds an alternate system root,

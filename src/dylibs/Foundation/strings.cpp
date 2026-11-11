@@ -590,12 +590,12 @@ std::uint64_t m_hasSuffix(id self, SEL, id p) { SELF_VIEW; const auto pv = view(
 std::uint64_t m_containsString(id self, SEL, id p) { SELF_VIEW; return find(sv, view(p), 0, {0, static_cast<CFIndex>(sv.size())}).location != kCFNotFound; }
 std::uint64_t m_rangeOfString(id self, SEL, id p) { SELF_VIEW; const CFRange r = find(sv, view(p), 0, {0, static_cast<CFIndex>(sv.size())});
     mm_objc_return_words_hi(static_cast<std::uint64_t>(r.length));
-    return static_cast<std::uint64_t>(r.location); }
+    return r.location == kCFNotFound ? NSNotFound : static_cast<std::uint64_t>(r.location); }
 std::uint64_t m_rangeOfStringOptions(id self, SEL, id p, std::uint64_t opts) { SELF_VIEW; const CFRange r = find(sv, view(p), opts, {0, static_cast<CFIndex>(sv.size())}); mm_objc_return_words_hi(static_cast<std::uint64_t>(r.length));
-    return static_cast<std::uint64_t>(r.location); }
+    return r.location == kCFNotFound ? NSNotFound : static_cast<std::uint64_t>(r.location); }
 std::uint64_t m_rangeOfStringOptionsRange(id self, SEL, id p, std::uint64_t opts, std::uint64_t loc, std::uint64_t len) {
     SELF_VIEW; const CFRange r = find(sv, view(p), opts, {static_cast<CFIndex>(loc), static_cast<CFIndex>(len)}); mm_objc_return_words_hi(static_cast<std::uint64_t>(r.length));
-    return static_cast<std::uint64_t>(r.location);
+    return r.location == kCFNotFound ? NSNotFound : static_cast<std::uint64_t>(r.location);
 }
 std::uint64_t m_substringFromIndex(id self, SEL, std::uint64_t i) { SELF_VIEW; return ret(autorelease(string_from_utf16(sv.substr(std::min(i, sv.size()))))); }
 std::uint64_t m_substringToIndex(id self, SEL, std::uint64_t i) { SELF_VIEW; return ret(autorelease(string_from_utf16(sv.substr(0, i)))); }
@@ -689,7 +689,7 @@ std::uint64_t m_stringByTrimmingWhitespace(id self, SEL, id) {
 std::uint64_t m_intValue(id self, SEL) { return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::atoi(to_utf8(self).c_str()))); }
 std::uint64_t m_integerValue(id self, SEL) { return static_cast<std::uint64_t>(std::strtoll(to_utf8(self).c_str(), nullptr, 10)); }
 double m_doubleValue(id self, SEL) { return std::strtod(to_utf8(self).c_str(), nullptr); }
-double m_floatValue(id self, SEL) { return static_cast<float>(std::strtod(to_utf8(self).c_str(), nullptr)); }
+float m_floatValue(id self, SEL) { return static_cast<float>(std::strtod(to_utf8(self).c_str(), nullptr)); }
 std::uint64_t m_boolValue(id self, SEL) {
     std::string s = to_utf8(self);
     std::size_t i = 0;

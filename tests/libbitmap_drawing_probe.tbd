@@ -1,0 +1,8 @@
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64-macos ]
+install-name: '@rpath/libbitmap_drawing_probe.dylib'
+exports:
+  - targets: [ arm64-macos ]
+    symbols: [ _machoman_bitmap_check ]
+...

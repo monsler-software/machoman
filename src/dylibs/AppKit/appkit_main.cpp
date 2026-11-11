@@ -31,6 +31,7 @@ bool trace() {
 
 std::string to_utf8(id nsstring) {
     if (!nsstring) return {};
+    if (is_kind(nsstring, cls("NSAttributedString"))) nsstring=obj(send(nsstring,"string"));
     const char *utf8 = reinterpret_cast<const char *>(send(nsstring, "UTF8String"));
     return utf8 ? std::string(utf8) : std::string();
 }

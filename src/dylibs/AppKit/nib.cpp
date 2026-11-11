@@ -283,6 +283,8 @@ id unarchiver::build_menu_item(id dict, int depth) {
                                    ret(string(key))};
     item = obj(mm_objc_send(item, mm_objc_sel("initWithTitle:action:keyEquivalent:"), 3, args));
     if (!item) return nullptr;
+    send(item, "setTag:", std::uint64_t(int_value(dict, "NSTag", depth)));
+    send(item, "setState:", std::uint64_t(int_value(dict, "NSState", depth)));
     if (id submenu = value(dict, "NSSubmenu", depth)) send(item, "setSubmenu:", ret(submenu));
     if (id target = value(dict, "NSTarget", depth)) send(item, "setTarget:", ret(target));
     send(item, "setKeyEquivalentModifierMask:", static_cast<std::uint64_t>(int_value(dict, "NSKeyEquivModMask", depth, 1 << 20)));
@@ -368,6 +370,12 @@ id unarchiver::build_view(id dict, const std::string &klass, int depth, std::uin
             if (!action.empty()) send(view, "setAction:", ret(mm_objc_sel(action.c_str())));
             if (id target = value(cell, "NSControlTarget", depth)) send(view, "setTarget:", ret(target));
             if (id key = value(cell, "NSKeyEquivalent", depth)) send(view, "setKeyEquivalent:", ret(key));
+            if (is_kind(view, cls("NSPopUpButton"))) {
+                if (id menu = value(cell, "NSMenu", depth)) {
+                    send(view, "setMenu:", ret(menu));
+                    if (id selected = value(cell, "NSMenuItem", depth)) send(view, "selectItem:", ret(selected));
+                }
+            }
         }
     }
     if (id subviews = value(dict, "NSSubviews", depth)) {
@@ -379,7 +387,7 @@ id unarchiver::build_view(id dict, const std::string &klass, int depth, std::uin
         auto *control=as<control_object>(view);
         control->minimum=real_value(dict,"NSMinValue",depth,0);control->maximum=real_value(dict,"NSMaxValue",depth,100);
         control->value=real_value(dict,"NSValue",depth,0);
-        if(is_kind(view,cls("NSProgressIndicator")))control->indeterminate=(int_value(dict,"NSpiFlags",depth)&1)!=0;
+        if(is_kind(view,cls("NSProgressIndicator")))control->indeterminate=(int_value(dict,"NSpiFlags",depth)&2)!=0;
     }
     if(is_kind(view,cls("NSScrollView")))if(id content=value(dict,"NSContentView",depth))send(view,"setContentView:",ret(content));
     if(is_kind(view,cls("NSTableView"))) {

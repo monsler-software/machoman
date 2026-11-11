@@ -392,3 +392,15 @@ void register_threading() {
         {"handleFailureInFunction:file:lineNumber:description:", IMP(assertion_function), "v48@0:8@16@24q32@40"});
 }
 } // namespace fnd
+
+extern "C" {
+extern EXPORT const double kCFAbsoluteTimeIntervalSince1970_ __asm__("_kCFAbsoluteTimeIntervalSince1970");
+extern EXPORT const double kCFAbsoluteTimeIntervalSince1904_ __asm__("_kCFAbsoluteTimeIntervalSince1904");
+const double kCFAbsoluteTimeIntervalSince1970_ = 978307200.;
+const double kCFAbsoluteTimeIntervalSince1904_ = 3061152000.;
+double CFAbsoluteTimeGetCurrent_() DARWIN(CFAbsoluteTimeGetCurrent);
+double CFAbsoluteTimeGetCurrent_() {
+    /* CF absolute time counts seconds from 2001-01-01, not the Unix epoch. */
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() - 978307200.;
+}
+}

@@ -22,7 +22,8 @@ MM_FW_CLASS(NSFont);
 
 namespace ak {
 control_object::~control_object() {
-    for (id o : {title, key_equivalent, image, font, placeholder, identifier, text_field, image_view})
+    for (id o : {title, key_equivalent, image, font, placeholder, identifier, text_field, image_view,
+                 choice_menu, choice_selection})
         release(o);
     for (id o : choices)
         release(o);
@@ -203,7 +204,55 @@ std::uint64_t text_key(id o, SEL, id e) {
     return 0;
 }
 std::uint64_t accepts_text(id o, SEL) { return c(o)->enabled && (c(o)->editable || c(o)->selectable); }
+id popup_menu(id o) {
+    auto *v = c(o);
+    if (!v->choice_menu)
+        v->choice_menu = obj(send(reinterpret_cast<id>(cls("NSMenu")), "new"));
+    return v->choice_menu;
+}
+std::uint64_t choice_count(id o, SEL) {
+    return c(o)->choice_menu ? send(c(o)->choice_menu, "numberOfItems") : c(o)->choices.size();
+}
+id choice_item(id o, std::int64_t index) {
+    return c(o)->choice_menu ? obj(send(c(o)->choice_menu, "itemAtIndex:", std::uint64_t(index))) : nullptr;
+}
+id title_at(id o, std::int64_t index) {
+    if (auto item = choice_item(o, index)) return obj(send(item, "title"));
+    auto &choices = c(o)->choices;
+    return index >= 0 && index < std::int64_t(choices.size()) ? choices[index] : nullptr;
+}
+std::uint64_t selected_choice(id o, SEL) {
+    auto *v = c(o);
+    return v->choice_menu ? (v->choice_selection ? send(v->choice_menu, "indexOfItem:", ret(v->choice_selection)) : std::uint64_t(-1))
+                          : std::uint64_t(v->selected);
+}
+std::uint64_t select_choice(id o, SEL, std::int64_t index) {
+    auto *v = c(o);
+    if (index < -1 || index >= std::int64_t(choice_count(o, nullptr))) return 0;
+    v->selected = index;
+    if (v->choice_menu) {
+        if (v->choice_selection) send(v->choice_selection, "setState:", 0);
+        assign(v->choice_selection, choice_item(o, index));
+        if (v->choice_selection) send(v->choice_selection, "setState:", 1);
+    }
+    send(o, "setTitle:", ret(title_at(o, index)));
+    dirty(o);
+    return 0;
+}
+std::uint64_t insert_choice(id o, SEL, id title, std::int64_t index) {
+    id menu = popup_menu(o);
+    if (index < 0 || index > std::int64_t(send(menu, "numberOfItems"))) return 0;
+    id item = obj(send(reinterpret_cast<id>(cls("NSMenuItem")), "alloc"));
+    const std::uint64_t args[]{ret(title), 0, ret(string(""))};
+    item = obj(mm_objc_send(item, mm_objc_sel("initWithTitle:action:keyEquivalent:"), 3, args));
+    send(menu, "insertItem:atIndex:", ret(item), std::uint64_t(index));
+    release(item);
+    if (!c(o)->choice_selection) select_choice(o, nullptr, 0);
+    dirty(o);
+    return 0;
+}
 std::uint64_t add_choice(id o, SEL, id title) {
+    if (is_kind(o, cls("NSPopUpButton"))) return insert_choice(o, nullptr, title, choice_count(o, nullptr));
     auto *v = c(o);
     v->choices.push_back(retain(title));
     if (v->selected < 0) {
@@ -215,6 +264,8 @@ std::uint64_t add_choice(id o, SEL, id title) {
 }
 std::uint64_t remove_choices(id o, SEL) {
     auto *v = c(o);
+    if (v->choice_menu) send(v->choice_menu, "removeAllItems");
+    assign(v->choice_selection, nullptr);
     for (id i : v->choices)
         release(i);
     v->choices.clear();
@@ -222,26 +273,50 @@ std::uint64_t remove_choices(id o, SEL) {
     send(o, "setTitle:", ret(string("")));
     return 0;
 }
-std::uint64_t select_choice(id o, SEL, std::int64_t index) {
-    auto *v = c(o);
-    if (index < 0 || index >= std::int64_t(v->choices.size()))
-        return 0;
-    v->selected = index;
-    send(o, "setTitle:", ret(v->choices[index]));
-    dirty(o);
-    return 0;
-}
-std::uint64_t selected_choice(id o, SEL) { return std::uint64_t(c(o)->selected); }
-std::uint64_t choice_count(id o, SEL) { return c(o)->choices.size(); }
 std::uint64_t choice_title(id o, SEL) {
-    auto *v = c(o);
-    return v->selected >= 0 && v->selected < std::int64_t(v->choices.size()) ? ret(v->choices[v->selected]) : 0;
+    return ret(title_at(o, std::int64_t(selected_choice(o, nullptr))));
 }
 std::uint64_t select_title(id o, SEL, id title) {
-    auto *v = c(o);
-    for (std::size_t i = 0; i < v->choices.size(); ++i)
-        if (to_utf8(v->choices[i]) == to_utf8(title))
+    for (std::uint64_t i = 0; i < choice_count(o, nullptr); ++i)
+        if (to_utf8(title_at(o, i)) == to_utf8(title))
             return select_choice(o, nullptr, i);
+    return 0;
+}
+std::uint64_t get_choice_menu(id o, SEL) { return ret(popup_menu(o)); }
+std::uint64_t set_choice_menu(id o, SEL, id menu) {
+    if (menu && !is_kind(menu, cls("NSMenu"))) return 0;
+    assign(c(o)->choice_menu, menu);
+    assign(c(o)->choice_selection, nullptr);
+    select_choice(o, nullptr, choice_count(o, nullptr) ? 0 : -1);
+    return 0;
+}
+std::uint64_t get_choice_item(id o, SEL, std::int64_t index) { return ret(choice_item(o, index)); }
+std::uint64_t get_selected_item(id o, SEL) { return ret(choice_item(o, std::int64_t(selected_choice(o, nullptr)))); }
+std::uint64_t index_of_tag(id o, SEL, std::int64_t tag) {
+    for (std::uint64_t i = 0; i < choice_count(o, nullptr); ++i)
+        if (std::int64_t(send(choice_item(o, i), "tag")) == tag) return i;
+    return std::uint64_t(-1);
+}
+std::uint64_t select_tag(id o, SEL, std::int64_t tag) {
+    const auto index = std::int64_t(index_of_tag(o, nullptr, tag));
+    if (index < 0) return 0;
+    select_choice(o, nullptr, index);
+    return 1;
+}
+std::uint64_t select_item(id o, SEL, id item) {
+    return select_choice(o, nullptr, item ? std::int64_t(send(popup_menu(o), "indexOfItem:", ret(item))) : -1);
+}
+std::uint64_t choice_array(id o, SEL) { return send(popup_menu(o), "itemArray"); }
+std::uint64_t add_titles(id o, SEL, id titles) {
+    for (std::uint64_t i = 0; i < send(titles, "count"); ++i) add_choice(o, nullptr, obj(send(titles, "objectAtIndex:", i)));
+    return 0;
+}
+std::uint64_t remove_choice(id o, SEL, std::int64_t index) {
+    if (index < 0 || index >= std::int64_t(choice_count(o, nullptr))) return 0;
+    bool selected = choice_item(o, index) == c(o)->choice_selection;
+    send(popup_menu(o), "removeItemAtIndex:", std::uint64_t(index));
+    if (selected) select_choice(o, nullptr, choice_count(o, nullptr) ? 0 : -1);
+    dirty(o);
     return 0;
 }
 std::uint64_t choice_key(id o, SEL, id e) {
@@ -250,9 +325,9 @@ std::uint64_t choice_key(id o, SEL, id e) {
     if (!v->enabled)
         return 0;
     if (key == 125 || key == 124)
-        select_choice(o, nullptr, std::min(v->selected + 1, std::int64_t(v->choices.size()) - 1));
+        select_choice(o, nullptr, std::min(std::int64_t(selected_choice(o, nullptr)) + 1, std::int64_t(choice_count(o, nullptr)) - 1));
     else if (key == 126 || key == 123)
-        select_choice(o, nullptr, std::max(std::int64_t(0), v->selected - 1));
+        select_choice(o, nullptr, std::max(std::int64_t(0), std::int64_t(selected_choice(o, nullptr)) - 1));
     else
         return 0;
     action(o);
@@ -265,16 +340,54 @@ struct choice_button_object {
     ~choice_button_object() { release(owner); }
 };
 Class choice_button_class = nullptr;
+Class choice_list_class = nullptr;
+id previous_choice_popup = nullptr;
+struct choice_list_object {
+    view_object view;
+    id owner = nullptr;
+    std::int64_t highlighted = 0;
+    ~choice_list_object() { release(owner); }
+};
+std::uint64_t choice_popup_closed(id, SEL, id window) {
+    if (id parent = as<window_object>(window)->parent_window) send(parent, "removeChildWindow:", ret(window));
+    if (previous_choice_popup == window) {
+        previous_choice_popup = nullptr;
+        release(window);
+    }
+    return 0;
+}
+std::uint64_t choice_list_key(id o, SEL, id e) {
+    auto *list = as<choice_list_object>(o);
+    const auto key = as<event_object>(e)->keycode;
+    if (key == 53) { send(list->view.window, "close"); return 0; }
+    auto &rows = list->view.subviews;
+    if (rows.empty()) return 0;
+    if (key == 36 || key == 76) {
+        if (list->highlighted >= 0 && list->highlighted < std::int64_t(rows.size()))
+            send(rows[list->highlighted], "performClick:", 0);
+        return 0;
+    }
+    if (key != 125 && key != 126) return 0;
+    auto index = list->highlighted;
+    for (std::size_t n = 0; n < rows.size(); ++n) {
+        index = (index + std::int64_t(rows.size()) + (key == 125 ? 1 : -1)) % std::int64_t(rows.size());
+        if (c(rows[index])->enabled) break;
+    }
+    list->highlighted = index;
+    for (std::size_t i = 0; i < rows.size(); ++i) c(rows[i])->highlighted = std::int64_t(i) == index;
+    auto *clip = list->view.superview ? as<view_object>(list->view.superview) : nullptr;
+    if (clip) clip->bounds.y = std::clamp(index * 26. - clip->bounds.h / 2, 0., std::max(0., list->view.frame.h - clip->bounds.h));
+    dirty(o);
+    return 0;
+}
 std::uint64_t choice_click(id o, SEL, id) {
     auto *b = as<choice_button_object>(o);
+    if (!b->control.enabled) return 0;
     id owner = retain(b->owner);
     auto index = b->index;
     id window = retain(b->control.view.window);
     select_choice(owner, nullptr, index);
     send(window, "close");
-    id parent = as<window_object>(window)->parent_window;
-    if (parent)
-        send(parent, "removeChildWindow:", ret(window));
     release(window);
     action(owner);
     release(owner);
@@ -282,38 +395,65 @@ std::uint64_t choice_click(id o, SEL, id) {
 }
 std::uint64_t popup_mouse(id o, SEL, id event) {
     auto *v = c(o);
-    if (!v->enabled || v->choices.empty())
+    const auto count = choice_count(o, nullptr);
+    if (!v->enabled || !count || !v->view.window)
         return 0;
     send(v->view.window, "makeFirstResponder:", ret(o));
-    static id previous = nullptr;
-    if (previous) {
-        send(previous, "close");
-        id parent = as<window_object>(previous)->parent_window;
-        if (parent)
-            send(parent, "removeChildWindow:", ret(previous));
-        release(previous);
-        previous = nullptr;
-    }
+    if (previous_choice_popup) send(previous_choice_popup, "close");
     auto w = as<window_object>(v->view.window);
-    auto point = as<event_object>(event)->where;
-    double width = std::max(140., v->view.frame.w), height = std::min(std::size_t(20), v->choices.size()) * 26. + 4;
-    id popup = make_window({w->frame.x + point.x - width / 2, w->frame.y + point.y - height, width, height}, 0);
-    previous = retain(popup);
-    for (std::size_t n = 0; n < std::min(std::size_t(20), v->choices.size()); ++n) {
+    rect anchor = v->view.bounds;
+    if (auto *ctx = api()->current_context()) {
+        const double values[]{anchor.x, anchor.y, anchor.w, anchor.h};
+        for (int i = 0; i < 4; ++i) std::memcpy(&ctx->v[i][0], &values[i], 8);
+        send(o, "convertRect:toView:", 0);
+        double *fields[]{&anchor.x, &anchor.y, &anchor.w, &anchor.h};
+        for (int i = 0; i < 4; ++i) std::memcpy(fields[i], &ctx->v[i][0], 8);
+    }
+    anchor.y = w->frame.h - anchor.y - anchor.h;
+    double width = std::max(140., v->view.frame.w), height = std::min(std::uint64_t(20), count) * 26. + 4;
+    id popup = make_window({0, 0, width, height}, 0);
+    as<window_object>(popup)->popup = true;
+    as<window_object>(popup)->popup_anchor = anchor;
+    as<window_object>(popup)->popup_serial = event ? as<event_object>(event)->input_serial : 0;
+    previous_choice_popup = retain(popup);
+    auto *list = make<choice_list_object>(choice_list_class);
+    id document = reinterpret_cast<id>(list);
+    list->owner = retain(o);
+    list->highlighted = std::max(std::int64_t(0), std::int64_t(selected_choice(o, nullptr)));
+    list->view.frame = list->view.bounds = {0, 0, width, count * 26. + 4};
+    id scroll = obj(send(reinterpret_cast<id>(cls("NSScrollView")), "alloc"));
+    as<view_object>(scroll)->frame = as<view_object>(scroll)->bounds = {0, 0, width, height};
+    if (auto *ctx = api()->current_context()) {
+        const double values[]{0, 0, width, height};
+        for (int i = 0; i < 4; ++i) std::memcpy(&ctx->v[i][0], &values[i], 8);
+    }
+    scroll = obj(send(scroll, "initWithFrame:"));
+    send(scroll, "setDocumentView:", ret(document));
+    send(popup, "setContentView:", ret(scroll));
+    send(popup, "setDelegate:", ret(document));
+    for (std::size_t n = 0; n < count; ++n) {
         auto *b = make<choice_button_object>(choice_button_class);
         id button = reinterpret_cast<id>(b);
         b->owner = retain(o);
         b->index = n;
-        b->control.title = retain(v->choices[n]);
+        b->control.title = retain(title_at(o, n));
+        if (auto item = choice_item(o, n)) b->control.enabled = send(item, "isEnabled") && !send(item, "isSeparatorItem");
         b->control.bordered = false;
-        b->control.view.frame = {2, height - 2 - (n + 1) * 26, width - 4, 26};
+        b->control.alignment = 0;
+        b->control.menu_row = true;
+        b->control.state = std::int64_t(n) == std::int64_t(selected_choice(o, nullptr));
+        b->control.highlighted = std::int64_t(n) == list->highlighted;
+        b->control.view.frame = {2, 2 + n * 26., width - 4, 26};
         b->control.view.bounds = {0, 0, width - 4, 26};
-        send(obj(send(popup, "contentView")), "addSubview:", ret(button));
+        send(document, "addSubview:", ret(button));
         release(button);
     }
     send(w->content_view, "setNeedsDisplay:", 1);
     send(v->view.window, "addChildWindow:ordered:", ret(popup), 1);
     send(popup, "makeKeyAndOrderFront:", 0);
+    send(popup, "makeFirstResponder:", ret(document));
+    release(document);
+    release(scroll);
     release(popup);
     return 0;
 }
@@ -584,6 +724,10 @@ void layout_cocoa_view(id view) {
         auto f = frames[i];
         auto old = as<view_object>(children[i])->frame;
         rect next{f.x + v->bounds.x, flipped ? f.y + v->bounds.y : v->bounds.h - f.y - f.h + v->bounds.y, f.w, f.h};
+        if (!constraints.empty()) {
+            auto aligned = layout::align_edges({next.x, next.y, next.w, next.h});
+            next = {aligned.x, aligned.y, aligned.w, aligned.h};
+        }
         if (std::abs(old.x - next.x) > .01 || std::abs(old.y - next.y) > .01 || std::abs(old.w - next.w) > .01 ||
             std::abs(old.h - next.h) > .01)
             set_frame(children[i], next);
@@ -655,6 +799,14 @@ void register_cocoa_controls(Class view, Class control) {
                                                &choice_storage, &choice_meta);
     register_lifecycle<choice_button_object>(choice_button_class);
     MM_METHODS(choice_button_class, {"performClick:", MM_IMP(choice_click), "v24@0:8@16"});
+    static mm_objc_class list_storage{}, list_meta{};
+    choice_list_class = mm_objc_define_class("__MMCocoaChoiceList", view, sizeof(choice_list_object), &list_storage, &list_meta);
+    register_lifecycle<choice_list_object>(choice_list_class);
+    MM_METHODS(choice_list_class,
+        {"isFlipped", MM_IMP(flipped), "B16@0:8"}, {"acceptsFirstResponder", MM_IMP(flipped), "B16@0:8"},
+        {"keyDown:", MM_IMP(choice_list_key), "v24@0:8@16"},
+        {"windowWillClose:", MM_IMP(choice_popup_closed), "v24@0:8@16"},
+        {"scrollWheel:", MM_IMP(wheel), "v24@0:8@16"});
     Class combo = define("NSComboBox", cls("NSTextField"), MM_FW_CLASS_REF(NSComboBox), MM_FW_META_REF(NSComboBox));
     define("NSSecureTextField", cls("NSTextField"), MM_FW_CLASS_REF(NSSecureTextField),
            MM_FW_META_REF(NSSecureTextField));
@@ -672,9 +824,21 @@ void register_cocoa_controls(Class view, Class control) {
                    {"numberOfItems", MM_IMP(choice_count), "q16@0:8"},
                    {"titleOfSelectedItem", MM_IMP(choice_title), "@16@0:8"},
                    {"keyDown:", MM_IMP(choice_key), "v24@0:8@16"}, {"mouseDown:", MM_IMP(popup_mouse), "v24@0:8@16"});
+    MM_METHODS(cls("NSPopUpButton"),
+        {"menu", MM_IMP(get_choice_menu), "@16@0:8"}, {"setMenu:", MM_IMP(set_choice_menu), "v24@0:8@16"},
+        {"insertItemWithTitle:atIndex:", MM_IMP(insert_choice), "v32@0:8@16q24"},
+        {"itemAtIndex:", MM_IMP(get_choice_item), "@24@0:8q16"},
+        {"selectedItem", MM_IMP(get_selected_item), "@16@0:8"},
+        {"indexOfItemWithTag:", MM_IMP(index_of_tag), "q24@0:8q16"},
+        {"selectItemWithTag:", MM_IMP(select_tag), "B24@0:8q16"},
+        {"selectItem:", MM_IMP(select_item), "v24@0:8@16"},
+        {"itemArray", MM_IMP(choice_array), "@16@0:8"},
+        {"addItemsWithTitles:", MM_IMP(add_titles), "v24@0:8@16"},
+        {"removeItemAtIndex:", MM_IMP(remove_choice), "v24@0:8q16"});
     Class segments =
         define("NSSegmentedControl", control, MM_FW_CLASS_REF(NSSegmentedControl), MM_FW_META_REF(NSSegmentedControl));
     MM_METHODS(segments, {"setSegmentCount:", MM_IMP(segment_count), "v24@0:8q16"},
+               {"segmentCount", MM_IMP(choice_count), "q16@0:8"},
                {"setLabel:forSegment:", MM_IMP(segment_label), "v32@0:8@16q24"},
                {"selectedSegment", MM_IMP(selected_choice), "q16@0:8"},
                {"setSelectedSegment:", MM_IMP(select_choice), "v24@0:8q16"},

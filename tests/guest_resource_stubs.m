@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <math.h>
 
 static void require(BOOL condition, const char *message) {
     if (!condition) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
@@ -35,6 +36,8 @@ typedef struct { float a, b, c, d; } FloatValue;
 @end
 
 static void resources(void) {
+    double absolute = CFAbsoluteTimeGetCurrent();
+    require(absolute > 0. && fabs(absolute + kCFAbsoluteTimeIntervalSince1970 - [[NSDate date] timeIntervalSince1970]) < 1., "CF clock uses the 2001 epoch and FP return ABI");
     char root[] = "/tmp/machoman-resource-XXXXXX";
     require(mkdtemp(root) != NULL, "resource fixture");
     NSString *directory = [NSString stringWithUTF8String:root];

@@ -98,10 +98,28 @@ struct darwin_fts {
         out->cycle = e->fts_info == FTS_DC && e->fts_cycle ? entry(e->fts_cycle) : nullptr;
         return out;
     }
-    darwin_ftsent *list(FTSENT *head) {
+    darwin_ftsent *list(FTSENT *head, bool require_stat) {
         darwin_ftsent *first = nullptr, *last = nullptr;
         for (auto *e = head; e; e = e->fts_link) {
             auto *out = entry(e);
+            /* glibc defers child stat calls without a comparator, whereas
+             * Darwin's fts_children(..., 0) exposes complete metadata.
+             * The shared native path still names the parent at this point. */
+            if (require_stat && !out->statp && e->fts_info == FTS_NSOK) {
+                auto &snapshot = *entries.at(e);
+                const auto parent = out->parent && out->parent->path ? out->parent->path : "";
+                snapshot.path = (std::filesystem::path(parent) / e->fts_name).string();
+                snapshot.accpath = snapshot.path;
+                out->path = snapshot.path.data(); out->accpath = snapshot.accpath.data();
+                out->pathlen = static_cast<std::uint16_t>(snapshot.path.size());
+                struct stat metadata{};
+                const int result = options & FTS_LOGICAL ? ::stat(out->accpath, &metadata) : ::lstat(out->accpath, &metadata);
+                if (result == 0) {
+                    convert_stat(metadata, &snapshot.stat); out->statp = &snapshot.stat;
+                    out->ino = metadata.st_ino; out->dev = metadata.st_dev; out->nlink = metadata.st_nlink;
+                    out->info = S_ISDIR(metadata.st_mode) ? FTS_D : S_ISREG(metadata.st_mode) ? FTS_F : S_ISLNK(metadata.st_mode) ? FTS_SL : FTS_DEFAULT;
+                } else { out->error = mm_darwin_errno(errno); out->info = FTS_NS; }
+            }
             if (last) last->link = out; else first = out;
             last = out;
         }
@@ -191,7 +209,7 @@ darwin_ftsent *darwin_fts_read(darwin_fts *s) {
 darwin_ftsent *darwin_fts_children(darwin_fts *s, int options) DARWIN(fts_children);
 darwin_ftsent *darwin_fts_children(darwin_fts *s, int options) {
     sort_scope scope(s);
-    return s->child = s->list(fts_children(s->native, options));
+    return s->child = s->list(fts_children(s->native, options), options == 0 && !(s->options & (FTS_NOSTAT | 0x800)));
 }
 int darwin_fts_set(darwin_fts *s, darwin_ftsent *e, int instruction) DARWIN(fts_set);
 int darwin_fts_set(darwin_fts *s, darwin_ftsent *e, int instruction) {

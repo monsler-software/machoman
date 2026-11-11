@@ -1435,7 +1435,8 @@ extern "C" void mm_watch_hit(const mm_cpu_context *ctx, std::uint64_t va) {
         if (++hits[va] > limit) return;
     }
     std::fprintf(stderr, "watch 0x%llx:", static_cast<unsigned long long>(va));
-    for (int i = 0; i < 9; i++) {
+    static const int registers = std::getenv("MACHOMAN_WATCH_REGISTERS") ? 31 : 9;
+    for (int i = 0; i < registers; i++) {
         std::fprintf(stderr, " x%d=0x%llx", i, static_cast<unsigned long long>(ctx->x[i]));
         std::string text;
         if (describe_string(ctx->x[i], text)) std::fprintf(stderr, "(\"%s\")", text.c_str());

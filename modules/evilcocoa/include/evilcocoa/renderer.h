@@ -14,6 +14,7 @@ struct rect {
 enum class kind {
     label,
     button,
+    menu_item,
     checkbox,
     radio,
     text_field,

@@ -22,6 +22,7 @@ FND_CLASS(NSSet); FND_CLASS(NSMutableSet); FND_CLASS(__NSSetM);
 FND_CLASS(NSData); FND_CLASS(NSMutableData); FND_CLASS(__NSDataM);
 FND_CLASS(NSValue); FND_CLASS(NSNumber); FND_CLASS(__NSCFNumber); FND_CLASS(__NSCFBoolean); FND_CLASS(NSConstantIntegerNumber);
 FND_CLASS(NSNull);
+FND_CLASS(NSConstantDoubleNumber);
 FND_CLASS(NSEnumerator);
 
 namespace {
@@ -47,6 +48,9 @@ struct value_object { mm_objc_object base; std::string bytes; std::string type; 
 
 
 Class g_array, g_marray, g_carray, g_dict, g_mdict, g_cdict, g_set, g_mset, g_cset, g_data, g_mdata, g_cdata, g_value, g_number, g_cnumber, g_boolean, g_null, g_enumerator;
+Class g_constant_double = nullptr;
+struct constant_double { mm_objc_object base; double value; };
+bool constant_double_number(id o) { return o && mm_objc_object_class(o)==g_constant_double; }
 
 /* Exported singletons the guest binds to directly. */
 extern "C" {
@@ -112,8 +116,8 @@ std::uint64_t a_objectAtIndex(id self, SEL, std::uint64_t i) {
 std::uint64_t a_firstObject(id self, SEL) { auto &v = arr(self)->items; return v.empty() ? 0 : ret(v.front()); }
 std::uint64_t a_lastObject(id self, SEL) { auto &v = arr(self)->items; return v.empty() ? 0 : ret(v.back()); }
 std::uint64_t a_containsObject(id self, SEL, id o) { for (id e : arr(self)->items) if (objects_equal(e, o)) return 1; return 0; }
-std::uint64_t a_indexOfObject(id self, SEL, id o) { auto &v = arr(self)->items; for (std::size_t i = 0; i < v.size(); i++) if (objects_equal(v[i], o)) return i; return static_cast<std::uint64_t>(-1); }
-std::uint64_t a_indexOfObjectIdenticalTo(id self, SEL, id o) { auto &v = arr(self)->items; for (std::size_t i = 0; i < v.size(); i++) if (v[i] == o) return i; return static_cast<std::uint64_t>(-1); }
+std::uint64_t a_indexOfObject(id self, SEL, id o) { auto &v = arr(self)->items; for (std::size_t i = 0; i < v.size(); i++) if (objects_equal(v[i], o)) return i; return NSNotFound; }
+std::uint64_t a_indexOfObjectIdenticalTo(id self, SEL, id o) { auto &v = arr(self)->items; for (std::size_t i = 0; i < v.size(); i++) if (v[i] == o) return i; return NSNotFound; }
 std::uint64_t a_getObjectsRange(id self, SEL, id *buf, std::uint64_t loc, std::uint64_t len) { auto &v = arr(self)->items; for (std::uint64_t i = 0; i < len && loc + i < v.size(); i++) buf[i] = v[loc + i]; return 0; }
 std::uint64_t a_isEqualToArray(id self, SEL, id o) {
     if (!o || !is_array(o)) return 0;
@@ -612,7 +616,7 @@ std::uint64_t nu_unsignedValue(id self, SEL) { return static_cast<std::uint64_t>
 std::uint64_t nu_unsignedIntValue(id self, SEL) { return static_cast<std::uint32_t>(num_int(num(self))); }
 std::uint64_t nu_boolValue(id self, SEL) { return num_is_float(num(self)) ? num(self)->v.d != 0 : num(self)->v.i != 0; }
 double nu_doubleValue(id self, SEL) { return num_double(num(self)); }
-double nu_floatValue(id self, SEL) { return static_cast<float>(num_double(num(self))); }
+float nu_floatValue(id self, SEL) { return static_cast<float>(num_double(num(self))); }
 std::string number_string(number_object *n) {
     char buf[64];
     if (n->type == 'B') return n->v.i ? "1" : "0";
@@ -627,6 +631,7 @@ std::uint64_t nu_description(id self, SEL) { return nu_stringValue(self, nullptr
 std::uint64_t nu_objCType(id self, SEL) { static thread_local char t[2]; t[0] = num(self)->type; t[1] = 0; return ret(t); }
 std::uint64_t nu_isEqualToNumber(id self, SEL, id o) {
     if (!o || !is_number(o)) return 0;
+    if(constant_double_number(self)||constant_double_number(o))return number_double(self)==number_double(o);
     number_object *a = num(self), *b = num(o);
     if (num_is_float(a) || num_is_float(b)) return num_double(a) == num_double(b);
     return a->v.i == b->v.i;
@@ -634,7 +639,8 @@ std::uint64_t nu_isEqualToNumber(id self, SEL, id o) {
 std::uint64_t nu_isEqual(id self, SEL, id o) { return nu_isEqualToNumber(self, nullptr, o); }
 std::uint64_t nu_hash(id self, SEL) { number_object *n = num(self); if (num_is_float(n) && n->v.d == std::floor(n->v.d) && std::fabs(n->v.d) < 9e18) return static_cast<std::uint64_t>(static_cast<std::int64_t>(n->v.d)); if (num_is_float(n)) { std::uint64_t b; std::memcpy(&b, &n->v.d, 8); return b; } return n->v.u; }
 std::uint64_t nu_compare(id self, SEL, id o) {
-    const double a = num_double(num(self)), b = num_double(num(o));
+    const double a = number_double(self), b = number_double(o);
+    if(constant_double_number(self)||constant_double_number(o))return static_cast<std::uint64_t>(a<b?-1:a>b?1:0);
     if (!num_is_float(num(self)) && !num_is_float(num(o))) { const std::int64_t x = num(self)->v.i, y = num(o)->v.i; return static_cast<std::uint64_t>(x < y ? -1 : x > y ? 1 : 0); }
     return static_cast<std::uint64_t>(a < b ? -1 : a > b ? 1 : 0);
 }
@@ -667,7 +673,7 @@ std::uint64_t nu_initWithUnsignedInt(id self, SEL, std::uint64_t v) { num(self)-
 std::uint64_t nu_initWithLong(id self, SEL, std::uint64_t v) { num(self)->type = 'q'; num(self)->v.i = static_cast<std::int64_t>(v); return ret(self); }
 std::uint64_t nu_initWithUnsignedLong(id self, SEL, std::uint64_t v) { num(self)->type = 'Q'; num(self)->v.u = v; return ret(self); }
 std::uint64_t nu_initWithBool(id self, SEL, std::uint64_t v) { num(self)->type = 'B'; num(self)->v.i = (v & 0xFF) != 0; return ret(self); }
-std::uint64_t nu_initWithFloat(id self, SEL, double v) { num(self)->type = 'f'; num(self)->v.d = static_cast<float>(v); return ret(self); }
+std::uint64_t nu_initWithFloat(id self, SEL, float v) { num(self)->type = 'f'; num(self)->v.d = v; return ret(self); }
 std::uint64_t nu_initWithDouble(id self, SEL, double v) { num(self)->type = 'd'; num(self)->v.d = v; return ret(self); }
 /* Class factories: doubles arrive in v0 regardless of the integer args. */
 std::uint64_t nc_numberWithChar(id, SEL, std::uint64_t v) { return ret(autorelease(number_new('c', static_cast<signed char>(v), 0))); }
@@ -679,7 +685,7 @@ std::uint64_t nc_numberWithUnsignedInt(id, SEL, std::uint64_t v) { return ret(au
 std::uint64_t nc_numberWithLong(id, SEL, std::uint64_t v) { return ret(autorelease(number_new('q', static_cast<std::int64_t>(v), 0))); }
 std::uint64_t nc_numberWithUnsignedLong(id, SEL, std::uint64_t v) { return ret(autorelease(number_new('Q', static_cast<std::int64_t>(v), 0))); }
 std::uint64_t nc_numberWithBool(id, SEL, std::uint64_t v) { return ret((v & 0xFF) ? kCFBooleanTrue_ptr : kCFBooleanFalse_ptr); }
-std::uint64_t nc_numberWithFloat(id, SEL, double v) { return ret(autorelease(number_new('f', 0, static_cast<float>(v)))); }
+std::uint64_t nc_numberWithFloat(id, SEL, float v) { return ret(autorelease(number_new('f', 0, v))); }
 std::uint64_t nc_numberWithDouble(id, SEL, double v) { return ret(autorelease(number_new('d', 0, v))); }
 
 /* NSValue: raw bytes with an objc type string. */
@@ -791,9 +797,9 @@ id number_from_int64(std::int64_t v) { return number_new('q', v, 0); }
 id number_from_double(double v) { return number_new('d', 0, v); }
 id number_bool(bool v) { return v ? kCFBooleanTrue_ptr : kCFBooleanFalse_ptr; }
 bool is_number(id o) { return o && is_kind(o, g_number); }
-double number_double(id n) { return num_double(num(n)); }
-std::int64_t number_int64(id n) { return num_int(num(n)); }
-bool number_is_float(id n) { return num_is_float(num(n)); }
+double number_double(id n) { return constant_double_number(n)?as<constant_double>(n)->value:num_double(num(n)); }
+std::int64_t number_int64(id n) { return constant_double_number(n)?static_cast<std::int64_t>(as<constant_double>(n)->value):num_int(num(n)); }
+bool number_is_float(id n) { return constant_double_number(n)||num_is_float(num(n)); }
 id null_object() { return kCFNull_ptr; }
 
 namespace {
@@ -1063,6 +1069,21 @@ void register_collections() {
     g_cnumber = mm_objc_define_class("__NSCFNumber", g_number, sizeof(number_object), FND_CLASS_REF(__NSCFNumber), FND_META_REF(__NSCFNumber));
     g_boolean = mm_objc_define_class("__NSCFBoolean", g_cnumber, sizeof(number_object), FND_CLASS_REF(__NSCFBoolean), FND_META_REF(__NSCFBoolean));
     mm_objc_define_class("NSConstantIntegerNumber", g_cnumber, sizeof(number_object), FND_CLASS_REF(NSConstantIntegerNumber), FND_META_REF(NSConstantIntegerNumber));
+    g_constant_double=mm_objc_define_class("NSConstantDoubleNumber",g_number,sizeof(constant_double),FND_CLASS_REF(NSConstantDoubleNumber),FND_META_REF(NSConstantDoubleNumber));
+    static auto double_value=[](id s,SEL){return as<constant_double>(s)->value;};
+    static auto float_value=[](id s,SEL){return static_cast<float>(as<constant_double>(s)->value);};
+    static auto int_value=[](id s,SEL){return static_cast<std::int64_t>(as<constant_double>(s)->value);};
+    static auto bool_value=[](id s,SEL){return std::uint64_t(as<constant_double>(s)->value!=0);};
+    static auto type=[](id,SEL){return ret("d");};
+    static auto text=[](id s,SEL){char b[96];std::snprintf(b,sizeof b,"%.17g",as<constant_double>(s)->value);return ret(autorelease(string_from_utf8(b)));};
+    static auto hash=[](id s,SEL){const double v=as<constant_double>(s)->value;if(std::isfinite(v)&&std::fabs(v)<9e18&&v==std::floor(v))return static_cast<std::uint64_t>(static_cast<std::int64_t>(v));std::uint64_t bits;std::memcpy(&bits,&v,8);return bits;};
+    static auto compare=[](id s,SEL,id o){const double a=number_double(s),b=number_double(o);return std::int64_t(a<b?-1:a>b?1:0);};
+    static auto value=[](id s,SEL,void *out)->std::uint64_t{if(out)std::memcpy(out,&as<constant_double>(s)->value,8);return 0;};
+    FND_METHODS(g_constant_double,
+        {"doubleValue",IMP(+double_value),"d16@0:8"},{"floatValue",IMP(+float_value),"f16@0:8"},
+        {"integerValue",IMP(+int_value),"q16@0:8"},{"longLongValue",IMP(+int_value),"q16@0:8"},{"intValue",IMP(+int_value),"i16@0:8"},{"boolValue",IMP(+bool_value),"B16@0:8"},
+        {"objCType",IMP(+type),"r*16@0:8"},{"description",IMP(+text),"@16@0:8"},{"stringValue",IMP(+text),"@16@0:8"},
+        {"hash",IMP(+hash),"Q16@0:8"},{"compare:",IMP(+compare),"q24@0:8@16"},{"getValue:",IMP(+value),"v24@0:8^v16"});
     register_lifecycle<number_object>(g_cnumber);
     register_cluster<number_object>(g_number, g_cnumber, false);
     FND_METHODS(g_number,

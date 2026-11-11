@@ -38,6 +38,7 @@ using UniChar = char16_t;
 
 struct CFRange { CFIndex location, length; };
 inline constexpr CFIndex kCFNotFound = -1;
+inline constexpr std::uint64_t NSNotFound = 0x7fffffffffffffffull;
 
 /* ---- classes ------------------------------------------------------------ */
 
@@ -207,6 +208,7 @@ void dispatch_drain_main_queue();
 
 /* Registration entry points (one per translation unit). */
 void register_strings();
+void register_formatting();
 void register_collections();
 void register_plists();
 void register_bundle();

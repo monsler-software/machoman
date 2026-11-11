@@ -211,6 +211,10 @@ std::string percent_encode(std::string_view s) {
 }
 
 std::uint64_t url_path_m(id self, SEL) { return ret(autorelease(string_from_utf8(u(self)->path))); }
+std::uint64_t url_pathComponents(id self, SEL) {
+    id path = string_from_utf8(u(self)->path);
+    auto result = send(path, "pathComponents"); release(path); return result;
+}
 std::uint64_t url_absoluteString(id self, SEL) { return ret(autorelease(string_from_utf8(u(self)->scheme + "://" + percent_encode(u(self)->path)))); }
 std::uint64_t url_isFileURL(id self, SEL) { return u(self)->scheme == "file"; }
 std::uint64_t url_lastPathComponent(id self, SEL) {
@@ -626,6 +630,21 @@ std::uint64_t bundle_URLForResourceWithExtension(id self, SEL, id name, id type)
     const std::uint64_t p = bundle_pathForResourceOfType(self, nullptr, name, type);
     return p ? ret(autorelease(url_new(to_utf8(obj(p)), false))) : 0;
 }
+std::uint64_t bundle_pathsForResourcesOfTypeInDirectory(id self, SEL, id type, id directory) {
+    namespace fs=std::filesystem;
+    fs::path path=bun(self)->path+"/Contents/Resources";
+    if(directory){fs::path dir(to_utf8(directory));if(dir.is_absolute())return ret(autorelease(array_create(nullptr,0,false)));path/=dir;}
+    std::vector<id> paths;std::error_code ec;
+    std::string extension=type?to_utf8(type):"";
+    if(!extension.empty()&&extension.front()!='.')extension.insert(extension.begin(),'.');
+    for(fs::directory_iterator it(path,ec),end;it!=end&&!ec;it.increment(ec)) {
+        if(!it->is_regular_file(ec))continue;
+        if(type&&it->path().extension().string()!=extension)continue;
+        paths.push_back(string_from_utf8(it->path().string()));
+    }
+    std::sort(paths.begin(),paths.end(),[](id a,id b){return to_utf8(a)<to_utf8(b);});
+    id result=array_create(paths.data(),paths.size(),false);for(id p:paths)release(p);return ret(autorelease(result));
+}
 std::uint64_t bundle_localizedString(id self, SEL, id key, id value, id) { (void)self; return ret(value && string_chars(value).length ? value : key); }
 std::uint64_t bundlec_mainBundle(id, SEL) { return ret(main_bundle()); }
 std::uint64_t bundlec_bundleWithPath(id, SEL, id path) { return ret(autorelease(make_bundle(to_utf8(path)))); }
@@ -697,13 +716,14 @@ std::uint64_t defaults_removeObjectForKey(id, SEL, id key) { prefs().set(key, nu
 std::uint64_t defaults_stringForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_string(v) ? ret(v) : 0; }
 std::uint64_t defaults_arrayForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_kind(v, cls("NSArray")) ? ret(v) : 0; }
 std::uint64_t defaults_dictionaryForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_kind(v, cls("NSDictionary")) ? ret(v) : 0; }
-std::uint64_t defaults_boolForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? (number_int64(v) != 0) : 0; }
-std::uint64_t defaults_integerForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? static_cast<std::uint64_t>(number_int64(v)) : 0; }
-double defaults_doubleForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? number_double(v) : 0.0; }
+std::uint64_t defaults_boolForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? (number_int64(v) != 0) : v && is_string(v) ? send(v, "boolValue") : 0; }
+std::uint64_t defaults_integerForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? static_cast<std::uint64_t>(number_int64(v)) : v && is_string(v) ? send(v, "integerValue") : 0; }
+double defaults_doubleForKey(id, SEL, id key) { id v = prefs().get(key); return v && is_number(v) ? number_double(v) : v && is_string(v) ? std::strtod(to_utf8(v).c_str(), nullptr) : 0.0; }
 float defaults_floatForKey(id self, SEL selector, id key) { return static_cast<float>(defaults_doubleForKey(self, selector, key)); }
 std::uint64_t defaults_setBoolForKey(id, SEL, std::uint64_t b, id key) { prefs().set(key, number_bool((b & 0xFF) != 0)); return 0; }
 std::uint64_t defaults_setIntegerForKey(id, SEL, std::uint64_t v, id key) { id n = number_from_int64(static_cast<std::int64_t>(v)); prefs().set(key, n); release(n); return 0; }
 std::uint64_t defaults_setDoubleForKey(id, SEL, double v, id key) { id n = number_from_double(v); prefs().set(key, n); release(n); return 0; }
+std::uint64_t defaults_setFloatForKey(id self, SEL selector, float v, id key) { return defaults_setDoubleForKey(self, selector, v, key); }
 std::uint64_t defaults_synchronize(id, SEL) { return prefs().sync(); }
 std::uint64_t defaults_registerDefaults(id, SEL, id d) {
     std::vector<id> keys;
@@ -1515,6 +1535,7 @@ void register_misc() {
     register_lifecycle<url_object>(g_url);
     FND_METHODS(g_url,
         {"path", IMP(url_path_m), "@16@0:8"},
+        {"pathComponents", IMP(url_pathComponents), "@16@0:8"},
         {"absoluteString", IMP(url_absoluteString), "@16@0:8"},
         {"relativePath", IMP(url_path_m), "@16@0:8"},
         {"scheme", IMP(url_scheme), "@16@0:8"},
@@ -1576,6 +1597,7 @@ void register_misc() {
         {"infoDictionary", IMP(bundle_infoDictionary), "@16@0:8"},
         {"localizedInfoDictionary", IMP(bundle_infoDictionary), "@16@0:8"},
         {"objectForInfoDictionaryKey:", IMP(bundle_objectForInfoDictionaryKey), "@24@0:8@16"},
+        {"pathsForResourcesOfType:inDirectory:", IMP(bundle_pathsForResourcesOfTypeInDirectory), "@32@0:8@16@24"},
         {"bundleIdentifier", IMP(bundle_bundleIdentifier), "@16@0:8"},
         {"executablePath", IMP(bundle_executablePath), "@16@0:8"},
         {"executableURL", IMP(bundle_executableURL), "@16@0:8"},
@@ -1603,6 +1625,7 @@ void register_misc() {
         {"setBool:forKey:", IMP(defaults_setBoolForKey), "v32@0:8B16@24"},
         {"setInteger:forKey:", IMP(defaults_setIntegerForKey), "v32@0:8q16@24"},
         {"setDouble:forKey:", IMP(defaults_setDoubleForKey), "v32@0:8d16@24"},
+        {"setFloat:forKey:", IMP(defaults_setFloatForKey), "v32@0:8f16@24"},
         {"synchronize", IMP(defaults_synchronize), "B16@0:8"},
         {"registerDefaults:", IMP(defaults_registerDefaults), "v24@0:8@16"});
     FND_CLASS_METHODS(g_defaults, {"standardUserDefaults", IMP(defaultsc_standardUserDefaults), "@16@0:8"});
@@ -1623,6 +1646,7 @@ void register_misc() {
 
     g_filemanager = mm_objc_define_class("NSFileManager", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSFileManager), FND_META_REF(NSFileManager));
     FND_METHODS(g_filemanager,
+        {"displayNameAtPath:", IMP(+[](id, SEL, id path) -> std::uint64_t { return send(path, "lastPathComponent"); }), "@24@0:8@16"},
         {"fileExistsAtPath:", IMP(fm_fileExistsAtPath), "B24@0:8@16"},
         {"fileExistsAtPath:isDirectory:", IMP(fm_fileExistsAtPathIsDirectory), "B32@0:8@16^B24"},
         {"isReadableFileAtPath:", IMP(fm_isReadableFileAtPath), "B24@0:8@16"},
@@ -2185,6 +2209,7 @@ static void foundation_ctor() {
     register_strings();
     register_collections();
     register_misc();
+    register_formatting();
     register_key_value();
     register_plists();
     register_task();

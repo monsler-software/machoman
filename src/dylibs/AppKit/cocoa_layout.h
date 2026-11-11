@@ -14,6 +14,16 @@ struct constraint {
     int first, attribute, second = -1, second_attribute = 0, relation = 0;
     double multiplier = 1, constant = 0, priority = 1000;
 };
+// Round shared edges, rather than widths independently, so adjacent views
+// remain adjacent and bitmap dimensions agree with their drawing bounds.
+inline frame align_edges(frame f) {
+    const double right = std::round(f.x + f.w), bottom = std::round(f.y + f.h);
+    f.x = std::round(f.x);
+    f.y = std::round(f.y);
+    f.w = std::max(0., right - f.x);
+    f.h = std::max(0., bottom - f.y);
+    return f;
+}
 inline void resize_axis(double &origin, double &length, double old_size, double delta, unsigned mask) {
     const std::array<double, 3> spans{std::max(0., origin), std::max(0., length),
                                       std::max(0., old_size - origin - length)};
@@ -153,8 +163,12 @@ inline void solve(std::vector<frame> &frames, double width, double height, const
     for (size_t i = 0; i < frames.size(); ++i)
         if (std::isfinite(result[i * 4]) && std::isfinite(result[i * 4 + 1]) && std::isfinite(result[i * 4 + 2]) &&
             std::isfinite(result[i * 4 + 3]))
-            frames[i] = {result[i * 4], result[i * 4 + 1], std::max(0., result[i * 4 + 2]),
-                         std::max(0., result[i * 4 + 3])};
+        {
+            frames[i].x = result[i * 4];
+            frames[i].y = result[i * 4 + 1];
+            frames[i].w = std::max(0., result[i * 4 + 2]);
+            frames[i].h = std::max(0., result[i * 4 + 3]);
+        }
 }
 } // namespace ak::layout
 #endif

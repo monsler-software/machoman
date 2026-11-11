@@ -30,6 +30,15 @@ int main() {
     require(near(f[0].h, 24) && near(f[1].h, 265), "scroll view stretches while button keeps intrinsic size");
     solve(f, 589, 437, c);
     require(near(f[0].x + f[0].w, 569) && near(f[0].y + f[0].h, 417), "constraints survive another resize");
+    require(f[1].width_stay == .0001 && f[1].height_stay == .0001, "solve preserves intrinsic-size weights");
+    std::vector<frame> adjacent{{0, 0, 20, 20, .0001, .0001}, {20, 0, 20, 20, .0001, .0001}};
+    solve(adjacent, 1167, 567, {{0, 5, -1, 5}, {0, 3, -1, 3}, {0, 4, -1, 4},
+                             {1, 5, 0, 6}, {1, 6, -1, 6}, {1, 3, -1, 3}, {1, 4, -1, 4},
+                             {0, 7, 1, 7}});
+    for (auto &a : adjacent) a = align_edges(a);
+    require(adjacent[0].h == 567 && adjacent[1].h == 567, "bitmap height matches rounded drawing bounds");
+    require(adjacent[0].x + adjacent[0].w == adjacent[1].x && adjacent[1].x + adjacent[1].w == 1167,
+            "rounding preserves shared edges without gaps");
     std::vector<frame> one{{0, 0, 20, 20}};
     solve(one, 100, 100, {{0, 7, -1, 0, 1, 1, 40, 999}});
     require(near(one[0].w, 40), "minimum-size inequality remains active");

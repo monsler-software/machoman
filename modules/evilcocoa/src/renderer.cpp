@@ -119,6 +119,13 @@ struct renderer::impl {
         for (auto &i : images)
             if (i.pixels == pixels)
                 return i.gl;
+        // Dirty custom views publish fresh bitmap snapshots. Drop textures
+        // whose snapshots are no longer referenced by any current view/item.
+        std::erase_if(images, [](const auto &i) {
+            if (i.pixels.use_count() != 1) return false;
+            glDeleteTextures(1, &i.gl.name);
+            return true;
+        });
         if (images.size() >= 128) {
             for (auto &i : images)
                 glDeleteTextures(1, &i.gl.name);
@@ -266,7 +273,11 @@ void renderer::draw(std::span<const item> items, int width, int height, double s
         };
         double inset = 0, right_inset = 0;
         bool middle = i.type != kind::label;
-        if (i.type == kind::button || i.type == kind::popup || i.type == kind::combo_box ||
+        if (i.type == kind::menu_item) {
+            inset = 24 * scale;
+            if (i.pressed) p.quad(r, accent, float(3 * scale));
+            if (i.checked) draw_text("✓", {r.x + 3 * scale, r.y, 18 * scale, r.h}, alignment::center);
+        } else if (i.type == kind::button || i.type == kind::popup || i.type == kind::combo_box ||
             i.type == kind::text_field) {
             if (i.bordered)
                 bezel(r, i.default_button, i.help_button ? float(std::min(r.w, r.h) / scale / 2) : 5);
@@ -282,7 +293,13 @@ void renderer::draw(std::span<const item> items, int width, int height, double s
             }
             if (i.type == kind::popup || i.type == kind::combo_box) {
                 right_inset = 24 * scale;
-                draw_text("⌄", {r.x + r.w - right_inset, r.y, right_inset, r.h}, alignment::center);
+                const double cx = r.x + r.w - right_inset / 2, cy = r.y + r.h / 2;
+                // A geometric chevron stays centered regardless of font metrics.
+                for (int step = 0; step < 4; ++step) {
+                    const double offset = step * scale;
+                    p.quad({cx - 4 * scale + offset, cy - 2 * scale + offset, 2 * scale, 2 * scale}, fg, float(scale));
+                    p.quad({cx + 3 * scale - offset, cy - 2 * scale + offset, 2 * scale, 2 * scale}, fg, float(scale));
+                }
             }
         } else if (i.type == kind::checkbox || i.type == kind::radio) {
             double side = std::min(r.h, 16 * scale), y = r.y + (r.h - side) / 2;

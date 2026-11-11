@@ -99,6 +99,7 @@ struct platform_window {
     wl_surface *surface = nullptr;
     xdg_surface *shell_surface = nullptr;
     xdg_toplevel *toplevel = nullptr;
+    xdg_popup *popup = nullptr;
 #ifdef MM_APPKIT_XDG_FOREIGN
     zxdg_exported_v2 *exported = nullptr;
     std::string exported_handle;
@@ -272,7 +273,7 @@ void pointer_motion(void *, wl_pointer *, std::uint32_t, wl_fixed_t x, wl_fixed_
     e.modifiers = s.modifiers;
     push(e);
 }
-void pointer_button(void *, wl_pointer *, std::uint32_t, std::uint32_t, std::uint32_t button, std::uint32_t pressed) {
+void pointer_button(void *, wl_pointer *, std::uint32_t serial, std::uint32_t, std::uint32_t button, std::uint32_t pressed) {
     display_state &s = state();
     /* linux/input-event-codes.h: BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112 */
     const int index = button == 0x111 ? 1 : button == 0x112 ? 2 : 0;
@@ -281,6 +282,7 @@ void pointer_button(void *, wl_pointer *, std::uint32_t, std::uint32_t, std::uin
     e.window = s.pointer_window;
     e.where = s.pointer_at;
     e.button = index;
+    e.input_serial = serial;
     e.modifiers = s.modifiers;
     if (pressed) s.buttons_down++;
     else if (s.buttons_down) s.buttons_down--;
@@ -352,11 +354,12 @@ void keyboard_leave(void *, wl_keyboard *, std::uint32_t, wl_surface *surface) {
     state().keyboard_window = nullptr;
     push(e);
 }
-void keyboard_key(void *, wl_keyboard *, std::uint32_t, std::uint32_t, std::uint32_t key, std::uint32_t pressed) {
+void keyboard_key(void *, wl_keyboard *, std::uint32_t serial, std::uint32_t, std::uint32_t key, std::uint32_t pressed) {
     display_state &s = state();
     const std::uint32_t code = key + 8; /* evdev -> xkb */
     platform_event e;
     e.kind = pressed ? event_kind::key_down : event_kind::key_up;
+    e.input_serial = serial;
     e.window = s.keyboard_window;
     e.where = s.pointer_at;
     const char *mapping = std::getenv("MACHOMAN_NATIVE_SHORTCUTS");
@@ -777,7 +780,8 @@ id platform_window_owner(platform_window *w) { return w ? w->owner : nullptr; }
 
 bool platform::available() { return connect(); }
 
-platform_window *platform::create_window(id ns_window, rect frame, const std::string &title, bool decorated, bool resizable) {
+platform_window *platform::create_window(id ns_window, rect frame, const std::string &title, bool decorated, bool resizable,
+                                          platform_window *popup_parent, rect popup_anchor, std::uint32_t popup_serial) {
     if (!connect()) return nullptr;
     display_state &s = state();
     auto *w = new platform_window;
@@ -806,63 +810,91 @@ platform_window *platform::create_window(id ns_window, rect frame, const std::st
     }
     w->shell_surface = xdg_wm_base_get_xdg_surface(s.wm_base, w->surface);
     xdg_surface_add_listener(w->shell_surface, &shell_surface_listener, w);
-    w->toplevel = xdg_surface_get_toplevel(w->shell_surface);
-    xdg_toplevel_add_listener(w->toplevel, &toplevel_listener, w);
+    if (popup_parent) {
+        auto *positioner = xdg_wm_base_create_positioner(s.wm_base);
+        xdg_positioner_set_size(positioner, std::max(1, int(frame.w)), std::max(1, int(frame.h)));
+        xdg_positioner_set_anchor_rect(positioner, int(std::round(popup_anchor.x)),
+                                      int(std::round(popup_anchor.y)) + popup_parent->menu_height,
+                                      std::max(1, int(std::round(popup_anchor.w))), std::max(1, int(std::round(popup_anchor.h))));
+        xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
+        xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+        xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y |
+                                                XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+                                                XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
+        w->popup = xdg_surface_get_popup(w->shell_surface, popup_parent->shell_surface, positioner);
+        xdg_positioner_destroy(positioner);
+        static const xdg_popup_listener listener = {
+            +[](void *data, xdg_popup *, std::int32_t x, std::int32_t y, std::int32_t width, std::int32_t height) {
+                auto *window = static_cast<platform_window *>(data);
+                window->frame.x = x; window->frame.y = y;
+                window->pending_size = {double(width), double(height)};
+            },
+            +[](void *data, xdg_popup *) {
+                platform_event event; event.kind = event_kind::close_requested;
+                event.window = static_cast<platform_window *>(data); push(event);
+            },
+            +[](void *, xdg_popup *, std::uint32_t) {}};
+        xdg_popup_add_listener(w->popup, &listener, w);
+        if (popup_serial && s.seat) xdg_popup_grab(w->popup, s.seat, popup_serial);
+    } else {
+        w->toplevel = xdg_surface_get_toplevel(w->shell_surface);
+        xdg_toplevel_add_listener(w->toplevel, &toplevel_listener, w);
 #ifdef MM_APPKIT_XDG_FOREIGN
-    if (s.exporter) {
-        w->exported = zxdg_exporter_v2_export_toplevel(s.exporter, w->surface);
-        static const zxdg_exported_v2_listener listener = {
-            +[](void *data, zxdg_exported_v2 *, const char *handle) {
-                static_cast<platform_window *>(data)->exported_handle = handle;
-            }};
-        zxdg_exported_v2_add_listener(w->exported, &listener, w);
-    }
-#endif
-    xdg_toplevel_set_title(w->toplevel, title.c_str());
-    const auto &identity = main_application_identity();
-    static const bool icon_installed = [&] {
-        const char *data = std::getenv("XDG_DATA_HOME"), *home = std::getenv("HOME");
-        const auto root = data && *data ? std::filesystem::path(data) : home && *home ? std::filesystem::path(home) / ".local/share" : std::filesystem::path{};
-        return install_application_icon(identity, root);
-    }();
-    (void)icon_installed;
-    if (std::getenv("MACHOMAN_DIAGNOSTICS"))
-        std::fprintf(stderr, "AppKit application identity: %s icon=%ux%u desktop=%s\n", identity.app_id.c_str(),
-                     identity.icon.width, identity.icon.height, icon_installed ? "installed" : "unavailable");
-    xdg_toplevel_set_app_id(w->toplevel, identity.app_id.c_str());
-#ifdef MM_APPKIT_XDG_ICON
-    if (s.icon_manager && s.shm && !identity.icon.argb.empty()) {
-        auto &buffer = w->icon_buffer;
-        buffer.width = static_cast<int>(identity.icon.width);
-        buffer.height = static_cast<int>(identity.icon.height);
-        buffer.bytes = identity.icon.argb.size() * 4;
-        const int fd = memfd_create("machoman-app-icon", MFD_CLOEXEC);
-        if (fd >= 0) {
-            if (ftruncate(fd, static_cast<off_t>(buffer.bytes)) == 0) {
-                buffer.pixels = mmap(nullptr, buffer.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                if (buffer.pixels == MAP_FAILED) buffer.pixels = nullptr;
-                if (buffer.pixels) {
-                    std::memcpy(buffer.pixels, identity.icon.argb.data(), buffer.bytes);
-                    wl_shm_pool *pool = wl_shm_create_pool(s.shm, fd, static_cast<int>(buffer.bytes));
-                    buffer.buffer = wl_shm_pool_create_buffer(pool, 0, buffer.width, buffer.height, buffer.width * 4, WL_SHM_FORMAT_ARGB8888);
-                    wl_shm_pool_destroy(pool);
-                    auto *icon = xdg_toplevel_icon_manager_v1_create_icon(s.icon_manager);
-                    xdg_toplevel_icon_v1_add_buffer(icon, buffer.buffer, 1);
-                    xdg_toplevel_icon_manager_v1_set_icon(s.icon_manager, w->toplevel, icon);
-                    xdg_toplevel_icon_v1_destroy(icon);
-                }
-            }
-            close(fd);
+        if (s.exporter) {
+            w->exported = zxdg_exporter_v2_export_toplevel(s.exporter, w->surface);
+            static const zxdg_exported_v2_listener listener = {
+                +[](void *data, zxdg_exported_v2 *, const char *handle) {
+                    static_cast<platform_window *>(data)->exported_handle = handle;
+                }};
+            zxdg_exported_v2_add_listener(w->exported, &listener, w);
         }
-    }
 #endif
-    if (!resizable) {
+        xdg_toplevel_set_title(w->toplevel, title.c_str());
+        const auto &identity = main_application_identity();
+        static const bool icon_installed = [&] {
+            const char *data = std::getenv("XDG_DATA_HOME"), *home = std::getenv("HOME");
+            const auto root = data && *data ? std::filesystem::path(data) : home && *home ? std::filesystem::path(home) / ".local/share" : std::filesystem::path{};
+            return install_application_icon(identity, root);
+        }();
+        (void)icon_installed;
+        if (std::getenv("MACHOMAN_DIAGNOSTICS"))
+            std::fprintf(stderr, "AppKit application identity: %s icon=%ux%u desktop=%s\n", identity.app_id.c_str(),
+                         identity.icon.width, identity.icon.height, icon_installed ? "installed" : "unavailable");
+        xdg_toplevel_set_app_id(w->toplevel, identity.app_id.c_str());
+#ifdef MM_APPKIT_XDG_ICON
+        if (s.icon_manager && s.shm && !identity.icon.argb.empty()) {
+            auto &buffer = w->icon_buffer;
+            buffer.width = static_cast<int>(identity.icon.width);
+            buffer.height = static_cast<int>(identity.icon.height);
+            buffer.bytes = identity.icon.argb.size() * 4;
+            const int fd = memfd_create("machoman-app-icon", MFD_CLOEXEC);
+            if (fd >= 0) {
+                if (ftruncate(fd, static_cast<off_t>(buffer.bytes)) == 0) {
+                    buffer.pixels = mmap(nullptr, buffer.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    if (buffer.pixels == MAP_FAILED) buffer.pixels = nullptr;
+                    if (buffer.pixels) {
+                        std::memcpy(buffer.pixels, identity.icon.argb.data(), buffer.bytes);
+                        wl_shm_pool *pool = wl_shm_create_pool(s.shm, fd, static_cast<int>(buffer.bytes));
+                        buffer.buffer = wl_shm_pool_create_buffer(pool, 0, buffer.width, buffer.height, buffer.width * 4, WL_SHM_FORMAT_ARGB8888);
+                        wl_shm_pool_destroy(pool);
+                        auto *icon = xdg_toplevel_icon_manager_v1_create_icon(s.icon_manager);
+                        xdg_toplevel_icon_v1_add_buffer(icon, buffer.buffer, 1);
+                        xdg_toplevel_icon_manager_v1_set_icon(s.icon_manager, w->toplevel, icon);
+                        xdg_toplevel_icon_v1_destroy(icon);
+                    }
+                }
+                close(fd);
+            }
+        }
+#endif
+    }
+    if (!resizable && w->toplevel) {
         const int width = std::max(1, static_cast<int>(w->frame.w));
         const int height = std::max(1, static_cast<int>(w->frame.h));
         xdg_toplevel_set_min_size(w->toplevel, width, height + w->menu_height);
         xdg_toplevel_set_max_size(w->toplevel, width, height + w->menu_height);
     }
-    if (!decorated) {
+    if (!decorated && !popup_parent) {
         /* Without xdg-decoration the compositor draws what it draws; an
          * undecorated window is a request we cannot make, so it is noted
          * and ignored rather than faked. */
@@ -920,6 +952,7 @@ void platform::destroy_window(platform_window *w) {
 #ifdef MM_APPKIT_XDG_FOREIGN
     if (w->exported) zxdg_exported_v2_destroy(w->exported);
 #endif
+    if (w->popup) xdg_popup_destroy(w->popup);
     if (w->toplevel) xdg_toplevel_destroy(w->toplevel);
     if (w->shell_surface) xdg_surface_destroy(w->shell_surface);
     if (w->surface) wl_surface_destroy(w->surface);

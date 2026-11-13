@@ -2,6 +2,7 @@
 #include "machoman/macho.h"
 #include "machoman/translator.h"
 #include "machoman/translation_cache.h"
+#include "machoman/environment.h"
 
 #include <algorithm>
 #include <atomic>
@@ -26,18 +27,29 @@
 #include <csignal>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <link.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <sys/syscall.h>
+#include <asm/prctl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <ucontext.h>
 #endif
 
 extern char **environ;
 
 extern "C" std::uint64_t mm_hostcall(mm_cpu_context *ctx, const void *fn);
+extern "C" void mm_native_enter(mm_cpu_context *ctx, std::uint64_t pc);
+extern "C" { thread_local std::uint64_t mm_native_entry_pc = 0; }
 static_assert(offsetof(mm_cpu_context, x) == 0 && offsetof(mm_cpu_context, v) == 384 &&
               offsetof(mm_cpu_context, host_result_in_context) == 904,
               "hostcall_x86_64.S hardcodes these offsets");
+static_assert(offsetof(mm_cpu_context, native_x) == 912 && offsetof(mm_cpu_context, native_flags) == 1040 &&
+              offsetof(mm_cpu_context, native_mode) == 1048 && offsetof(mm_cpu_context, native_v) == 1056,
+              "native_x86_64.S hardcodes these offsets");
+static_assert(offsetof(mm_cpu_context, native_hi_valid) == 1312);
+static_assert(offsetof(mm_cpu_context, native_fp) == 1328);
 
 namespace {
 
@@ -53,27 +65,36 @@ std::vector<std::uint8_t> read_whole_file(const std::filesystem::path &path) {
 }
 
 bool trace_enabled() {
-    static const bool on = std::getenv("MACHOMAN_TRACE") != nullptr;
-    return on;
+    return std::getenv("MACHOMAN_TRACE") != nullptr;
+}
+
+bool host_callable(const void *address, bool lazy) {
+#if defined(__linux__)
+    Dl_info info{};
+    void *symbol = nullptr;
+    if (dladdr1(address, &info, &symbol, RTLD_DL_SYMENT) && symbol) {
+        const auto type = ELF64_ST_TYPE(static_cast<const Elf64_Sym *>(symbol)->st_info);
+        return type == STT_FUNC || type == STT_GNU_IFUNC;
+    }
+#endif
+    return lazy;
 }
 
 bool diagnostics_enabled() {
-    static const bool on = std::getenv("MACHOMAN_DIAGNOSTICS") != nullptr;
-    return on;
+    return std::getenv("MACHOMAN_DIAGNOSTICS") != nullptr;
 }
 
 /* dyld prints every image it loads under DYLD_PRINT_LIBRARIES; our own
  * trace says the same thing, so the two share one switch. */
 bool dyld_trace_enabled() {
-    static const bool on = trace_enabled() || std::getenv("DYLD_PRINT_LIBRARIES") != nullptr;
-    return on;
+    return trace_enabled() || std::getenv("DYLD_PRINT_LIBRARIES") != nullptr;
 }
 
 /* A colon-separated list of directories from the environment, the form
  * every DYLD_* search path uses. */
-std::vector<std::string> env_path_list(const char *name) {
+std::vector<std::string> env_path_list(const char *name, mm_environment &environment) {
     std::vector<std::string> out;
-    const char *value = std::getenv(name);
+    const char *value = environment.get(name);
     if (!value) return out;
     std::string_view sv(value);
     while (!sv.empty()) {
@@ -111,7 +132,8 @@ public:
             void *got = VirtualAlloc(want, seg->vmsize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (!got) return false;
 #else
-            void *got = mmap(want, seg->vmsize, PROT_READ | PROT_WRITE,
+            const int executable = img.header->cputype == MM_CPU_TYPE_X86_64 && (seg->initprot & 4) ? PROT_EXEC : 0;
+            void *got = mmap(want, seg->vmsize, PROT_READ | PROT_WRITE | executable,
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
             if (got == MAP_FAILED || got != want) {
                 if (got != MAP_FAILED) munmap(got, seg->vmsize);
@@ -234,19 +256,24 @@ struct fault_guard {
     sigjmp_buf jump;
     std::uintptr_t rip = 0;
     std::uintptr_t addr = 0;
+    int signum = SIGSEGV, code = SEGV_MAPERR;
+    mm_cpu_context *native = nullptr;
 };
 thread_local fault_guard *g_guard = nullptr;
 thread_local unsigned g_fault_scope_depth = 0;
 std::mutex g_fault_handlers_mu;
 unsigned g_fault_handler_users = 0;
-struct sigaction g_previous_segv{}, g_previous_bus{};
+constexpr int fault_signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE};
+struct sigaction g_previous_fault[std::size(fault_signals)]{};
 
 void on_fault(int signum, siginfo_t *info, void *uctx) {
     fault_guard *g = g_guard;
     if (!g) {
         /* A host fault outside translated code belongs to the handler that
          * was installed before this runtime entered its execution scope. */
-        const auto &previous = signum == SIGBUS ? g_previous_bus : g_previous_segv;
+        std::size_t index = 0;
+        while (fault_signals[index] != signum) ++index;
+        const auto &previous = g_previous_fault[index];
         if (previous.sa_handler == SIG_IGN) return;
         if (previous.sa_handler == SIG_DFL) {
             sigaction(signum, &previous, nullptr);
@@ -258,7 +285,35 @@ void on_fault(int signum, siginfo_t *info, void *uctx) {
     auto *uc = static_cast<ucontext_t *>(uctx);
     g->rip = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
     g->addr = reinterpret_cast<std::uintptr_t>(info->si_addr);
+    g->signum = signum;
+    g->code = info->si_code;
+    if (g->native) {
+        constexpr int registers[] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                     REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+        for (int i = 0; i < 16; ++i)
+            g->native->native_x[i] = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[registers[i]]);
+        g->native->native_flags = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_EFL]);
+        g->native->native_trapno = static_cast<std::uint32_t>(uc->uc_mcontext.gregs[REG_TRAPNO]);
+        g->native->native_error = static_cast<std::uint32_t>(uc->uc_mcontext.gregs[REG_ERR]);
+        if (uc->uc_mcontext.fpregs) {
+            std::memcpy(g->native->native_fp, uc->uc_mcontext.fpregs, sizeof(g->native->native_fp));
+            std::memcpy(g->native->native_v, uc->uc_mcontext.fpregs->_xmm, sizeof(g->native->native_v));
+        }
+    }
     siglongjmp(g->jump, 1);
+}
+
+/* A native guest may switch to a fiber's stack. Probe those stack words
+ * under a fault guard; process_vm_readv is not available in every sandbox.
+ * Only memcpy runs between setjmp and longjmp, with no host state to unwind. */
+bool guarded_copy(void *destination, const void *source, std::size_t size) {
+    fault_guard guard;
+    auto *previous = g_guard;
+    g_guard = &guard;
+    const bool ok = sigsetjmp(guard.jump, 0) == 0;
+    if (ok) std::memcpy(destination, source, size);
+    g_guard = previous;
+    return ok;
 }
 
 /* Signal dispositions are process-wide; the jump target is thread-local.
@@ -268,24 +323,41 @@ class fault_handler_scope {
 public:
     fault_handler_scope() {
         if (g_fault_scope_depth++ != 0) return;
+        /* Native guests can use small fiber stacks. A Linux signal frame
+         * plus on_fault's C++ frame must never grow into guest allocations.
+         * Each host thread owns a persistent, prefaulted recovery stack;
+         * nested runs share it and the outer scope restores the host setup. */
+        static thread_local std::vector<std::uint8_t> recovery_stack(128 * 1024);
+        if (sigaltstack(nullptr, &previous_stack_) != 0) std::abort();
+        if (!(previous_stack_.ss_flags & SS_ONSTACK)) {
+            stack_t stack{};
+            stack.ss_sp = recovery_stack.data();
+            stack.ss_size = recovery_stack.size();
+            if (sigaltstack(&stack, nullptr) != 0) std::abort();
+            installed_stack_ = true;
+        }
         std::lock_guard lock(g_fault_handlers_mu);
         if (g_fault_handler_users++ != 0) return;
         struct sigaction sa{};
         sa.sa_sigaction = on_fault;
-        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &g_previous_segv);
-        sigaction(SIGBUS, &sa, &g_previous_bus);
+        for (std::size_t i = 0; i < std::size(fault_signals); ++i)
+            sigaction(fault_signals[i], &sa, &g_previous_fault[i]);
     }
     ~fault_handler_scope() {
         if (--g_fault_scope_depth != 0) return;
+        if (installed_stack_ && sigaltstack(&previous_stack_, nullptr) != 0) std::abort();
         std::lock_guard lock(g_fault_handlers_mu);
         if (--g_fault_handler_users != 0) return;
-        sigaction(SIGSEGV, &g_previous_segv, nullptr);
-        sigaction(SIGBUS, &g_previous_bus, nullptr);
+        for (std::size_t i = 0; i < std::size(fault_signals); ++i)
+            sigaction(fault_signals[i], &g_previous_fault[i], nullptr);
     }
     fault_handler_scope(const fault_handler_scope &) = delete;
     fault_handler_scope &operator=(const fault_handler_scope &) = delete;
+private:
+    stack_t previous_stack_{};
+    bool installed_stack_ = false;
 };
 #endif
 
@@ -547,7 +619,8 @@ bool is_ctor_or_dtor(std::string_view symbol) {
 /* Loads images and resolves symbols; see the linking notes in runtime.h. */
 class linker {
 public:
-    linker(const mm_venv &venv, std::filesystem::path exe_dir) : venv_(venv), exe_dir_(std::move(exe_dir)) {}
+    linker(const mm_venv &venv, std::filesystem::path exe_dir, mm_environment &environment)
+        : venv_(venv), exe_dir_(std::move(exe_dir)), environment_(environment) {}
     ~linker() {
         /* Images first (their translations reference nothing in host libs), then host libs. */
         images_.clear();
@@ -560,6 +633,42 @@ public:
     std::vector<std::unique_ptr<guest_image>> &images() { return images_; }
     std::vector<std::unique_ptr<host_lib>> &host_libs() { return host_libs_; }
 
+    /* A host DSO can hide its dependency's lifecycle hook by defining the
+     * same name. Include the already-loaded ELF dependency closure so, for
+     * example, a C program using blocks initializes libobjc even without
+     * an explicit Mach-O libobjc load command. NOLOAD never loads new code. */
+    void include_host_dependencies() {
+#if !defined(_WIN32)
+        for (std::size_t index = 0; index < host_libs_.size(); ++index) {
+            if (!host_libs_[index]->handle) continue;
+            link_map *map = nullptr;
+            if (dlinfo(host_libs_[index]->handle, RTLD_DI_LINKMAP, &map) != 0 || !map || !map->l_ld) continue;
+            const char *strings = nullptr;
+            for (auto *entry = map->l_ld; entry->d_tag != DT_NULL; ++entry)
+                if (entry->d_tag == DT_STRTAB) strings = reinterpret_cast<const char *>(entry->d_un.d_ptr);
+            if (!strings) continue;
+            for (auto *entry = map->l_ld; entry->d_tag != DT_NULL; ++entry) {
+                if (entry->d_tag != DT_NEEDED) continue;
+                const char *name = strings + entry->d_un.d_val;
+                void *handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
+                if (!handle) continue;
+                const bool known = std::any_of(host_libs_.begin(), host_libs_.end(),
+                    [&](const auto &library) { return library->handle == handle; });
+                if (known) { dlclose(handle); continue; }
+                link_map *dependency_map = nullptr;
+                if (dlinfo(handle, RTLD_DI_LINKMAP, &dependency_map) != 0 || !dependency_map) {
+                    dlclose(handle); continue;
+                }
+                auto library = std::make_unique<host_lib>();
+                library->install_name = name;
+                library->path = dependency_map->l_name;
+                library->handle = handle;
+                host_libs_.push_back(std::move(library));
+            }
+        }
+#endif
+    }
+
     /* Maps the executable at its fixed addresses and loads its dependency
      * closure. Returns null on failure (details on stderr). */
     guest_image *load_executable(const std::filesystem::path &path, std::vector<std::uint8_t> file, const mm_macho_image &img) {
@@ -569,7 +678,8 @@ public:
         image->file = std::move(file);
         image->img = img;
         image->img.data = image->file; /* the parse aliased the caller's buffer; re-alias ours */
-        if (mm_macho_parse(image->file, image->img) != mm_macho_status::ok)
+        if (mm_macho_parse(image->file, image->img) != mm_macho_status::ok ||
+            (image->img.header->cputype != MM_CPU_TYPE_ARM64 && image->img.header->cputype != MM_CPU_TYPE_X86_64))
             return nullptr;
         image->slide = 0;
         if (!image->mapping.map(image->img, 0)) {
@@ -584,7 +694,7 @@ public:
          * injected on macOS. They become dependencies of the executable, so
          * their initializers run before its own and their exports take part
          * in symbol lookup. */
-        for (const auto &inserted : env_path_list("DYLD_INSERT_LIBRARIES")) {
+        for (const auto &inserted : env_path_list("DYLD_INSERT_LIBRARIES", environment_)) {
             const dependency d = load_dependency(inserted, *raw);
             if (!d.guest && !d.host)
                 std::fprintf(stderr, "dyld: could not insert %s\n", inserted.c_str());
@@ -644,9 +754,11 @@ public:
      * `image` through dylib `ordinal`. Guest definitions win within the
      * named library; otherwise every image and host library is searched,
      * since umbrella frameworks re-export what other libraries define. */
-    void lookup(guest_image &image, int ordinal, std::string_view symbol, bool lazy, std::uint64_t &guest, void *&host) {
+    void lookup(guest_image &image, int ordinal, std::string_view symbol, bool lazy, std::uint64_t &guest, void *&host,
+                bool *from_resolver = nullptr) {
         guest = 0;
         host = nullptr;
+        if (from_resolver) *from_resolver = false;
         const std::string name = strip_variant(symbol);
         if (ordinal >= 1 && static_cast<std::size_t>(ordinal) <= image.deps.size()) {
             const dependency &d = image.deps[static_cast<std::size_t>(ordinal) - 1];
@@ -675,7 +787,10 @@ public:
              * statically (a framework stub deriving constants and stub
              * functions from the name). Only the library the bind actually
              * names is asked, so a stub never shadows another library. */
-            if (d.host && (host = host_synthesise(*d.host, name, lazy))) return;
+            if (d.host && (host = host_synthesise(*d.host, name, lazy))) {
+                if (from_resolver) *from_resolver = true;
+                return;
+            }
         } else if (ordinal == 0) { /* BIND_SPECIAL_DYLIB_SELF */
             std::vector<const guest_image *> seen;
             if ((guest = guest_lookup(image, name, seen))) return;
@@ -695,7 +810,7 @@ public:
          * naming `_exp2` must reach libc rather than a stub. */
         if (ordinal >= 1 && static_cast<std::size_t>(ordinal) <= image.deps.size())
             if (const dependency &d = image.deps[static_cast<std::size_t>(ordinal) - 1]; d.host)
-                host = host_synthesise(*d.host, name, lazy);
+                if ((host = host_synthesise(*d.host, name, lazy)) && from_resolver) *from_resolver = true;
     }
 
     bool preserves_registers(std::string_view symbol) {
@@ -759,7 +874,7 @@ private:
         const std::string leaf = fs::path(std::string(install_name)).filename().string();
         const std::string framework = framework_partial_path(install_name);
         auto env_candidates = [&](const char *variable, std::vector<fs::path> &into) {
-            for (const auto &dir : env_path_list(variable)) {
+            for (const auto &dir : env_path_list(variable, environment_)) {
                 const bool frameworks = std::string_view(variable).find("FRAMEWORK") != std::string_view::npos;
                 if (frameworks && framework.empty()) continue;
                 const std::string rest = frameworks ? framework : leaf;
@@ -784,14 +899,17 @@ private:
 
         std::vector<fs::path> roots;
         /* DYLD_ROOT_PATH is a whole alternate system root; it precedes the venv. */
-        for (const auto &r : env_path_list("DYLD_ROOT_PATH")) roots.emplace_back(r);
+        for (const auto &r : env_path_list("DYLD_ROOT_PATH", environment_)) roots.emplace_back(r);
         roots.push_back(venv_.root);
-        for (const auto &r : env_path_list("MACHOMAN_DYLIB_PATH")) roots.emplace_back(r);
+        for (const auto &r : env_path_list("MACHOMAN_DYLIB_PATH", environment_)) roots.emplace_back(r);
         std::error_code ec;
 #if !defined(_WIN32)
         /* Development convenience: the dylibs built next to the machoman binary. */
-        if (const auto self = fs::read_symlink("/proc/self/exe", ec); !ec)
+        if (const auto self = fs::read_symlink("/proc/self/exe", ec); !ec) {
+            if (referrer.img.header->cputype == MM_CPU_TYPE_X86_64)
+                roots.push_back(self.parent_path() / "dylibs/x86_64");
             roots.push_back(self.parent_path() / "dylibs");
+        }
 #endif
         fs::path host, guest;
         auto consider = [&](fs::path p) -> bool {
@@ -820,8 +938,9 @@ private:
         image->install_name = std::string(install_name);
         image->file = read_whole_file(path);
         if (image->file.empty() || mm_macho_parse(image->file, image->img) != mm_macho_status::ok ||
+            image->img.header->cputype != images_.front()->img.header->cputype ||
             image->img.header->filetype != MM_MH_DYLIB) {
-            std::fprintf(stderr, "dyld: %s is not an arm64 Mach-O dylib\n", path.c_str());
+            std::fprintf(stderr, "dyld: %s is not a matching-architecture Mach-O dylib\n", path.c_str());
             return nullptr;
         }
         /* Contiguous region for all segments at the next free base. */
@@ -942,6 +1061,7 @@ private:
 
     const mm_venv &venv_;
     std::filesystem::path exe_dir_;
+    mm_environment &environment_;
     std::vector<std::unique_ptr<guest_image>> images_;   /* load order; [0] is the executable */
     std::vector<std::unique_ptr<host_lib>> host_libs_;
     std::uint64_t next_base_ = 0x200000000ull;           /* dylibs are placed from here upwards */
@@ -976,7 +1096,9 @@ std::string nearest_symbol(const guest_image &g, std::uint64_t va) {
 std::string describe_pc(linker &ld, std::uint64_t va) {
     char buf[256];
     const guest_image *g = ld.image_for(va);
-    if (g && va >= g->code.addr && va - g->code.addr + 4 <= g->code.bytes.size()) {
+    if (g && g->img.header->cputype == MM_CPU_TYPE_X86_64 && va >= g->code.addr && va - g->code.addr < g->code.bytes.size()) {
+        std::snprintf(buf, sizeof buf, "0x%llx (x86_64) %s", static_cast<unsigned long long>(va), nearest_symbol(*g, va).c_str());
+    } else if (g && va >= g->code.addr && va - g->code.addr + 4 <= g->code.bytes.size()) {
         std::uint32_t raw = 0;
         std::memcpy(&raw, g->code.bytes.data() + (va - g->code.addr), 4);
         const mm_a64_insn insn = mm_a64_decode(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(&raw), 4), va);
@@ -1030,7 +1152,7 @@ void print_backtrace(linker &ld, const mm_cpu_context &ctx) {
     }
 }
 
-/* Darwin arm64 signal frame layouts (from <sys/signal.h>, <mach/arm/_structs.h>). */
+/* Darwin signal frames, from <sys/signal.h> and <mach/{arm,i386}/_structs.h>. */
 struct darwin_siginfo {
     std::int32_t signo, errno_, code, pid;
     std::uint32_t uid;
@@ -1046,6 +1168,15 @@ struct darwin_mcontext {
     std::uint64_t v[32][2];        /* neon state: v0-v31 */
     std::uint32_t fpsr, fpcr;
 };
+struct darwin_x86_mcontext {
+    struct { std::uint16_t trapno, cpu; std::uint32_t err; std::uint64_t faultvaddr; } es;
+    struct { std::uint64_t registers[16], rip, rflags, cs, fs, gs; } ss;
+    struct { std::uint32_t reserved[2]; std::uint8_t fx[512]; std::uint32_t reserved1; } fs;
+};
+static_assert(sizeof(darwin_x86_mcontext) == 712);
+static_assert(offsetof(darwin_x86_mcontext, ss) == 16 && offsetof(darwin_x86_mcontext, fs) == 184);
+constexpr int darwin_x86_registers[] = {MM_RAX, MM_RBX, MM_RCX, MM_RDX, MM_RDI, MM_RSI, MM_RBP, MM_RSP,
+                                      MM_R8, MM_R9, MM_R10, MM_R11, MM_R12, MM_R13, MM_R14, MM_R15};
 struct darwin_ucontext {
     std::int32_t uc_onstack;
     std::uint32_t uc_sigmask;
@@ -1070,6 +1201,7 @@ struct host_call_frame {
 struct guest_thread {
     std::uint64_t id = 0;
     mm_cpu_context ctx;
+    std::uint64_t native_tls[512] = {};
     std::vector<std::uint64_t> stack;
     std::thread host;
     mm_runtime_status status = mm_runtime_status::ok;
@@ -1079,7 +1211,13 @@ struct guest_thread {
     mm_callback_result callback_failure;
     const host_call_frame *host_calls = nullptr;
     /* Frames of signal handlers currently running on this thread. */
-    struct signal_frame { mm_cpu_context saved; std::unique_ptr<darwin_siginfo> info; std::unique_ptr<darwin_ucontext> uc; std::unique_ptr<darwin_mcontext> mc; };
+    struct signal_frame {
+        mm_cpu_context saved;
+        std::unique_ptr<darwin_siginfo> info;
+        std::unique_ptr<darwin_ucontext> uc;
+        std::unique_ptr<darwin_mcontext> mc;
+        std::unique_ptr<darwin_x86_mcontext> native_mc;
+    };
     std::vector<signal_frame> signal_frames;
 };
 
@@ -1087,20 +1225,17 @@ struct guest_thread {
  * process; host dylibs reach it through the mm_host_api callbacks. */
 class guest_process {
 public:
-    guest_process(const mm_venv &venv, std::span<char *const> args, const std::filesystem::path &exe_path)
-        : exe_path_(exe_path), linker_(venv, std::filesystem::weakly_canonical(exe_path).parent_path()) {
+    guest_process(const mm_venv &venv, std::span<char *const> args, const std::filesystem::path &exe_path,
+                  mm_environment &environment, std::string launcher)
+        : exe_path_(exe_path), environment_(environment), venv_root_(std::filesystem::absolute(venv.root).string()),
+          launcher_(std::move(launcher)), executable_path_(exe_path.string()),
+          linker_(venv, std::filesystem::weakly_canonical(exe_path).parent_path(), environment) {
         if (args.empty())
             arg_storage_.push_back(exe_path.string());
         for (char *a : args)
             arg_storage_.emplace_back(a);
         for (auto &a : arg_storage_) argv_.push_back(a.data());
         argv_.push_back(nullptr);
-        /* The guest inherits the host environment, as a process started by
-         * dyld would: programs read TMPDIR, HOME and their own variables
-         * from it, and an empty environment breaks them in obscure ways. */
-        for (char **e = environ; e && *e; e++) env_storage_.emplace_back(*e);
-        for (auto &e : env_storage_) envp_.push_back(e.data());
-        envp_.push_back(nullptr);
         /* dyld's "apple" array; its first entry is the executable path. */
         apple_storage_.push_back("executable_path=" + exe_path.string());
         for (auto &a : apple_storage_) apple_.push_back(a.data());
@@ -1123,6 +1258,8 @@ public:
             }
         }
 #endif
+        environment_.bind(nullptr);
+        if (g_process == this) g_process = nullptr;
     }
     /* dyld runs these before main, dependencies first. */
     std::vector<std::uint64_t> initializers(const guest_image &g) const;
@@ -1140,6 +1277,23 @@ public:
     static int api_prepare_guest_callback(std::uint64_t fn_va, std::size_t stack_size, void **handle);
     static int api_invoke_guest_callback(void *handle, const std::uint64_t *args, int nargs, mm_callback_result *result);
     static int api_release_guest_callback(void *handle);
+    static std::uint64_t api_lookup_symbol(const char *name);
+    static int api_copy_guest_memory(void *destination, const void *source, std::size_t size);
+    static char ***api_environment() { return g_process->environment_.slot(); }
+    static char *api_environment_get(const char *name) { return g_process->environment_.get(name); }
+    static int api_environment_set(const char *name, const char *value, int overwrite) {
+        const int error=g_process->environment_.set(name, value, overwrite);
+        g_process->api_.envp=g_process->environment_.data(); return error;
+    }
+    static int api_environment_unset(const char *name) {
+        const int error=g_process->environment_.unset(name);
+        g_process->api_.envp=g_process->environment_.data(); return error;
+    }
+    static int api_environment_put(char *entry) {
+        const int error=g_process->environment_.put(entry);
+        g_process->api_.envp=g_process->environment_.data(); return error;
+    }
+    static void api_bind_environment(char ***storage) { g_process->environment_.bind(storage); }
     static bool api_is_guest_code(std::uint64_t va);
     static const char *api_unresolved_import_name(std::uint64_t va);
     static void api_atexit_register(std::uint64_t fn_va, std::uint64_t arg);
@@ -1169,16 +1323,24 @@ private:
     const bound_import *host_target(const void *target);
 
     std::filesystem::path exe_path_;
+    mm_environment &environment_;
+    std::string venv_root_, launcher_, executable_path_;
     linker linker_;
     guest_image *main_ = nullptr;
     std::vector<bound_import> imports_;
+    struct interposition { std::uint64_t original, replacement; const guest_image *owner; };
+    std::vector<interposition> interpositions_;
     std::unordered_map<const void *, std::size_t> import_by_host_;
     std::mutex dladdr_mu_;
     std::vector<std::unique_ptr<bound_import>> dladdr_imports_; /* host targets discovered at run time */
     import_traps traps_;
-    std::vector<std::string> arg_storage_, env_storage_, apple_storage_;
-    std::vector<char *> argv_, envp_, apple_;
+    std::vector<std::string> arg_storage_, apple_storage_;
+    std::vector<char *> argv_, apple_;
     mm_host_api api_{};
+    std::vector<std::pair<mm_dylib_boundary_fn, mm_dylib_boundary_fn>> boundary_hooks_;
+    std::vector<mm_dylib_thread_exit_fn> thread_exit_hooks_;
+    void enter_guest_boundary() { for (const auto &[enter, leave] : boundary_hooks_) { (void)leave; enter(); } }
+    void leave_guest_boundary() { for (const auto &[enter, leave] : boundary_hooks_) { (void)enter; leave(); } }
 
     std::mutex atexit_mu_;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> atexit_;
@@ -1186,6 +1348,7 @@ private:
     std::mutex signals_mu_;
     guest_signal signals_[33];
     std::uint64_t sigreturn_va_ = 0; /* trap address a signal handler returns to */
+    std::uint64_t native_return_va_ = 0;
 
     std::mutex threads_mu_;
     std::uint64_t next_thread_id_ = 1;
@@ -1193,6 +1356,15 @@ private:
 
     static inline guest_process *g_process = nullptr;
     static inline thread_local guest_thread *g_current = nullptr;
+    static inline thread_local mm_environment *fork_environment_ = nullptr;
+    static void prepare_environment_fork() {
+        fork_environment_=g_process ? &g_process->environment_ : nullptr;
+        if (fork_environment_) fork_environment_->prepare_fork();
+    }
+    static void finish_environment_fork() {
+        if (fork_environment_) fork_environment_->finish_fork();
+        fork_environment_=nullptr;
+    }
 
     struct callback_binding {
         guest_process *process;
@@ -1228,9 +1400,12 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
             imp.returns_this = imp.host && is_ctor_or_dtor(b.symbol);
             imports_.push_back(std::move(imp));
         }
-    if (!traps_.reserve(imports_.size() + 1))
+    const auto trap_count = imports_.size() + 1026;
+    imports_.reserve(trap_count - 2);
+    if (!traps_.reserve(trap_count))
         return mm_runtime_status::map_failed;
-    sigreturn_va_ = traps_.va(imports_.size());
+    sigreturn_va_ = traps_.va(trap_count - 2);
+    native_return_va_ = traps_.va(trap_count - 1);
     std::size_t unresolved = 0;
     for (std::size_t i = 0; i < imports_.size(); i++) {
         const auto &imp = imports_[i];
@@ -1240,7 +1415,11 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
         } else if (imp.guest) {
             value = imp.guest + static_cast<std::uint64_t>(imp.bind.addend);
         } else if (imp.host) {
-            value = reinterpret_cast<std::uintptr_t>(imp.host) + static_cast<std::uint64_t>(imp.bind.addend);
+            /* Even ABI-compatible libc functions cross the boundary: guest
+             * errno writes must reach libc before it executes. */
+            value = main_->img.header->cputype == MM_CPU_TYPE_X86_64 && host_callable(imp.host, imp.bind.lazy)
+                ? traps_.va(i) : reinterpret_cast<std::uintptr_t>(imp.host);
+            value += static_cast<std::uint64_t>(imp.bind.addend);
             import_by_host_.emplace(imp.host, i);
         } else if (imp.bind.weak) {
             value = 0; /* weak import that nobody provides */
@@ -1257,17 +1436,59 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
     if (dyld_trace_enabled())
         std::fprintf(stderr, "dyld: %zu images, %zu imports, %zu unresolved\n", linker_.images().size(), imports_.size(), unresolved);
 
-    api_ = mm_host_api{3, reinterpret_cast<const void *>(main_->header_va()),
-                       static_cast<int>(arg_storage_.size()), argv_.data(), envp_.data(),
+    /* DYLD_INTERPOSE pairs contain {replacement, original}. The original
+     * is already bound above; native host traps identify the same original
+     * function even when different import slots have different trap VAs.
+     * The interposing image retains its original imports for fallbacks. */
+    for (const auto &image : linker_.images())
+        for (const auto *segment : image->img.segments)
+            for (const auto &section : image->img.sections(*segment)) {
+                if (mm_macho_name(section.sectname) != "__interpose") continue;
+                for (std::uint64_t offset = 0; offset + 16 <= section.size; offset += 16) {
+                    std::uint64_t pair[2];
+                    std::memcpy(pair, reinterpret_cast<const void *>(section.addr + image->slide + offset), sizeof pair);
+                    const auto trap = traps_.index_of(pair[1]);
+                    if (trap >= 0 && static_cast<std::size_t>(trap) < imports_.size()) {
+                        const auto &imported = imports_[static_cast<std::size_t>(trap)];
+                        pair[1] = imported.guest ? imported.guest : reinterpret_cast<std::uintptr_t>(imported.host);
+                    }
+                    if (pair[0] && pair[1]) interpositions_.push_back({pair[1], pair[0], image.get()});
+                }
+            }
+    std::size_t replaced = 0;
+    for (const auto &imported : imports_) {
+        if (imported.bind.weak_table) continue;
+        const auto original = imported.guest ? imported.guest : reinterpret_cast<std::uintptr_t>(imported.host);
+        for (const auto &interpose : interpositions_) {
+            if (interpose.owner == imported.image || interpose.original != original) continue;
+            const auto replacement = interpose.replacement + static_cast<std::uint64_t>(imported.bind.addend);
+            std::memcpy(reinterpret_cast<void *>(imported.bind.address + imported.image->slide), &replacement, 8);
+            ++replaced;
+            break;
+        }
+    }
+    if (dyld_trace_enabled() && replaced)
+        std::fprintf(stderr, "dyld: applied %zu interposed bindings from %zu replacement pairs\n", replaced, interpositions_.size());
+
+    api_ = mm_host_api{6, reinterpret_cast<const void *>(main_->header_va()),
+                       static_cast<int>(arg_storage_.size()), argv_.data(), environment_.data(),
                        &api_thread_create, &api_thread_join, &api_thread_self, &api_thread_stack,
                        &api_fpcr_get, &api_fpcr_set, &api_current_context, &api_signal_install,
                        &api_call_guest, &api_is_guest_code, &api_unresolved_import_name,
                        &api_atexit_register, &api_atexit_run,
                        &api_image_count, &api_image_header, &api_image_slide, &api_image_path, &api_image_for_address,
                        &api_print_guest_backtrace,
-                       &api_prepare_guest_callback, &api_invoke_guest_callback, &api_release_guest_callback};
+                       &api_prepare_guest_callback, &api_invoke_guest_callback, &api_release_guest_callback,
+                       &api_lookup_symbol, &api_copy_guest_memory,
+                       &api_environment, &api_environment_get, &api_environment_set, &api_environment_unset,
+                       &api_environment_put, &api_bind_environment, venv_root_.c_str(), launcher_.c_str(), executable_path_.c_str()};
     g_process = this;
 #if !defined(_WIN32)
+    /* Register before guest atfork handlers. Prepare runs last and unlock
+     * runs first, so guest callbacks can themselves change the environment. */
+    static const int environment_fork_registration=::pthread_atfork(
+        prepare_environment_fork, finish_environment_fork, finish_environment_fork);
+    if (environment_fork_registration) return mm_runtime_status::map_failed;
     /* SIGQUIT (^\ or `kill -QUIT`) dumps every guest thread's stack, which
      * is the only way to see where a hung guest is standing: translated
      * code holds no host state, so a host debugger's backtrace stops at
@@ -1287,6 +1508,7 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
     /* dlsym searches a library's dependencies too, so several libraries can
      * report the same initializer (every stub framework sees libobjc's);
      * call each distinct one once. */
+    linker_.include_host_dependencies();
     std::vector<mm_dylib_init_fn> initialized;
     for (auto &h : linker_.host_libs()) {
         if (!h->handle) continue;
@@ -1295,9 +1517,24 @@ mm_runtime_status guest_process::load(std::vector<std::uint8_t> file, const mm_m
         initialized.push_back(init);
         init(&api_);
     }
+    for (auto &h : linker_.host_libs()) {
+        if (!h->handle) continue;
+        const auto enter = reinterpret_cast<mm_dylib_boundary_fn>(dlsym(h->handle, "machoman_dylib_guest_enter"));
+        const auto leave = reinterpret_cast<mm_dylib_boundary_fn>(dlsym(h->handle, "machoman_dylib_guest_leave"));
+        const auto hooks = std::pair{enter, leave};
+        if (enter && leave && std::find(boundary_hooks_.begin(), boundary_hooks_.end(), hooks) == boundary_hooks_.end())
+            boundary_hooks_.push_back(hooks);
+        const auto thread_exit = reinterpret_cast<mm_dylib_thread_exit_fn>(dlsym(h->handle, "machoman_dylib_thread_exit"));
+        if (thread_exit && std::find(thread_exit_hooks_.begin(), thread_exit_hooks_.end(), thread_exit) == thread_exit_hooks_.end())
+            thread_exit_hooks_.push_back(thread_exit);
+    }
 #endif
 
     for (auto &g : linker_.images()) {
+        if (g->img.header->cputype == MM_CPU_TYPE_X86_64) {
+            if (dyld_trace_enabled()) std::fprintf(stderr, "native: %s (x86_64, no translation)\n", g->path.c_str());
+            continue;
+        }
         const auto cached = mm_translate_cached(g->path, g->file, g->code.bytes, g->code.addr, g->result);
         if (trace_enabled() || std::getenv("MACHOMAN_CACHE_TRACE"))
             std::fprintf(stderr, "translation cache: %s: %s\n", g->path.c_str(),
@@ -1346,9 +1583,84 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
      * come back afterwards rather than being cleared. */
     guest_thread *const outer = g_current;
     g_current = &t;
+    const bool native = main_->img.header->cputype == MM_CPU_TYPE_X86_64;
+    if (native) {
+        t.ctx.native_mode = 1;
+        // Swift-context callbacks pass swiftself in r13, like arm64 x20.
+        // Initial thread contexts are zero; nested calls may supply a self.
+        const auto swift_self = t.ctx.native_x[MM_R13];
+        std::memset(t.ctx.native_x, 0, sizeof t.ctx.native_x);
+        t.ctx.native_x[MM_R13] = swift_self;
+        constexpr int arguments[] = {MM_RDI, MM_RSI, MM_RDX, MM_RCX, MM_R8, MM_R9};
+        for (int i = 0; i < 6; ++i) t.ctx.native_x[arguments[i]] = t.ctx.x[i];
+        t.ctx.native_x[MM_RSP] = t.ctx.x[31] - 8;
+        const std::uint64_t initial_stack[] = {native_return_va_, t.ctx.x[6], t.ctx.x[7]};
+        std::memcpy(reinterpret_cast<void *>(t.ctx.native_x[MM_RSP]), initial_stack, sizeof initial_stack);
+        std::memcpy(t.ctx.native_v, t.ctx.v, sizeof(t.ctx.v[0]) * 16);
+#if !defined(_WIN32)
+        asm volatile("fxsave %0" : "=m" (t.ctx.native_fp));
+#endif
+        t.ctx.native_flags = 0x202;
+        t.native_tls[0] = reinterpret_cast<std::uintptr_t>(t.native_tls);
+    }
     mm_runtime_status st;
     for (;;) {
-        st = main_->runtime->run(t.ctx, pc); /* any image's trampoline reaches every translation via the code map */
+        int native_signal = 11, native_signal_code = 1;
+        if (native) {
+#if !defined(_WIN32)
+            fault_guard guard;
+            guard.native = &t.ctx;
+            auto *previous = g_guard;
+            g_guard = &guard;
+            unsigned long previous_gs = 0;
+            syscall(SYS_arch_prctl, ARCH_GET_GS, &previous_gs);
+            syscall(SYS_arch_prctl, ARCH_SET_GS, t.native_tls);
+            alignas(16) std::uint8_t host_fp[512];
+            asm volatile("fxsave %0" : "=m" (host_fp));
+            enter_guest_boundary();
+            if (sigsetjmp(guard.jump, 0) == 0) mm_native_enter(&t.ctx, pc);
+            leave_guest_boundary();
+            asm volatile("fxrstor %0" : : "m" (host_fp));
+            syscall(SYS_arch_prctl, ARCH_SET_GS, previous_gs);
+            g_guard = previous;
+            t.ctx.fault_va = guard.rip;
+            t.ctx.fault_addr = guard.addr;
+            t.ctx.x[29] = t.ctx.native_x[MM_RBP];
+            if (guard.rip == native_return_va_) {
+                t.ctx.x[0] = t.ctx.native_x[MM_RAX];
+                t.ctx.x[31] = t.ctx.native_x[MM_RSP];
+                st = mm_runtime_status::ok;
+                break;
+            }
+            constexpr int arguments[] = {MM_RDI, MM_RSI, MM_RDX, MM_RCX, MM_R8, MM_R9};
+            for (int i = 0; i < 6; ++i) t.ctx.x[i] = t.ctx.native_x[arguments[i]];
+            const auto sp = t.ctx.native_x[MM_RSP];
+            const auto stack_begin = reinterpret_cast<std::uintptr_t>(t.stack.data());
+            const auto stack_end = stack_begin + t.stack.size() * sizeof(std::uint64_t);
+            std::uint64_t words[3];
+            if (sp >= stack_begin && sp <= stack_end - sizeof words)
+                std::memcpy(words, reinterpret_cast<const void *>(sp), sizeof words);
+            else if (sp > UINT64_MAX - sizeof words ||
+                     !guarded_copy(words, reinterpret_cast<const void *>(sp), sizeof words)) {
+                st = mm_runtime_status::memory_fault; break;
+            }
+            t.ctx.x[30] = words[0];
+            t.ctx.x[6] = words[1];
+            t.ctx.x[7] = words[2];
+            t.ctx.x[31] = sp + 24;
+            std::memcpy(t.ctx.v, t.ctx.native_v, sizeof t.ctx.native_v);
+            st = guard.signum == SIGSEGV && traps_.index_of(guard.rip) >= 0
+                ? mm_runtime_status::bad_target : mm_runtime_status::memory_fault;
+            native_signal = guard.signum == SIGBUS ? 10 : guard.signum;
+            native_signal_code = guard.code > 0 && guard.code < 128 ? guard.code : 1;
+#else
+            st = mm_runtime_status::unsupported_arch;
+#endif
+        } else {
+            enter_guest_boundary();
+            st = main_->runtime->run(t.ctx, pc);
+            leave_guest_boundary();
+        }
         if (st == mm_runtime_status::unsupported_insn || st == mm_runtime_status::memory_fault ||
             st == mm_runtime_status::brk) {
             if (t.prepared_execution) break;
@@ -1356,10 +1668,12 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             std::uint64_t addr = t.ctx.fault_va;
             if (st == mm_runtime_status::memory_fault) { signum = 11; code = 1; addr = t.ctx.fault_addr; } /* SIGSEGV, SEGV_MAPERR */
             if (st == mm_runtime_status::brk) { signum = 5; code = 1; }                                       /* SIGTRAP */
+            if (native) { signum = native_signal; code = native_signal_code; }
             if (const std::uint64_t handler = deliver_signal(t, signum, code, addr)) {
-                if (trace_enabled())
-                    std::fprintf(stderr, "signal: %d at 0x%llx -> handler 0x%llx\n", signum,
-                                 static_cast<unsigned long long>(t.ctx.fault_va), static_cast<unsigned long long>(handler));
+                if (trace_enabled() || diagnostics_enabled())
+                    std::fprintf(stderr, "signal: %d code %d at 0x%llx accessing 0x%llx -> handler 0x%llx\n", signum,
+                                 code, static_cast<unsigned long long>(t.ctx.fault_va),
+                                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(handler));
                 pc = handler;
                 continue;
             }
@@ -1373,7 +1687,10 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             continue;
         }
         const std::ptrdiff_t trap = traps_.index_of(t.ctx.fault_va);
-        if (trap >= 0) {
+        const bound_import *native_import = nullptr;
+        if (trap >= 0 && static_cast<std::size_t>(trap) < imports_.size() && native)
+            native_import = &imports_[static_cast<std::size_t>(trap)];
+        if (trap >= 0 && (!native_import || !native_import->host)) {
             if (t.prepared_execution) { st = mm_runtime_status::unresolved_import; break; }
             const auto &imp = imports_[static_cast<std::size_t>(trap)];
             const auto &dylibs = imp.image->img.dylibs;
@@ -1384,7 +1701,7 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             st = mm_runtime_status::unresolved_import;
             break;
         }
-        const void *target = reinterpret_cast<const void *>(t.ctx.fault_va);
+        const void *target = native_import ? native_import->host : reinterpret_cast<const void *>(t.ctx.fault_va);
         const bound_import *it = nullptr;
         if (t.prepared_execution) {
             if (const auto found = import_by_host_.find(target); found != import_by_host_.end())
@@ -1407,9 +1724,10 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             std::fprintf(stderr, "call: %s(0x%llx, 0x%llx, 0x%llx)\n", symbol_name(*it).c_str(),
                          static_cast<unsigned long long>(t.ctx.x[0]), static_cast<unsigned long long>(t.ctx.x[1]),
                          static_cast<unsigned long long>(t.ctx.x[2]));
-        /* mm_hostcall forwards x0-x7 and v0-v7 per the SysV ABI and writes
-         * the integer/FP results back into x0/x1 and v0/v1. Stack-passed
-         * guest arguments beyond eight are not forwarded yet. */
+        /* mm_hostcall forwards x0-x7, v0-v7 and six stack words to SysV.
+         * Adapters read packed narrow Darwin arm64 stack arguments by type.
+         * Integer/FP results return in x0 and v0/v1; x1 needs an explicit
+         * two-word return override. */
         t.ctx.resume_va = 0;
         t.ctx.host_tail_fn = 0;
         auto call_host = [&](const void *fn) {
@@ -1423,7 +1741,9 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
                 std::memcpy(frame.args, t.ctx.x, sizeof frame.args);
                 t.host_calls = &frame;
             }
+            enter_guest_boundary();
             mm_hostcall(&t.ctx, fn);
+            leave_guest_boundary();
             if (!t.prepared_execution && diagnostics_enabled()) t.host_calls = frame.outer;
             /* A dispatcher has selected an implementation; it has not
              * returned to the guest yet. Its C return registers are
@@ -1431,13 +1751,21 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             if (t.ctx.resume_va || t.ctx.host_tail_fn)
                 std::memcpy(t.ctx.v, argument_vectors, sizeof argument_vectors);
         };
-        if (it->preserve_regs) {
+        if (native && symbol_name(*it) == "__tlv_bootstrap") {
+            const auto saved_rdx = t.ctx.native_x[MM_RDX];
+            std::uint64_t saved_v[16][2];
+            std::memcpy(saved_v, t.ctx.v, sizeof saved_v);
+            call_host(target);
+            t.ctx.native_x[MM_RDX] = saved_rdx;
+            std::memcpy(t.ctx.v, saved_v, sizeof saved_v);
+        } else if (it->preserve_regs) {
             std::uint64_t saved_x[19], saved_v[8][2];
             std::memcpy(saved_x, t.ctx.x, sizeof saved_x);
             std::memcpy(saved_v, t.ctx.v, sizeof saved_v);
             call_host(target);
             std::memcpy(t.ctx.x, saved_x, sizeof saved_x);
             std::memcpy(t.ctx.v, saved_v, sizeof saved_v);
+            if (native) t.ctx.x[0] = t.ctx.native_x[MM_RAX];
         } else if (it->returns_this) {
             const std::uint64_t self = t.ctx.x[0];
             call_host(target);
@@ -1453,6 +1781,10 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             t.ctx.host_tail_fn = 0;
             call_host(fn);
         }
+        if (native && trace_enabled())
+            std::fprintf(stderr, "return: %s -> 0x%llx, caller 0x%llx, resume 0x%llx\n", symbol_name(*it).c_str(),
+                         static_cast<unsigned long long>(t.ctx.x[0]), static_cast<unsigned long long>(t.ctx.x[30]),
+                         static_cast<unsigned long long>(t.ctx.resume_va));
         if (t.callback_failure.status != mm_runtime_status::ok) {
             st = t.callback_failure.status;
             t.ctx.fault_va = t.callback_failure.fault_va;
@@ -1460,6 +1792,16 @@ mm_runtime_status guest_process::run_thread(guest_thread &t, std::uint64_t pc) {
             break;
         }
         pc = t.ctx.resume_va ? t.ctx.resume_va : t.ctx.x[30];
+        if (native) {
+            if (t.ctx.resume_va) {
+                constexpr int arguments[] = {MM_RDI, MM_RSI, MM_RDX, MM_RCX, MM_R8, MM_R9};
+                for (int i = 0; i < 6; ++i) t.ctx.native_x[arguments[i]] = t.ctx.x[i];
+            } else {
+                t.ctx.native_x[MM_RSP] += 8;
+                t.ctx.native_x[MM_RAX] = t.ctx.x[0];
+            }
+            std::memcpy(t.ctx.native_v, t.ctx.v, sizeof t.ctx.native_v);
+        }
         t.ctx.resume_va = 0;
         /* A top-level guest function can tail-call a host implementation;
          * its host return then consumes the same zero LR as guest RET. */
@@ -1494,7 +1836,8 @@ void guest_process::report(const guest_thread &t, mm_runtime_status st) {
         break;
     case mm_runtime_status::memory_fault: {
         const std::ptrdiff_t trap = traps_.index_of(ctx.fault_addr);
-        if (trap >= 0) {
+        if (trap >= 0 && static_cast<std::size_t>(trap) < imports_.size() &&
+            !imports_[static_cast<std::size_t>(trap)].host && !imports_[static_cast<std::size_t>(trap)].guest) {
             std::fprintf(stderr, "run: unresolved data import %s dereferenced at %s\n",
                          symbol_name(imports_[static_cast<std::size_t>(trap)]).c_str(),
                          describe_pc(linker_, ctx.fault_va).c_str());
@@ -1554,7 +1897,7 @@ mm_runtime_status guest_process::run_main() {
     ctx.x[30] = 0; /* return-to-host sentinel */
     ctx.x[0] = static_cast<std::uint64_t>(api_.argc);
     ctx.x[1] = reinterpret_cast<std::uintptr_t>(argv_.data());
-    ctx.x[2] = reinterpret_cast<std::uintptr_t>(envp_.data());
+    ctx.x[2] = reinterpret_cast<std::uintptr_t>(environment_.data());
     ctx.x[3] = reinterpret_cast<std::uintptr_t>(apple_.data());
     guest_thread &t = *main_thread;
     {
@@ -1595,7 +1938,7 @@ mm_runtime_status guest_process::run_main() {
             std::fprintf(stderr, "init: %s\n", describe_pc(linker_, init).c_str());
         t.ctx.x[0] = static_cast<std::uint64_t>(api_.argc);
         t.ctx.x[1] = reinterpret_cast<std::uintptr_t>(argv_.data());
-        t.ctx.x[2] = reinterpret_cast<std::uintptr_t>(envp_.data());
+        t.ctx.x[2] = reinterpret_cast<std::uintptr_t>(environment_.data());
         t.ctx.x[3] = reinterpret_cast<std::uintptr_t>(apple_.data());
         t.ctx.x[4] = 0;
         t.ctx.x[30] = 0;
@@ -1608,7 +1951,7 @@ mm_runtime_status guest_process::run_main() {
     }
     t.ctx.x[0] = static_cast<std::uint64_t>(api_.argc);
     t.ctx.x[1] = reinterpret_cast<std::uintptr_t>(argv_.data());
-    t.ctx.x[2] = reinterpret_cast<std::uintptr_t>(envp_.data());
+    t.ctx.x[2] = reinterpret_cast<std::uintptr_t>(environment_.data());
     t.ctx.x[3] = reinterpret_cast<std::uintptr_t>(apple_.data());
     t.ctx.x[30] = 0;
 
@@ -1644,11 +1987,16 @@ int guest_process::api_thread_create(std::uint64_t entry_va, std::uint64_t arg, 
     *id = raw->id;
     raw->host = std::thread([p, raw, entry_va] {
         const mm_runtime_status st = p->run_thread(*raw, entry_va);
+        const auto result = raw->ctx.x[0];
         if (st != mm_runtime_status::ok)
             p->report(*raw, st);
+        auto *outer = g_current;
+        g_current = raw;
+        for (auto thread_exit : p->thread_exit_hooks_) thread_exit();
+        g_current = outer;
         std::lock_guard lock(p->threads_mu_);
         raw->status = st;
-        raw->result = raw->ctx.x[0];
+        raw->result = result;
         raw->finished = true;
     });
     return 0;
@@ -1691,24 +2039,40 @@ std::uint64_t guest_process::deliver_signal(guest_thread &t, int signum, int cod
     frame.saved = t.ctx;
     frame.info = std::make_unique<darwin_siginfo>();
     frame.uc = std::make_unique<darwin_ucontext>();
-    frame.mc = std::make_unique<darwin_mcontext>();
     *frame.info = {};
     frame.info->signo = signum;
     frame.info->code = code;
     frame.info->addr = fault_addr;
-    *frame.mc = {};
-    frame.mc->far = fault_addr;
-    for (int i = 0; i < 29; i++) frame.mc->x[i] = t.ctx.x[i];
-    frame.mc->fp = t.ctx.x[29];
-    frame.mc->lr = t.ctx.x[30];
-    frame.mc->sp = t.ctx.x[31];
-    frame.mc->pc = t.ctx.fault_va;
-    std::memcpy(frame.mc->v, t.ctx.v, sizeof frame.mc->v);
-    frame.mc->fpcr = static_cast<std::uint32_t>(t.ctx.fpcr);
     *frame.uc = {};
-    frame.uc->uc_mcsize = sizeof(darwin_mcontext);
-    frame.uc->uc_mcontext = reinterpret_cast<std::uintptr_t>(frame.mc.get());
     frame.uc->uc_stack = {reinterpret_cast<std::uintptr_t>(t.stack.data()), t.stack.size() * 8, 0, 0};
+    if (t.ctx.native_mode) {
+        frame.native_mc = std::make_unique<darwin_x86_mcontext>();
+        auto &mc = *frame.native_mc;
+        mc.es = {static_cast<std::uint16_t>(t.ctx.native_trapno), 0, t.ctx.native_error, fault_addr};
+        for (int i = 0; i < 16; ++i) mc.ss.registers[i] = t.ctx.native_x[darwin_x86_registers[i]];
+        mc.ss.rip = t.ctx.fault_va;
+        mc.ss.rflags = t.ctx.native_flags;
+        mc.ss.cs = 0x33;
+        std::memcpy(mc.fs.fx, t.ctx.native_fp, sizeof mc.fs.fx);
+        /* Linux saves 64-bit x87 instruction/data pointers; Darwin uses
+         * 32-bit offsets followed by selectors, as does legacy FXSAVE. */
+        std::memset(mc.fs.fx + 12, 0, 4);
+        std::memset(mc.fs.fx + 20, 0, 4);
+        frame.uc->uc_mcsize = sizeof mc;
+        frame.uc->uc_mcontext = reinterpret_cast<std::uintptr_t>(&mc);
+    } else {
+        frame.mc = std::make_unique<darwin_mcontext>();
+        frame.mc->far = fault_addr;
+        for (int i = 0; i < 29; i++) frame.mc->x[i] = t.ctx.x[i];
+        frame.mc->fp = t.ctx.x[29];
+        frame.mc->lr = t.ctx.x[30];
+        frame.mc->sp = t.ctx.x[31];
+        frame.mc->pc = t.ctx.fault_va;
+        std::memcpy(frame.mc->v, t.ctx.v, sizeof frame.mc->v);
+        frame.mc->fpcr = static_cast<std::uint32_t>(t.ctx.fpcr);
+        frame.uc->uc_mcsize = sizeof(darwin_mcontext);
+        frame.uc->uc_mcontext = reinterpret_cast<std::uintptr_t>(frame.mc.get());
+    }
 
     /* Handler runs on the same guest stack below a red zone; returning
      * from it lands on the sigreturn trap. */
@@ -1717,6 +2081,19 @@ std::uint64_t guest_process::deliver_signal(guest_thread &t, int signum, int cod
     t.ctx.x[1] = reinterpret_cast<std::uintptr_t>(frame.info.get());
     t.ctx.x[2] = reinterpret_cast<std::uintptr_t>(frame.uc.get());
     t.ctx.x[30] = sigreturn_va_;
+    if (t.ctx.native_mode) {
+        const auto sp = ((t.ctx.native_x[MM_RSP] - 1024) & ~std::uint64_t{15}) - 8;
+        const auto begin = reinterpret_cast<std::uintptr_t>(t.stack.data());
+        if (sp >= begin && sp < begin + t.stack.size() * 8)
+            std::memcpy(reinterpret_cast<void *>(sp), &sigreturn_va_, 8);
+#if !defined(_WIN32)
+        else if (!guarded_copy(reinterpret_cast<void *>(sp), &sigreturn_va_, 8)) { t.ctx = frame.saved; return 0; }
+#endif
+        t.ctx.native_x[MM_RSP] = sp;
+        t.ctx.native_x[MM_RDI] = t.ctx.x[0];
+        t.ctx.native_x[MM_RSI] = t.ctx.x[1];
+        t.ctx.native_x[MM_RDX] = t.ctx.x[2];
+    }
     t.signal_frames.push_back(std::move(frame));
     return sig.handler;
 }
@@ -1729,19 +2106,24 @@ bool guest_process::sigreturn(guest_thread &t) {
     /* A handler that returns normally resumes at the PC it may have
      * edited in the mcontext (the fault instruction by default). */
     mm_cpu_context resumed = frame.saved;
-    for (int i = 0; i < 29; i++) resumed.x[i] = frame.mc->x[i];
-    resumed.x[29] = frame.mc->fp;
-    resumed.x[30] = frame.mc->lr;
-    resumed.x[31] = frame.mc->sp;
-    std::memcpy(resumed.v, frame.mc->v, sizeof resumed.v);
-    const std::uint64_t resume_pc = frame.mc->pc;
-    if (resume_pc == frame.saved.fault_va) {
-        /* Nothing changed the PC: re-executing the faulting instruction would
-         * fault again, so treat it as fatal (matches SIG_DFL semantics). */
-        t.ctx = resumed;
-        t.ctx.fault_va = resume_pc;
-        return false;
+    std::uint64_t resume_pc;
+    if (frame.native_mc) {
+        const auto &mc = *frame.native_mc;
+        for (int i = 0; i < 16; ++i) resumed.native_x[darwin_x86_registers[i]] = mc.ss.registers[i];
+        resumed.native_flags = mc.ss.rflags;
+        std::memcpy(resumed.native_fp, mc.fs.fx, sizeof resumed.native_fp);
+        std::memcpy(resumed.native_v, mc.fs.fx + 160, sizeof resumed.native_v);
+        resume_pc = mc.ss.rip;
+    } else {
+        for (int i = 0; i < 29; i++) resumed.x[i] = frame.mc->x[i];
+        resumed.x[29] = frame.mc->fp;
+        resumed.x[30] = frame.mc->lr;
+        resumed.x[31] = frame.mc->sp;
+        std::memcpy(resumed.v, frame.mc->v, sizeof resumed.v);
+        resumed.fpcr = frame.mc->fpcr;
+        resume_pc = frame.mc->pc;
     }
+    /* A handler can repair memory or a register without changing the PC. */
     resumed.branch_table = t.ctx.branch_table;
     t.ctx = resumed;
     t.ctx.entry_va = resume_pc;
@@ -1751,7 +2133,8 @@ bool guest_process::sigreturn(guest_thread &t) {
 std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint64_t *args, int nargs) {
     guest_process *p = g_process;
     guest_thread *t = g_current;
-    if (!p) return 0;
+    if (!p || nargs < 0 || nargs > 32 || (nargs && !args)) return 0;
+    p->leave_guest_boundary(); /* Capture host API changes before its guest callback. */
     const bool host_callback = !t;
     if (host_callback) {
         /* Framework workers (dispatch queues, display links, etc.) are
@@ -1778,7 +2161,18 @@ std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint
     }
     const mm_cpu_context saved = t->ctx;
     for (int i = 0; i < 8; i++) t->ctx.x[i] = i < nargs ? args[i] : 0;
-    t->ctx.x[31] = (saved.x[31] - 256) & ~std::uint64_t{15};
+    /* An Intel aggregate adapter temporarily uses x[31] for flattened
+     * host arguments, which may live in a small heap vector. Nested guest
+     * callbacks must keep using the real Intel stack, below its red zone. */
+    const auto callback_sp = saved.native_mode ? saved.native_x[MM_RSP] : saved.x[31];
+    t->ctx.x[31] = (callback_sp - 256) & ~std::uint64_t{15};
+    if (nargs > 8) {
+        const bool native = p->main_->img.header->cputype == MM_CPU_TYPE_X86_64;
+        // Native run_thread installs words 6 and 7 at SP and SP+8.
+        // ARM's first stacked argument is word 8 at SP itself.
+        std::memcpy(reinterpret_cast<void *>(t->ctx.x[31] + (native ? 16 : 0)),
+                    args + 8, static_cast<std::size_t>(nargs - 8) * 8);
+    }
     t->ctx.x[30] = 0;
     t->ctx.resume_va = 0;
     t->ctx.host_tail_fn = 0;
@@ -1792,10 +2186,13 @@ std::uint64_t guest_process::api_call_guest(std::uint64_t fn_va, const std::uint
         std::abort();
     }
     /* Memory effects stay; registers (callee-saved and otherwise) are restored for the host caller's guest frame. */
-    const std::uint64_t v0[2] = {t->ctx.v[0][0], t->ctx.v[0][1]};
+    std::uint64_t vectors[2][2];
+    std::memcpy(vectors, t->ctx.v, sizeof vectors);
+    const auto native_rdx = t->ctx.native_x[MM_RDX];
     t->ctx = saved;
     t->ctx.x[0] = result;
-    t->ctx.v[0][0] = v0[0]; t->ctx.v[0][1] = v0[1];
+    std::memcpy(t->ctx.v, vectors, sizeof vectors);
+    if (t->ctx.native_mode) t->ctx.native_x[MM_RDX] = native_rdx;
     if (host_callback) {
         std::lock_guard lock(p->threads_mu_);
         t->status = st;
@@ -1917,7 +2314,51 @@ void guest_process::api_atexit_run() {
     }
 }
 
-bool guest_process::api_is_guest_code(std::uint64_t va) { return mm_runtime_code::translation_of(va) != 0; }
+bool guest_process::api_is_guest_code(std::uint64_t va) {
+    if (g_process && g_process->main_->img.header->cputype == MM_CPU_TYPE_X86_64) {
+        const auto *image = g_process->linker_.image_for(va);
+        return image && va >= image->code.addr && va - image->code.addr < image->code.bytes.size();
+    }
+    return mm_runtime_code::translation_of(va) != 0;
+}
+
+int guest_process::api_copy_guest_memory(void *destination, const void *source, std::size_t size) {
+#if !defined(_WIN32)
+    fault_handler_scope handlers;
+    return guarded_copy(destination, source, size) ? 0 : -1;
+#else
+    (void)destination; (void)source; (void)size;
+    return -1;
+#endif
+}
+
+std::uint64_t guest_process::api_lookup_symbol(const char *name) {
+    auto *process = g_process;
+    if (!process || !name) return 0;
+    const std::string darwin = std::string("_") + name;
+    std::uint64_t guest = 0;
+    void *host = nullptr;
+    process->linker_.lookup(*process->main_, -2, darwin, false, guest, host);
+    const auto original = guest ? guest : reinterpret_cast<std::uintptr_t>(host);
+    for (const auto &interpose : process->interpositions_)
+        if (interpose.original == original) return interpose.replacement;
+    if (guest) return guest;
+    if (!host) return 0;
+    if (process->main_->img.header->cputype != MM_CPU_TYPE_X86_64 || !host_callable(host, false))
+        return reinterpret_cast<std::uintptr_t>(host);
+    if (const auto found = process->import_by_host_.find(host); found != process->import_by_host_.end())
+        return process->traps_.va(found->second);
+    if (process->imports_.size() == process->imports_.capacity()) return 0;
+    bound_import imported{};
+    imported.image = process->main_;
+    imported.host = host;
+    imported.name_storage = darwin;
+    process->imports_.push_back(std::move(imported));
+    const auto index = process->imports_.size() - 1;
+    process->imports_.back().bind.symbol = process->imports_.back().name_storage;
+    process->import_by_host_.emplace(host, index);
+    return process->traps_.va(index);
+}
 
 std::size_t guest_process::api_image_count() { return g_process ? g_process->linker_.images().size() : 0; }
 
@@ -2038,30 +2479,140 @@ void guest_process::api_thread_stack(std::uint64_t *base, std::uint64_t *size) {
     *base = reinterpret_cast<std::uintptr_t>(g_current->stack.data()) + *size;
 }
 
+/* Configure the initial guest environment without changing host libc. */
+bool prepare_environment(const mm_launch_request &request, mm_environment &environment) {
+    if (request.apply_venv_env) for (const auto &[name, value] : request.venv->env) {
+        const int error=value ? environment.set(name.c_str(), value->c_str(), 1) : environment.unset(name.c_str());
+        if (error) return false;
+    }
+    for (char *entry : request.env) {
+        if (!entry) continue;
+        const std::string_view text(entry);
+        const auto separator=text.find('=');
+        const std::string name(text.substr(0, separator));
+        const int error=separator==std::string_view::npos ? environment.unset(name.c_str())
+            : environment.set(name.c_str(), entry+separator+1, 1);
+        if (error) return false;
+    }
+    return true;
+}
+
+/* Backend options intentionally stay in the host environment, where Wayland,
+ * libc and framework workers read them. Only runtime configuration is overlaid;
+ * guest HOME/PATH/etc remain isolated. Restore overlays on every return path. */
+struct host_configuration_scope {
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+    void set(const std::string &name, const char *value) {
+#if !defined(_WIN32)
+        if (std::none_of(saved.begin(), saved.end(), [&](const auto &entry) { return entry.first==name; })) {
+            const char *previous=std::getenv(name.c_str());
+            saved.emplace_back(name, previous ? std::optional<std::string>(previous) : std::nullopt);
+        }
+        if (value) ::setenv(name.c_str(), value, 1); else ::unsetenv(name.c_str());
+#else
+        (void)name; (void)value;
+#endif
+    }
+    host_configuration_scope(const mm_launch_request &request, mm_environment &environment) {
+        auto apply=[&](std::string_view name) {
+            if (name.starts_with("MACHOMAN_") || name=="DYLD_PRINT_LIBRARIES") {
+                const std::string key(name); set(key, environment.get(key.c_str()));
+            }
+        };
+        if (request.apply_venv_env) for (const auto &[name, value] : request.venv->env) { (void)value; apply(name); }
+        for (const char *entry : request.env) if (entry) {
+            const std::string_view text(entry); apply(text.substr(0, text.find('=')));
+        }
+    }
+    ~host_configuration_scope() {
+#if !defined(_WIN32)
+        for (auto it=saved.rbegin(); it!=saved.rend(); ++it) {
+            if (it->second) ::setenv(it->first.c_str(), it->second->c_str(), 1);
+            else ::unsetenv(it->first.c_str());
+        }
+#endif
+    }
+};
 } // namespace
 
-mm_runtime_status mm_runtime_launch(const mm_launch_request &request) {
-#if !defined(_WIN32)
-    /* The caller's environment assignments come first: everything below,
-     * dyld's search paths included, reads the environment. */
-    for (char *const entry : request.env) {
-        if (!entry) continue;
-        const std::string_view sv(entry);
-        const auto eq = sv.find('=');
-        if (eq == std::string_view::npos) unsetenv(std::string(sv).c_str());
-        else setenv(std::string(sv.substr(0, eq)).c_str(), std::string(sv.substr(eq + 1)).c_str(), 1);
+mm_runtime_status mm_runtime_audit(const mm_launch_request &request, mm_import_audit &report) {
+    report = {};
+    if (!request.venv) return mm_runtime_status::bad_image;
+    mm_environment environment(environ);
+    if (!prepare_environment(request, environment)) return mm_runtime_status::bad_image;
+    host_configuration_scope configuration(request, environment);
+    std::string error;
+    const auto path = mm_venv_resolve_executable(*request.venv, request.executable_path, error);
+    if (!error.empty()) {
+        std::fprintf(stderr, "audit: %s\n", error.c_str());
+        return mm_runtime_status::bad_image;
     }
-#endif
+    auto data = read_whole_file(path);
+    mm_macho_image image;
+    if (data.empty() || mm_macho_parse(data, image) != mm_macho_status::ok) return mm_runtime_status::bad_image;
+    if (image.header->cputype != MM_CPU_TYPE_ARM64 && image.header->cputype != MM_CPU_TYPE_X86_64)
+        return mm_runtime_status::unsupported_arch;
+    linker ld(*request.venv, path.parent_path(), environment);
+    if (!ld.load_executable(path, std::move(data), image)) return mm_runtime_status::map_failed;
+    report.guest_images = ld.images().size();
+    report.host_libraries = ld.host_libs().size();
+    for (auto &loaded : ld.images()) {
+        for (std::size_t i = 0; i < loaded->img.dylibs.size(); ++i) {
+            const auto &dep = loaded->deps[i];
+            if (!dep.guest && (!dep.host || !dep.host->handle))
+                report.missing_dependencies.push_back({loaded->path.string(), std::string(loaded->img.dylibs[i].name), loaded->img.dylibs[i].weak()});
+        }
+        for (const auto &bind : loaded->img.binds()) {
+            mm_import_audit_entry entry{.image = loaded->path.string(), .symbol = std::string(bind.symbol),
+                                        .resolution = mm_import_resolution::missing, .lazy = bind.lazy, .weak = bind.weak};
+            if (bind.dylib_ordinal >= 1 && static_cast<std::size_t>(bind.dylib_ordinal) <= loaded->img.dylibs.size())
+                entry.dependency = loaded->img.dylibs[static_cast<std::size_t>(bind.dylib_ordinal) - 1].name;
+            else entry.dependency = "ordinal:" + std::to_string(bind.dylib_ordinal);
+            std::uint64_t guest;
+            void *host;
+            bool resolver;
+            if (bind.weak_table) {
+                entry.resolution = mm_import_resolution::own;
+                entry.provider = entry.image;
+            } else {
+                ld.lookup(*loaded, bind.dylib_ordinal, bind.symbol, bind.lazy, guest, host, &resolver);
+                if (guest) {
+                    entry.resolution = mm_import_resolution::guest;
+                    if (const auto *provider = ld.image_for(guest)) entry.provider = provider->path.string();
+                } else if (host) {
+                    entry.resolution = resolver ? mm_import_resolution::resolver : mm_import_resolution::host;
 #if !defined(_WIN32)
-    /* A guest that spawns a helper needs to spawn it the same way it was
-     * itself started, so the venv and this binary are published in the
-     * environment: NSTask and posix_spawn re-enter machoman through them
-     * when the program they are handed is a Mach-O (see task.cpp). */
+                    Dl_info info{};
+                    if (dladdr(host, &info) && info.dli_fname) entry.provider = info.dli_fname;
+#endif
+                    if (entry.provider.empty() && resolver) entry.provider = entry.dependency;
+                } else if (bind.weak) entry.resolution = mm_import_resolution::weak_missing;
+            }
+            report.imports.push_back(std::move(entry));
+        }
+    }
+    return mm_runtime_status::ok;
+}
+
+mm_runtime_status mm_runtime_launch(const mm_launch_request &request) {
+    if (!request.venv) return mm_runtime_status::bad_image;
+    mm_environment environment(environ);
+    if (!prepare_environment(request, environment)) return mm_runtime_status::bad_image;
+    host_configuration_scope configuration(request, environment);
+    std::string launcher;
+#if !defined(_WIN32)
+    /* Host backends retain their scoped launch context; guest-facing launch
+     * APIs receive immutable paths in mm_host_api, independently of envp. */
     {
         std::error_code ec;
-        setenv("MACHOMAN_VENV", request.venv->root.c_str(), 1);
+        const auto venv_root = std::filesystem::absolute(request.venv->root);
+        configuration.set("MACHOMAN_VENV", venv_root.c_str());
         const auto self = std::filesystem::read_symlink("/proc/self/exe", ec);
-        if (!ec) setenv("MACHOMAN_EXE", self.c_str(), 1);
+        if (!ec) { launcher=self.string(); configuration.set("MACHOMAN_EXE", self.c_str()); }
+        if (request.initial_signal_mask) {
+            const auto mask=std::to_string(*request.initial_signal_mask);
+            configuration.set("MACHOMAN_INITIAL_SIGNAL_MASK", mask.c_str());
+        }
     }
 #endif
     /* Resolved, because a binary in the venv's bin/ is often a symlink into
@@ -2079,10 +2630,22 @@ mm_runtime_status mm_runtime_launch(const mm_launch_request &request) {
         return mm_runtime_status::bad_image;
 
     mm_macho_image img;
-    if (mm_macho_parse(data, img) != mm_macho_status::ok || !img.has_entry)
+    const auto parsed = mm_macho_parse(data, img);
+    if (parsed == mm_macho_status::no_arm64_slice) {
+        std::fprintf(stderr, "run: %s has no arm64 slice; machoman requires an arm64 macOS executable\n", exe_path.c_str());
+        return mm_runtime_status::unsupported_arch;
+    }
+    if (parsed != mm_macho_status::ok)
+        return mm_runtime_status::bad_image;
+    if (img.header->cputype != MM_CPU_TYPE_ARM64 && img.header->cputype != MM_CPU_TYPE_X86_64) {
+        std::fprintf(stderr, "run: %s is %s; machoman requires an arm64 macOS executable\n",
+                     exe_path.c_str(), mm_cpu_type_name(img.header->cputype));
+        return mm_runtime_status::unsupported_arch;
+    }
+    if (!img.has_entry)
         return mm_runtime_status::bad_image;
 
-    guest_process process(*request.venv, request.argv, exe_path);
+    guest_process process(*request.venv, request.argv, exe_path, environment, std::move(launcher));
     if (const auto st = process.load(std::move(data), img); st != mm_runtime_status::ok)
         return st;
     return process.run_main();
@@ -2103,6 +2666,7 @@ const char *mm_runtime_status_str(mm_runtime_status status) {
     case mm_runtime_status::unresolved_import: return "guest used an import no host dylib provides";
     case mm_runtime_status::exited:            return "guest called exit()";
     case mm_runtime_status::host_abort:        return "a host dylib aborted the guest";
+    case mm_runtime_status::unsupported_arch:  return "unsupported guest architecture (arm64 required)";
     }
     return "unknown status";
 }

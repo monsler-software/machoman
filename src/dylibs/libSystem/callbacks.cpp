@@ -190,7 +190,7 @@ sem_t *darwin_sem_open(const char *name, int oflag, ...) {
     int flags = 0;
     if (oflag & 0x0200) flags |= O_CREAT;  /* Darwin O_CREAT */
     if (oflag & 0x0800) flags |= O_EXCL;   /* Darwin O_EXCL */
-    mm_guest_va_list args = mm_guest_va_list::at_call_site();
+    mm_guest_va_list args = mm_guest_va_list::at_call_site(2);
     const unsigned mode = (flags & O_CREAT) ? static_cast<unsigned>(args.next_u64()) : 0;
     const unsigned value = (flags & O_CREAT) ? static_cast<unsigned>(args.next_u64()) : 0;
     /* POSIX wants a name starting with a slash and no others in it. */

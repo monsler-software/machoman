@@ -17,8 +17,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "machoman/macho.h"
 #include "machoman/translator.h"
@@ -38,6 +40,7 @@ enum class mm_runtime_status {
     unresolved_import,      /* guest called an import with no host implementation */
     exited,                 /* guest called exit(); ctx.exit_code */
     host_abort,             /* a host function aborted the guest (see stderr) */
+    unsupported_arch,       /* image has no arm64 code to translate */
 };
 
 /* Dynamic linking. An install name such as "/usr/lib/libc++.1.dylib" is
@@ -77,7 +80,7 @@ struct mm_callback_result {
  * machinery without hardcoding anything about the executable. All
  * function pointers are valid for the process lifetime. */
 struct mm_host_api {
-    std::uint32_t version;         /* 3; new fields are appended */
+    std::uint32_t version;         /* 6; new fields are appended */
     const void   *main_image;      /* mapped Mach-O header of the executable */
     int           argc;
     char        **argv;
@@ -108,10 +111,14 @@ struct mm_host_api {
      * (untranslated instruction), SIGSEGV/SIGBUS (memory fault) and SIGTRAP
      * (brk) to these with Darwin siginfo/ucontext arguments. */
     std::uint64_t (*signal_install)(int signum, std::uint64_t handler_va, std::uint32_t flags, std::uint32_t mask);
-    /* Calls guest function `fn_va` with up to eight integer arguments and
+    /* Calls guest function `fn_va` with up to 32 integer words and
      * returns its x0. A guest caller uses a nested run on its own stack;
      * a native framework worker gets a persistent guest thread and stack
-     * on its first callback. The caller's guest registers are preserved. */
+     * on its first callback. Words beyond the ISA's argument registers are
+     * copied to the guest stack. FP arguments come from the current context;
+     * x0, native rdx and v0/v1 carry results, other registers are preserved.
+     * Swift-context callbacks inherit swiftself in arm64 x20 or native r13
+     * from current_context; adapters must restore it after the call. */
     std::uint64_t (*call_guest)(std::uint64_t fn_va, const std::uint64_t *args, int nargs);
     /* True if `va` is inside the translated code of the executable, i.e.
      * a function pointer that must be called with call_guest rather than
@@ -150,12 +157,39 @@ struct mm_host_api {
     int (*prepare_guest_callback)(std::uint64_t fn_va, std::size_t stack_size, void **handle);
     int (*invoke_guest_callback)(void *handle, const std::uint64_t *args, int nargs, mm_callback_result *result);
     int (*release_guest_callback)(void *handle);
+    /* v4: Darwin dlsym name (without Mach-O's extra underscore). Returns
+     * guest code or a callable host bridge for the current architecture. */
+    std::uint64_t (*lookup_symbol)(const char *name);
+    /* v5: bounded guest-memory copying with fault recovery, for APIs that
+     * marshal message buffers or out-of-line memory. Returns 0 or -1. */
+    int (*copy_guest_memory)(void *destination, const void *source, std::size_t size);
+    /* v6: live process environment. Mutators return 0 or a host errno;
+     * putenv borrows the caller's buffer. bind_environment connects exported
+     * Darwin environ storage to the same authoritative pointer slot. */
+    char ***(*environment)();
+    char *(*environment_get)(const char *name);
+    int (*environment_set)(const char *name, const char *value, int overwrite);
+    int (*environment_unset)(const char *name);
+    int (*environment_put)(char *entry);
+    void (*bind_environment)(char ***storage);
+    /* Launch context is independent of guest-modifiable environment vars. */
+    const char *venv_root;
+    const char *launcher_path;
+    const char *executable_path;
 };
 using mm_dylib_init_fn = void (*)(const mm_host_api *);
 /* Optional machoman_dylib_start hook: all host APIs and guest translations
  * are ready, and callbacks run on the guest main thread before its static
  * initializers. init hooks register metadata without executing guest code. */
 using mm_dylib_start_fn = void (*)();
+/* Optional machoman_dylib_guest_enter / machoman_dylib_guest_leave hooks
+ * publish guest thread state before executing guest code or a host API,
+ * and capture it immediately afterwards. They must not call guest code. */
+using mm_dylib_boundary_fn = void (*)();
+/* Optional machoman_dylib_thread_exit hook: a guest pthread has returned,
+ * but still owns its guest identity, stack and TLS. The hook may use
+ * call_guest to run thread destructors before host thread teardown. */
+using mm_dylib_thread_exit_fn = void (*)();
 
 /* Translated code mapped into executable memory, re-enterable any number
  * of times (each host call-out returns here and resumes via run()). Its
@@ -218,12 +252,14 @@ struct mm_launch_request {
     const mm_venv   *venv;
     std::string_view executable_path; /* path under venv's bin/ to launch */
     std::span<char *const> argv;      /* argv[0] defaults to the executable path */
-    /* "KEY=VALUE" entries set in the environment before the program is
-     * loaded, and "KEY" alone removes one. The guest inherits this
-     * process's environment, so these reach both it and the host dylibs —
-     * which is what makes DYLD_LIBRARY_PATH and friends settable per run
-     * without exporting them into the whole shell. */
+    /* Host inheritance -> venv env defaults -> these "KEY=VALUE" overrides.
+     * "KEY" alone removes one. The guest owns its live environment; ordinary
+     * guest variables do not mutate host libc's environment. */
     std::span<char *const> env;
+    /* Nested exec/spawn already supplies the complete environment: do not
+     * reapply venv defaults after unsetenv or an explicit empty envp. */
+    bool apply_venv_env = true;
+    std::optional<std::uint32_t> initial_signal_mask;
 };
 
 /* Loads the arm64 image from the venv, maps its segments at their link
@@ -233,6 +269,29 @@ struct mm_launch_request {
  * where and why it stopped on stderr. Not a general loader yet: no dylib
  * symbol resolution, no syscall dispatch, no argv/envp ABI setup. */
 mm_runtime_status mm_runtime_launch(const mm_launch_request &request);
+
+enum class mm_import_resolution { guest, host, resolver, own, weak_missing, missing };
+struct mm_import_audit_entry {
+    std::string image, dependency, symbol, provider;
+    mm_import_resolution resolution;
+    bool lazy = false, weak = false;
+};
+struct mm_dependency_audit_entry {
+    std::string image, dependency;
+    bool weak = false;
+};
+struct mm_import_audit {
+    std::size_t guest_images = 0, host_libraries = 0;
+    std::vector<mm_import_audit_entry> imports;
+    std::vector<mm_dependency_audit_entry> missing_dependencies;
+};
+/* Loads the dependency closure using the ordinary dyld search/lookup rules.
+ * Does not bind slots, translate code, call framework lifecycle hooks, or
+ * execute guest initializers/main. Host dlopen constructors still run.
+ * Resolver means the named library's dynamic resolver supplied an address;
+ * it may be a stub or generated metadata and does not prove API support.
+ * A successful audit returns ok even when the report contains missing APIs. */
+mm_runtime_status mm_runtime_audit(const mm_launch_request &request, mm_import_audit &report);
 
 const char *mm_runtime_status_str(mm_runtime_status status);
 

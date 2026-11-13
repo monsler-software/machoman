@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -217,8 +218,16 @@ int spawn(task_object *t) {
         dictionary_keys(t->environment, keys);
         for (id k : keys)
             env_strings.push_back(to_utf8(k) + "=" + to_utf8(dictionary_get(t->environment, k)));
-        for (std::string &e : env_strings) env_raw.push_back(e.data());
-        env_raw.push_back(nullptr);
+    } else for (char **e=mm_host_environment(api()); e && *e; ++e) env_strings.emplace_back(*e);
+    for (std::string &e : env_strings) env_raw.push_back(e.data());
+    env_raw.push_back(nullptr);
+
+    std::string executable=t->path;
+    if (is_macho(executable)) {
+        auto nested=mm_guest_launch_arguments(api(), std::filesystem::absolute(executable).string(), raw.data(), 0);
+        if (nested.empty()) { errno=ENOENT; return -1; }
+        argv=std::move(nested); executable=argv.front();
+        raw.clear(); for (auto &a : argv) raw.push_back(a.data()); raw.push_back(nullptr);
     }
 
     const int out = descriptor_of(t->standard_output, true);
@@ -232,8 +241,7 @@ int spawn(task_object *t) {
         if (in >= 0) ::dup2(in, 0);
         if (out >= 0) ::dup2(out, 1);
         if (err >= 0) ::dup2(err, 2);
-        if (t->environment) ::execve(t->path.c_str(), raw.data(), env_raw.data());
-        else ::execv(t->path.c_str(), raw.data());
+        ::execve(executable.c_str(), raw.data(), env_raw.data());
         ::_exit(127);
     }
     t->pid = pid;
@@ -254,9 +262,7 @@ void reap(task_object *t) {
 std::uint64_t task_launch(id self, SEL) {
     task_object *t = tk(self);
     if (t->path.empty()) return 0;
-    /* A helper that is itself a Mach-O is started the way this process was
-     * started: through machoman, with the same venv. The runtime publishes
-     * both in the environment (mm_runtime_launch). */
+    /* Launch metadata comes from the runtime, independently of guest env. */
     if (is_macho(t->path)) {
         if (std::getenv("MACHOMAN_DISABLE_GUEST_SUBPROCESSES")) {
             std::fprintf(stderr, "Foundation: NSTask: guest helper disabled for this diagnostic run: %s\n", t->path.c_str());
@@ -264,8 +270,8 @@ std::uint64_t task_launch(id self, SEL) {
             t->status = 127;
             return 0;
         }
-        const char *launcher = std::getenv("MACHOMAN_EXE");
-        const char *venv = std::getenv("MACHOMAN_VENV");
+        const char *launcher = mm_host_launcher(api());
+        const char *venv = mm_host_venv(api());
         if (!launcher || !venv) {
             std::fprintf(stderr, "Foundation: NSTask: %s is a Mach-O and there is no launcher to run it with\n",
                          t->path.c_str());
@@ -273,15 +279,8 @@ std::uint64_t task_launch(id self, SEL) {
             t->status = 127;
             return 0;
         }
-        std::vector<std::string> rest = t->arguments;
-        t->arguments.clear();
-        t->arguments.push_back("run");
-        t->arguments.push_back(venv);
-        t->arguments.push_back(t->path);
-        t->arguments.insert(t->arguments.end(), rest.begin(), rest.end());
-        t->path = launcher;
         if (trace())
-            std::fprintf(stderr, "Foundation: NSTask: launching %s through %s\n", t->arguments[2].c_str(), launcher);
+            std::fprintf(stderr, "Foundation: NSTask: launching %s through %s\n", t->path.c_str(), launcher);
     }
     if (spawn(t) != 0)
         std::fprintf(stderr, "Foundation: NSTask: cannot run %s: %s\n", t->path.c_str(), std::strerror(errno));

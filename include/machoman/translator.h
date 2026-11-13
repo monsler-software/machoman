@@ -93,6 +93,14 @@ struct alignas(16) mm_cpu_context {
     alignas(16) std::uint64_t v[32][2] = {}; /* SIMD&FP registers, little-endian 128-bit: v[n][0] = bits 63:0 */
     const std::uint64_t *branch_table = nullptr; /* L1 of the code map (see MM_CODE_MAP_*) */
     std::uint32_t host_result_in_context = 0; /* dispatcher supplied FP results; mm_hostcall must preserve them */
+    // Native Darwin x86_64 execution. GPR indices use MM_RAX..MM_R15.
+    std::uint64_t native_x[16] = {};
+    std::uint64_t native_flags = 0x202;
+    std::uint64_t native_mode = 0;
+    alignas(16) std::uint64_t native_v[16][2] = {};
+    std::uint64_t native_hi_valid = 0;
+    alignas(16) std::uint8_t native_fp[512] = {}; /* FXSAVE image, including x87 and MXCSR */
+    std::uint32_t native_trapno = 0, native_error = 0;
 };
 
 struct mm_translate_note {

@@ -58,6 +58,7 @@ struct Buffer {
   OwnedId device;
   std::shared_ptr<mevk::Buffer> backend;
   std::uint64_t storage_mode = 0;
+  std::uint64_t cpu_cache_mode = 0, hazard_tracking_mode = 2;
 };
 struct Queue {
   mm_objc_object header;
@@ -102,6 +103,7 @@ struct Command {
   Label label;
   OwnedId queue;
   std::shared_ptr<CommandState> state;
+  bool retained_references=true;
 };
 struct Encoder {
   mm_objc_object header;

@@ -13,7 +13,19 @@ MM_FW_CLASS(MEVKFunction);
 MM_FW_CLASS(MEVKTexture);
 MM_FW_CLASS(MEVKRenderPipelineState);
 MM_FW_CLASS(MEVKRenderCommandEncoder);
+MM_FW_CLASS(MEVKComputeCommandEncoder);
+MM_FW_CLASS(MEVKComputePipelineState);
 MM_FW_CLASS(MTLTextureDescriptor);
+MM_FW_CLASS(MTLSamplerDescriptor);
+MM_FW_CLASS(MEVKSamplerState);
+MM_FW_CLASS(MTLVertexDescriptor);
+MM_FW_CLASS(MTLVertexAttributeDescriptor);
+MM_FW_CLASS(MTLVertexAttributeDescriptorArray);
+MM_FW_CLASS(MTLVertexBufferLayoutDescriptor);
+MM_FW_CLASS(MTLVertexBufferLayoutDescriptorArray);
+MM_FW_CLASS(MTLDepthStencilDescriptor);
+MM_FW_CLASS(MEVKDepthStencilState);
+MM_FW_CLASS(MTLRenderPassDepthAttachmentDescriptor);
 MM_FW_CLASS(MTLRenderPipelineDescriptor);
 MM_FW_CLASS(MTLRenderPipelineColorAttachmentDescriptor);
 MM_FW_CLASS(MTLRenderPipelineColorAttachmentDescriptorArray);
@@ -30,6 +42,8 @@ mm_id metal_get_association(mm_id,
                             const void *) __asm__("_objc_getAssociatedObject");
 void metal_set_association(mm_id, const void *, mm_id,
                            std::uint64_t) __asm__("_objc_setAssociatedObject");
+mm_id metal_dispatch_data_map(mm_id, const void **, std::size_t *)
+    __asm__("_dispatch_data_create_map");
 }
 
 namespace mevk_metal {
@@ -60,6 +74,17 @@ struct TextureDescriptor {
   std::uint64_t width = 1, height = 1, depth = 1, pixel_format = 70, type = 2,
                 mips = 1, samples = 1, array = 1, storage = 2, usage = 1;
 };
+struct SamplerDescriptor {
+  mm_objc_object header;
+  Label label;
+  mevk::SamplerDescription description;
+};
+struct SamplerObject {
+  mm_objc_object header;
+  Label label;
+  OwnedId device;
+  std::shared_ptr<mevk::Sampler> backend;
+};
 struct PipelineColor {
   mm_objc_object header;
   Label label;
@@ -73,7 +98,13 @@ struct PassColor {
   OwnedId texture;
   std::uint64_t load = 0, store = 1, level = 0, slice = 0, plane = 0;
   std::array<double, 4> clear{0, 0, 0, 0};
+  double clear_depth=1;
 };
+struct VertexAttribute {mm_objc_object header;Label label;std::uint64_t format=0,offset=0,buffer=0;};
+struct VertexBufferLayout {mm_objc_object header;Label label;std::uint64_t stride=0,step_function=1,step_rate=1;};
+struct VertexDescriptor {mm_objc_object header;Label label;OwnedId attributes,layouts;};
+struct DepthDescriptor {mm_objc_object header;Label label;std::uint64_t compare=7,write=0;};
+struct DepthObject {mm_objc_object header;Label label;OwnedId device;mevk::DepthState state;};
 struct AttachmentArray {
   mm_objc_object header;
   Label label;
@@ -97,18 +128,36 @@ struct PipelineObject {
   OwnedId device;
   std::shared_ptr<mevk::RenderPipeline> backend;
 };
-struct RenderEncoder {
+struct ResourceEncoder {
   mm_objc_object header;
   Label label;
   OwnedId command;
   std::shared_ptr<CommandState> state;
   std::shared_ptr<mevk::Context> context;
-  std::shared_ptr<mevk::RenderPipeline> pipeline;
   mevk::RenderBindings bindings;
-  mevk::Viewport viewport;
-  mevk::Scissor scissor;
   bool ended = false;
 };
+struct RenderEncoder : ResourceEncoder {
+  std::shared_ptr<mevk::RenderPipeline> pipeline;
+  mevk::Viewport viewport;
+  mevk::Scissor scissor;
+  mevk::DepthState depth;
+  mevk::RasterState raster;
+};
+struct ComputeEncoder : ResourceEncoder {
+  std::shared_ptr<mevk::ComputePipeline> pipeline;
+};
+struct ComputePipelineObject {
+  mm_objc_object header;
+  Label label;
+  OwnedId device;
+  std::shared_ptr<mevk::ComputePipeline> backend;
+};
+bool encoding(ResourceEncoder& encoder);
+ResourceEncoder& resource_encoder(id self) {
+  if(is_kind(self,MM_FW_CLASS_REF(MEVKComputeCommandEncoder)))return *as<ComputeEncoder>(self);
+  return *as<RenderEncoder>(self);
+}
 struct LayerState {
   mm_objc_object header;
   Label label;
@@ -187,6 +236,39 @@ id attachment_array(bool pass) {
   }
   return reinterpret_cast<id>(array);
 }
+template<bool Attributes>std::uint64_t vertex_array(id self,SEL) {
+  auto& value=Attributes?as<VertexDescriptor>(self)->attributes:as<VertexDescriptor>(self)->layouts;
+  if(!value.value) {
+    auto* array=make<AttachmentArray>(Attributes?MM_FW_CLASS_REF(MTLVertexAttributeDescriptorArray):MM_FW_CLASS_REF(MTLVertexBufferLayoutDescriptorArray));
+    for(unsigned i=0;i<32;++i) {
+      id object=Attributes?reinterpret_cast<id>(make<VertexAttribute>(MM_FW_CLASS_REF(MTLVertexAttributeDescriptor))):
+          reinterpret_cast<id>(make<VertexBufferLayout>(MM_FW_CLASS_REF(MTLVertexBufferLayoutDescriptor)));
+      array->values.emplace_back(object);release(object);
+    }
+    value.set(reinterpret_cast<id>(array));release(reinterpret_cast<id>(array));
+  }
+  return ret(value.value);
+}
+std::uint64_t vertex_factory(id c,SEL) {return ret(autorelease(reinterpret_cast<id>(make<VertexDescriptor>(reinterpret_cast<Class>(c)))));}
+bool vertex_input(id descriptor,mevk::VertexInput& input,std::string& error) {
+  if(!descriptor)return true;
+  if(!is_kind(descriptor,MM_FW_CLASS_REF(MTLVertexDescriptor))){error="invalid vertex descriptor";return false;}
+  auto* attributes=as<AttachmentArray>(obj(vertex_array<true>(descriptor,nullptr)));
+  auto* layouts=as<AttachmentArray>(obj(vertex_array<false>(descriptor,nullptr)));
+  std::array<bool,32> used{};
+  for(unsigned i=0;i<attributes->values.size();++i) {
+    auto* a=as<VertexAttribute>(attributes->values[i].value);if(!a->format)continue;
+    if(a->format>UINT32_MAX||a->offset>UINT32_MAX||a->buffer>=32){error="invalid vertex attribute format/offset/buffer index";return false;}
+    auto buffer=static_cast<std::uint32_t>(a->buffer);used[buffer]=true;
+    input.attributes.push_back({i,buffer,static_cast<std::uint32_t>(a->format),static_cast<std::uint32_t>(a->offset)});
+  }
+  for(unsigned i=0;i<used.size();++i)if(used[i]) {
+    auto* b=as<VertexBufferLayout>(layouts->values[i].value);
+    if(b->stride>UINT32_MAX||b->step_function>UINT32_MAX||b->step_rate>UINT32_MAX){error="unsupported vertex stride/step function/rate";return false;}
+    input.buffers.push_back({i,static_cast<std::uint32_t>(b->stride),static_cast<std::uint32_t>(b->step_function),static_cast<std::uint32_t>(b->step_rate)});
+  }
+  return true;
+}
 std::uint64_t pipeline_colors(id self, SEL) {
   auto *descriptor = as<PipelineDescriptor>(self);
   if (!descriptor->colors.value) {
@@ -209,7 +291,7 @@ std::uint64_t pass_depth(id self, SEL) {
   auto &value = as<PassDescriptor>(self)->depth;
   if (!value.value) {
     auto *p = make<PassColor>(
-        MM_FW_CLASS_REF(MTLRenderPassColorAttachmentDescriptor));
+        MM_FW_CLASS_REF(MTLRenderPassDepthAttachmentDescriptor));
     value.set(reinterpret_cast<id>(p));
     release(reinterpret_cast<id>(p));
   }
@@ -252,26 +334,13 @@ std::uint64_t texture_factory(id c, SEL, std::uint64_t format,
   return ret(autorelease(reinterpret_cast<id>(descriptor)));
 }
 
-std::uint64_t library_file(id self, SEL, id path, id *error) {
+std::uint64_t library_bytes(id self, std::span<const std::uint8_t> data,
+                            id *error, const char *name) {
   if (error)
     *error = nullptr;
-  const char *name =
-      path ? reinterpret_cast<const char *>(send(path, "UTF8String")) : nullptr;
   std::string message;
-  std::vector<std::uint8_t> data;
-  if (name) {
-    std::ifstream file(name, std::ios::binary | std::ios::ate);
-    auto size = file.tellg();
-    if (file && size > 0 && size <= 16 * 1024 * 1024) {
-      data.resize(static_cast<std::size_t>(size));
-      file.seekg(0);
-      file.read(reinterpret_cast<char *>(data.data()), size);
-      if (!file)
-        data.clear();
-    }
-  }
   if (data.empty())
-    message = "cannot read metallib file";
+    message = "empty or unreadable metallib";
   static std::mutex cache_mutex;
   static std::unordered_map<std::string,
                             std::weak_ptr<std::vector<mevk::ShaderFunction>>>
@@ -290,9 +359,18 @@ std::uint64_t library_file(id self, SEL, id path, id *error) {
       functions = it->second.lock();
     if (!functions) {
       functions = std::make_shared<std::vector<mevk::ShaderFunction>>();
-      if (mevk::load_metallib(data, *functions, message))
+      if (mevk::load_metallib(data, *functions, message)) {
+        // Shader inspection keeps GLSL; the Metal runtime needs reflection and
+        // SPIR-V only. Release generated source after loading the library.
+        for(auto& function:*functions){function.glsl.clear();function.glsl.shrink_to_fit();}
         cache[key] = functions;
-      else
+        static std::uint64_t libraries=0;
+        if(++libraries==1||libraries%256==0) {
+          auto stats=mevk::shader_cache_stats();
+          std::fprintf(stderr,"MEVK shader cache: hits=%llu misses=%llu writes=%llu rejected=%llu directory=%s\n",
+            static_cast<unsigned long long>(stats.hits),static_cast<unsigned long long>(stats.misses),static_cast<unsigned long long>(stats.writes),static_cast<unsigned long long>(stats.rejected),mevk::shader_cache_directory().c_str());
+        }
+      } else
         functions.reset();
     }
   }
@@ -309,6 +387,32 @@ std::uint64_t library_file(id self, SEL, id path, id *error) {
   std::fprintf(stderr, "MEVK Metal: translated %zu AIR functions from %s\n",
                library->functions->size(), name);
   return ret(library);
+}
+std::uint64_t library_file(id self, SEL, id path, id *error) {
+  const char *name =
+      path ? reinterpret_cast<const char *>(send(path, "UTF8String")) : nullptr;
+  std::vector<std::uint8_t> data;
+  if (name) {
+    std::ifstream file(name, std::ios::binary | std::ios::ate);
+    auto size = file.tellg();
+    if (file && size > 0 && size <= 16 * 1024 * 1024) {
+      data.resize(static_cast<std::size_t>(size));
+      file.seekg(0);
+      file.read(reinterpret_cast<char *>(data.data()), size);
+      if (!file) data.clear();
+    }
+  }
+  return library_bytes(self, data, error, name ? name : "nil file");
+}
+std::uint64_t library_data(id self, SEL, id data, id *error) {
+  const void *bytes = nullptr;
+  std::size_t size = 0;
+  id mapping = data ? metal_dispatch_data_map(data, &bytes, &size) : nullptr;
+  const auto result = library_bytes(self,
+      std::span(static_cast<const std::uint8_t *>(bytes), size), error,
+      "dispatch data");
+  release(mapping);
+  return result;
 }
 std::uint64_t library_url(id self, SEL sel, id url, id *error) {
   return library_file(self, sel, obj(send(url, "path")), error);
@@ -348,7 +452,8 @@ std::uint64_t function_name(id self, SEL) {
   return ret(string(as<Function>(self)->shader->name.c_str()));
 }
 std::uint64_t function_type(id self, SEL) {
-  return as<Function>(self)->shader->stage == mevk::ShaderStage::vertex ? 1 : 2;
+  auto stage=as<Function>(self)->shader->stage;
+  return stage==mevk::ShaderStage::vertex?1u:stage==mevk::ShaderStage::fragment?2u:3u;
 }
 std::uint64_t new_texture(id self, SEL, id descriptor) {
   if (!is_kind(descriptor, MM_FW_CLASS_REF(MTLTextureDescriptor))) {
@@ -357,20 +462,40 @@ std::uint64_t new_texture(id self, SEL, id descriptor) {
   }
   auto *d = as<TextureDescriptor>(descriptor);
   if (d->width > UINT32_MAX || d->height > UINT32_MAX ||
-      d->pixel_format > UINT32_MAX || d->depth != 1 || d->type != 2 ||
-      d->mips != 1 || d->samples != 1 || d->array != 1 || d->storage > 2 ||
-      (d->usage & ~std::uint64_t{5})) {
+      d->pixel_format > UINT32_MAX || d->depth > UINT32_MAX || d->type > UINT32_MAX ||
+      d->mips > UINT32_MAX || d->samples != 1 || d->array > UINT32_MAX || d->storage > 2 ||
+      (d->usage & ~std::uint64_t{7})) {
     std::fprintf(stderr, "MEVK Metal: unsupported texture "
-                         "dimensions/type/mips/samples/storage/usage\n");
+                         "%llux%llux%llu format=%llu type=%llu mips=%llu "
+                         "samples=%llu array=%llu storage=%llu usage=0x%llx\n",
+                 static_cast<unsigned long long>(d->width),
+                 static_cast<unsigned long long>(d->height),
+                 static_cast<unsigned long long>(d->depth),
+                 static_cast<unsigned long long>(d->pixel_format),
+                 static_cast<unsigned long long>(d->type),
+                 static_cast<unsigned long long>(d->mips),
+                 static_cast<unsigned long long>(d->samples),
+                 static_cast<unsigned long long>(d->array),
+                 static_cast<unsigned long long>(d->storage),
+                 static_cast<unsigned long long>(d->usage));
     return 0;
   }
   std::string error;
-  auto backend = as<Device>(self)->context->create_texture(
-      static_cast<std::uint32_t>(d->width),
-      static_cast<std::uint32_t>(d->height),
-      static_cast<std::uint32_t>(d->pixel_format), error);
+  mevk::TextureDescription description;
+  description.width=static_cast<std::uint32_t>(d->width);description.height=static_cast<std::uint32_t>(d->height);
+  description.depth=static_cast<std::uint32_t>(d->depth);description.type=static_cast<std::uint32_t>(d->type);
+  description.mips=static_cast<std::uint32_t>(d->mips);description.array_length=static_cast<std::uint32_t>(d->array);
+  description.pixel_format=static_cast<std::uint32_t>(d->pixel_format);
+  description.usage=static_cast<std::uint32_t>(d->usage);
+  auto backend = as<Device>(self)->context->create_texture(description,error);
   if (!backend) {
-    std::fprintf(stderr, "MEVK Metal: %s\n", error.c_str());
+    std::fprintf(stderr, "MEVK Metal: %s (texture %ux%ux%u format=%u type=%u mips=%u samples=%llu array=%u usage=0x%llx)\n", error.c_str(),
+        description.width,description.height,description.depth,description.pixel_format,description.type,description.mips,
+        static_cast<unsigned long long>(d->samples),description.array_length,static_cast<unsigned long long>(d->usage));
+    return 0;
+  }
+  if((d->usage&2u)&&!backend->supports_shader_write()) {
+    std::fprintf(stderr,"MEVK Metal: texture format does not support shader writes\n");
     return 0;
   }
   auto *texture = make<TextureObject>(MM_FW_CLASS_REF(MEVKTexture));
@@ -380,6 +505,46 @@ std::uint64_t new_texture(id self, SEL, id descriptor) {
   texture->usage = d->usage;
   return ret(texture);
 }
+std::uint64_t new_sampler(id self,SEL,id descriptor) {
+  if(!is_kind(descriptor,MM_FW_CLASS_REF(MTLSamplerDescriptor)))return 0;
+  std::string error;
+  auto backend=as<Device>(self)->context->create_sampler(as<SamplerDescriptor>(descriptor)->description,error);
+  if(!backend){std::fprintf(stderr,"MEVK Metal: %s\n",error.c_str());return 0;}
+  auto *sampler=make<SamplerObject>(MM_FW_CLASS_REF(MEVKSamplerState));
+  sampler->device.set(self);sampler->backend=std::move(backend);return ret(sampler);
+}
+std::uint64_t new_depth_state(id self,SEL,id descriptor) {
+  if(!is_kind(descriptor,MM_FW_CLASS_REF(MTLDepthStencilDescriptor))||as<DepthDescriptor>(descriptor)->compare>7)return 0;
+  auto* state=make<DepthObject>(MM_FW_CLASS_REF(MEVKDepthStencilState));state->device.set(self);
+  state->state={static_cast<std::uint32_t>(as<DepthDescriptor>(descriptor)->compare),as<DepthDescriptor>(descriptor)->write!=0};
+  return ret(state);
+}
+std::uint64_t render_depth_state(id self,SEL,id state) {
+  auto& encoder=*as<RenderEncoder>(self);std::lock_guard lock(encoder.state->mutex);
+  if(!encoding(encoder))return 0;
+  if(state&&(!is_kind(state,MM_FW_CLASS_REF(MEVKDepthStencilState))||as<Device>(as<DepthObject>(state)->device.value)->context!=encoder.context)) {
+    encoder.state->fail("invalid depth stencil state or device");return 0;
+  }
+  encoder.depth=state?as<DepthObject>(state)->state:mevk::DepthState{};
+  if(state)encoder.state->resources.emplace_back(state);return 0;
+}
+template<auto Field>std::uint64_t render_raster(id self,SEL,std::uint64_t value) {
+  auto& encoder=*as<RenderEncoder>(self);std::lock_guard lock(encoder.state->mutex);
+  if(!encoding(encoder))return 0;
+  if(value>UINT32_MAX){encoder.state->fail("raster state value exceeds supported range");return 0;}
+  encoder.raster.*Field=static_cast<std::uint32_t>(value);return 0;
+}
+std::uint64_t render_depth_bias(id self,SEL,float bias,float slope,float clamp) {
+  auto& encoder=*as<RenderEncoder>(self);std::lock_guard lock(encoder.state->mutex);
+  if(!encoding(encoder))return 0;encoder.raster.depth_bias=bias;encoder.raster.slope_scale=slope;encoder.raster.bias_clamp=clamp;return 0;
+}
+double pass_clear_depth(id self,SEL){return as<PassColor>(self)->clear_depth;}
+std::uint64_t set_pass_clear_depth(id self,SEL,double value){as<PassColor>(self)->clear_depth=value;return 0;}
+template<auto Field>std::uint64_t sampler_get(id self,SEL){return as<SamplerDescriptor>(self)->description.*Field;}
+template<auto Field>std::uint64_t sampler_set(id self,SEL,std::uint64_t value){as<SamplerDescriptor>(self)->description.*Field=static_cast<std::remove_reference_t<decltype(as<SamplerDescriptor>(self)->description.*Field)>>(value);return 0;}
+template<auto Field>float sampler_float_get(id self,SEL){return as<SamplerDescriptor>(self)->description.*Field;}
+template<auto Field>std::uint64_t sampler_float_set(id self,SEL,float value){as<SamplerDescriptor>(self)->description.*Field=value;return 0;}
+template<auto Field>std::uint64_t texture_description(id self,SEL){return as<TextureObject>(self)->backend->description().*Field;}
 std::uint64_t texture_width(id self, SEL) {
   return as<TextureObject>(self)->backend->width();
 }
@@ -390,33 +555,41 @@ std::uint64_t texture_format(id self, SEL) {
   return as<TextureObject>(self)->backend->pixel_format();
 }
 std::uint64_t one(id, SEL) { return 1; }
-std::uint64_t two(id, SEL) { return 2; }
 std::uint64_t texture_replace(id self, SEL, const std::uint64_t *region,
                               std::uint64_t mip, const void *bytes,
                               std::uint64_t stride) {
   auto *t = as<TextureObject>(self);
   std::string error;
-  if (!region || mip || region[2] || region[5] != 1 || region[0] > UINT32_MAX ||
+  if (!region || mip>UINT32_MAX || region[2]>UINT32_MAX || region[5]>UINT32_MAX || region[0] > UINT32_MAX ||
       region[1] > UINT32_MAX || region[3] > UINT32_MAX ||
       region[4] > UINT32_MAX || t->framebuffer_only)
     error = "unsupported texture upload region/mip/framebufferOnly";
   else
     t->backend->replace(static_cast<std::uint32_t>(region[0]),
                         static_cast<std::uint32_t>(region[1]),
+                        static_cast<std::uint32_t>(region[2]),
                         static_cast<std::uint32_t>(region[3]),
-                        static_cast<std::uint32_t>(region[4]), bytes, stride,
+                        static_cast<std::uint32_t>(region[4]),static_cast<std::uint32_t>(region[5]),static_cast<std::uint32_t>(mip),0,bytes,stride,stride*region[4],
                         error);
   if (!error.empty())
     std::fprintf(stderr, "MEVK Metal: %s\n", error.c_str());
   return 0;
+}
+std::uint64_t texture_replace_slice(id self,SEL,const std::uint64_t *region,std::uint64_t mip,std::uint64_t slice,const void *bytes,std::uint64_t stride,std::uint64_t image_stride) {
+  std::string error;
+  if(!region||mip>UINT32_MAX||slice>UINT32_MAX||as<TextureObject>(self)->framebuffer_only)return 0;
+  for(unsigned i=0;i<6;++i)if(region[i]>UINT32_MAX)return 0;
+  as<TextureObject>(self)->backend->replace(static_cast<std::uint32_t>(region[0]),static_cast<std::uint32_t>(region[1]),static_cast<std::uint32_t>(region[2]),
+    static_cast<std::uint32_t>(region[3]),static_cast<std::uint32_t>(region[4]),static_cast<std::uint32_t>(region[5]),static_cast<std::uint32_t>(mip),static_cast<std::uint32_t>(slice),bytes,stride,image_stride,error);
+  if(!error.empty())std::fprintf(stderr,"MEVK Metal: %s\n",error.c_str());return 0;
 }
 std::uint64_t texture_get_bytes(id self, SEL, void *bytes, std::uint64_t stride,
                                 const std::uint64_t *region,
                                 std::uint64_t mip) {
   auto *t = as<TextureObject>(self);
   std::string error;
-  auto bpp = t->backend->pixel_format() == 10 ? 1u : 4u;
-  if (!bytes || !region || mip || region[2] || region[5] != 1 ||
+  auto bpp = t->backend->bytes_per_pixel();
+  if (!bpp || !bytes || !region || mip || region[2] || region[5] != 1 ||
       region[0] > t->backend->width() ||
       region[3] > t->backend->width() - region[0] ||
       region[1] > t->backend->height() ||
@@ -441,6 +614,25 @@ std::uint64_t texture_get_bytes(id self, SEL, void *bytes, std::uint64_t stride,
                 static_cast<std::size_t>(region[3] * bpp));
   return 0;
 }
+std::uint64_t blit_buffer_to_texture(id self,SEL,id source,std::uint64_t offset,std::uint64_t row_bytes,std::uint64_t image_bytes,
+    const std::uint64_t* size,id destination,std::uint64_t slice,std::uint64_t mip,const std::uint64_t* origin) {
+  auto& encoder=*as<Encoder>(self);std::lock_guard lock(encoder.state->mutex);
+  if(!encoder.state->diagnostic.empty())return 0;
+  if(encoder.ended||encoder.state->commit_requested||!size||!origin||slice>UINT32_MAX||mip>UINT32_MAX||
+     !is_kind(source,cls("MEVKBuffer"))||!is_kind(destination,MM_FW_CLASS_REF(MEVKTexture))) {
+    encoder.state->fail("invalid buffer-to-texture copy arguments or encoder state");return 0;
+  }
+  std::array<std::uint32_t,3> s{},o{};
+  for(unsigned i=0;i<3;++i) {
+    if(size[i]>UINT32_MAX||origin[i]>UINT32_MAX){encoder.state->fail("buffer-to-texture dimensions exceed supported range");return 0;}
+    s[i]=static_cast<std::uint32_t>(size[i]);o[i]=static_cast<std::uint32_t>(origin[i]);
+  }
+  std::string error;
+  if(!encoder.state->backend->copy_buffer_to_texture(as<Buffer>(source)->backend,offset,row_bytes,image_bytes,s,as<TextureObject>(destination)->backend,
+      static_cast<std::uint32_t>(slice),static_cast<std::uint32_t>(mip),o,error))encoder.state->fail(error);
+  else {encoder.state->resources.emplace_back(source);encoder.state->resources.emplace_back(destination);}
+  return 0;
+}
 
 std::uint64_t new_pipeline(id self, SEL, id descriptor, id *error) {
   if (error)
@@ -461,13 +653,15 @@ std::uint64_t new_pipeline(id self, SEL, id descriptor, id *error) {
     for (std::size_t i = 1; i < colors->values.size(); ++i)
       if (as<PipelineColor>(colors->values[i].value)->format)
         extra = true;
-    if (extra || d->samples != 1 || d->depth_format || d->stencil_format ||
-        d->vertex_descriptor.value || color->format > UINT32_MAX ||
+    if (extra || d->samples != 1 || (d->depth_format&&d->depth_format!=250&&d->depth_format!=252) || d->stencil_format ||
+        color->format > UINT32_MAX ||
         color->src_rgb > 10 || color->dst_rgb > 10 || color->src_alpha > 10 ||
         color->dst_alpha > 10 || color->op_rgb > 4 || color->op_alpha > 4 ||
         color->mask > 15)
-      message = "unsupported pipeline attachments, vertex layout, samples or "
-                "blend state";
+      message = "unsupported pipeline attachments, vertex layout, samples or blend state (color="+
+          std::to_string(color->format)+", extra="+std::to_string(extra)+", depth="+std::to_string(d->depth_format)+
+          ", stencil="+std::to_string(d->stencil_format)+", vertex_layout="+std::to_string(d->vertex_descriptor.value!=nullptr)+
+          ", samples="+std::to_string(d->samples)+")";
     else {
       mevk::BlendState blend;
       blend.enabled = color->enabled != 0;
@@ -481,11 +675,14 @@ std::uint64_t new_pipeline(id self, SEL, id descriptor, id *error) {
       if (as<Function>(d->vertex.value)->device.value != self ||
           as<Function>(d->fragment.value)->device.value != self)
         message = "pipeline functions belong to another device";
-      else
+      else {
+        mevk::VertexInput input;
+        if(vertex_input(d->vertex_descriptor.value,input,message))
         backend = as<Device>(self)->context->create_render_pipeline(
             *as<Function>(d->vertex.value)->shader,
             *as<Function>(d->fragment.value)->shader,
-            static_cast<std::uint32_t>(color->format), blend, message);
+            static_cast<std::uint32_t>(color->format), blend, message,&input,static_cast<std::uint32_t>(d->depth_format));
+      }
     }
   }
   if (!backend) {
@@ -503,7 +700,7 @@ std::uint64_t new_pipeline(id self, SEL, id descriptor, id *error) {
                  as<Function>(d->fragment.value)->shader->name.c_str());
   return ret(result);
 }
-bool encoding(RenderEncoder &encoder) {
+bool encoding(ResourceEncoder &encoder) {
   if (!encoder.state->diagnostic.empty())
     return false;
   if (encoder.ended || encoder.state->commit_requested) {
@@ -527,30 +724,36 @@ std::uint64_t render_encoder(id self, SEL, id descriptor) {
   auto *d = as<PassDescriptor>(descriptor);
   auto *colors = as<AttachmentArray>(obj(pass_colors(descriptor, nullptr)));
   auto *color = as<PassColor>(colors->values[0].value);
+  auto* depth=d->depth.value?as<PassColor>(d->depth.value):nullptr;
   bool extra = false;
   for (std::size_t i = 1; i < colors->values.size(); ++i)
     if (as<PassColor>(colors->values[i].value)->texture.value)
       extra = true;
   if (extra || !is_kind(color->texture.value, MM_FW_CLASS_REF(MEVKTexture)) ||
-      color->load > 2 || color->store > 1 || color->level || color->slice ||
+      color->load > 2 || color->store > 1 || color->level >= 32 || color->slice > UINT32_MAX ||
       color->plane || d->array_length != 1 ||
-      (d->depth.value && as<PassColor>(d->depth.value)->texture.value) ||
+      (depth&&depth->texture.value&&(!is_kind(depth->texture.value,MM_FW_CLASS_REF(MEVKTexture))||depth->level>=32||depth->slice>UINT32_MAX||depth->plane||depth->load>2||depth->store>1)) ||
       (d->stencil.value && as<PassColor>(d->stencil.value)->texture.value)) {
-    state->fail("render pass requires one supported color texture without "
-                "depth/stencil/resolve");
+    state->fail("render pass requires one supported color texture without depth/stencil/resolve (extra="+std::to_string(extra)+
+        ", mip="+std::to_string(color->level)+", slice="+std::to_string(color->slice)+", depth="+
+        std::to_string(d->depth.value&&as<PassColor>(d->depth.value)->texture.value)+")");
     return 0;
   }
   auto *target = as<TextureObject>(color->texture.value);
   id device = as<Queue>(command->queue.value)->device.value;
+  auto width=std::max(1u,target->backend->width()>>color->level),height=std::max(1u,target->backend->height()>>color->level);
   if (target->device.value != device ||
-      (d->width && d->width != target->backend->width()) ||
-      (d->height && d->height != target->backend->height())) {
+      (d->width && d->width != width) || (d->height && d->height != height)) {
     state->fail("render target device or dimensions mismatch");
     return 0;
   }
   std::string error;
+  mevk::DepthAttachment depth_attachment;
+  if(depth&&depth->texture.value) {
+    depth_attachment={as<TextureObject>(depth->texture.value)->backend,static_cast<std::uint32_t>(depth->level),static_cast<std::uint32_t>(depth->slice),depth->load!=1,depth->clear_depth};
+  }
   if (!state->backend->begin_render(target->backend, color->load != 1,
-                                    color->clear, error)) {
+                                    color->clear, error,&depth_attachment,static_cast<std::uint32_t>(color->level),static_cast<std::uint32_t>(color->slice))) {
     state->fail(error);
     return 0;
   }
@@ -560,12 +763,12 @@ std::uint64_t render_encoder(id self, SEL, id descriptor) {
   encoder->state = state;
   encoder->context = as<Device>(device)->context;
   encoder->viewport = {
-      0, 0, double(target->backend->width()), double(target->backend->height()),
+      0, 0, double(width), double(height),
       0, 1};
-  encoder->scissor = {0, 0, target->backend->width(),
-                      target->backend->height()};
+  encoder->scissor = {0, 0, width,height};
   state->encoder_active = true;
   state->resources.emplace_back(color->texture.value);
+  if(depth&&depth->texture.value)state->resources.emplace_back(depth->texture.value);
   return ret(autorelease(reinterpret_cast<id>(encoder)));
 }
 std::uint64_t render_end(id self, SEL) {
@@ -604,46 +807,56 @@ std::uint64_t render_pipeline(id self, SEL, id pipeline) {
 }
 std::uint64_t render_buffer(id self, SEL selector, id buffer,
                             std::uint64_t offset, std::uint64_t index) {
-  auto &encoder = *as<RenderEncoder>(self);
+  auto &encoder = resource_encoder(self);
   std::lock_guard lock(encoder.state->mutex);
   if (!encoding(encoder))
     return 0;
-  if (index >= 16 || offset > UINT32_MAX ||
+  bool vertex=std::strstr(selector,"Vertex")!=nullptr;
+  if (index >= (vertex?32u:16u) || (index<16&&offset > UINT32_MAX) ||
       (buffer && !is_kind(buffer, cls("MEVKBuffer")))) {
     encoder.state->fail("invalid render buffer/index/offset");
     return 0;
   }
   auto slot = static_cast<std::size_t>(index) +
               (std::strstr(selector, "Fragment") ? 16u : 0u);
+  if(vertex) {
+    encoder.bindings.vertex_buffers[static_cast<std::size_t>(index)]=buffer?as<Buffer>(buffer)->backend:nullptr;
+    encoder.bindings.vertex_offsets[static_cast<std::size_t>(index)]=offset;
+  }
+  if(index<16) {
   encoder.bindings.buffers[slot] =
       buffer ? as<Buffer>(buffer)->backend : nullptr;
   encoder.bindings.offsets[slot] = static_cast<std::uint32_t>(offset);
+  }
   if (buffer)
     encoder.state->resources.emplace_back(buffer);
   return 0;
 }
 std::uint64_t render_buffer_offset(id self, SEL selector, std::uint64_t offset,
                                    std::uint64_t index) {
-  auto &encoder = *as<RenderEncoder>(self);
+  auto &encoder = resource_encoder(self);
   std::lock_guard lock(encoder.state->mutex);
   if (!encoding(encoder))
     return 0;
-  if (index >= 16 || offset > UINT32_MAX) {
+  bool vertex=std::strstr(selector,"Vertex")!=nullptr;
+  if (index >= (vertex?32u:16u) || (index<16&&offset > UINT32_MAX)) {
     encoder.state->fail("invalid render buffer offset/index");
     return 0;
   }
-  encoder.bindings.offsets[static_cast<std::size_t>(index) +
+  if(vertex)encoder.bindings.vertex_offsets[static_cast<std::size_t>(index)]=offset;
+  if(index<16)encoder.bindings.offsets[static_cast<std::size_t>(index) +
                            (std::strstr(selector, "Fragment") ? 16u : 0u)] =
       static_cast<std::uint32_t>(offset);
   return 0;
 }
 std::uint64_t render_bytes(id self, SEL selector, const void *bytes,
                            std::uint64_t size, std::uint64_t index) {
-  auto &encoder = *as<RenderEncoder>(self);
+  auto &encoder = resource_encoder(self);
   std::lock_guard lock(encoder.state->mutex);
   if (!encoding(encoder))
     return 0;
-  if (!bytes || !size || size > 4096 || index >= 16) {
+  bool vertex=std::strstr(selector,"Vertex")!=nullptr;
+  if (!bytes || !size || size > 4096 || index >= (vertex?32u:16u)) {
     encoder.state->fail("invalid inline render bytes (maximum 4096)");
     return 0;
   }
@@ -656,17 +869,20 @@ std::uint64_t render_bytes(id self, SEL selector, const void *bytes,
   std::memcpy(buffer->contents(), bytes, static_cast<std::size_t>(size));
   auto slot = static_cast<std::size_t>(index) +
               (std::strstr(selector, "Fragment") ? 16u : 0u);
-  encoder.bindings.buffers[slot] = std::move(buffer);
-  encoder.bindings.offsets[slot] = 0;
+  if(vertex) {
+    encoder.bindings.vertex_buffers[static_cast<std::size_t>(index)]=buffer;
+    encoder.bindings.vertex_offsets[static_cast<std::size_t>(index)]=0;
+  }
+  if(index<16){encoder.bindings.buffers[slot] = std::move(buffer);encoder.bindings.offsets[slot] = 0;}
   return 0;
 }
 std::uint64_t render_texture(id self, SEL selector, id texture,
                              std::uint64_t index) {
-  auto &encoder = *as<RenderEncoder>(self);
+  auto &encoder = resource_encoder(self);
   std::lock_guard lock(encoder.state->mutex);
   if (!encoding(encoder))
     return 0;
-  if (index >= 16 ||
+  if (index >= 32 ||
       (texture && !is_kind(texture, MM_FW_CLASS_REF(MEVKTexture)))) {
     encoder.state->fail("invalid shader texture/index");
     return 0;
@@ -676,12 +892,54 @@ std::uint64_t render_texture(id self, SEL selector, id texture,
     return 0;
   }
   auto slot = static_cast<std::size_t>(index) +
-              (std::strstr(selector, "Fragment") ? 16u : 0u);
+              (std::strstr(selector, "Fragment") ? 32u : 0u);
   encoder.bindings.textures[slot] =
       texture ? as<TextureObject>(texture)->backend : nullptr;
   if (texture)
     encoder.state->resources.emplace_back(texture);
   return 0;
+}
+std::uint64_t render_sampler(id self,SEL selector,id sampler,std::uint64_t index) {
+  auto &encoder=resource_encoder(self);std::lock_guard lock(encoder.state->mutex);
+  if(!encoding(encoder))return 0;
+  if(index>=16||(sampler&&!is_kind(sampler,MM_FW_CLASS_REF(MEVKSamplerState)))){encoder.state->fail("invalid shader sampler/index");return 0;}
+  auto slot=static_cast<std::size_t>(index)+(std::strstr(selector,"Fragment")?16u:0u);
+  encoder.bindings.samplers[slot]=sampler?as<SamplerObject>(sampler)->backend:nullptr;
+  if(sampler)encoder.state->resources.emplace_back(sampler);return 0;
+}
+std::uint64_t new_compute_pipeline(id self,SEL,id function,id *error) {
+  if(error)*error=nullptr;std::string message;
+  std::shared_ptr<mevk::ComputePipeline> backend;
+  if(!is_kind(function,MM_FW_CLASS_REF(MEVKFunction))||as<Function>(function)->device.value!=self)message="compute function belongs to another device or is invalid";
+  else backend=as<Device>(self)->context->create_compute_pipeline(*as<Function>(function)->shader,message);
+  if(!backend){if(error)*error=error_object(mevk_pipeline_error_domain,1,message);std::fprintf(stderr,"MEVK Metal compute: %s\n",message.c_str());return 0;}
+  auto *p=make<ComputePipelineObject>(MM_FW_CLASS_REF(MEVKComputePipelineState));p->device.set(self);p->backend=std::move(backend);return ret(p);
+}
+std::uint64_t compute_encoder(id self,SEL) {
+  auto *command=as<Command>(self);auto state=command->state;std::lock_guard lock(state->mutex);
+  if(!state->diagnostic.empty())return 0;
+  if(state->commit_requested||state->encoder_active){state->fail("overlapping or committed compute encoder");return 0;}
+  auto *e=make<ComputeEncoder>(MM_FW_CLASS_REF(MEVKComputeCommandEncoder));e->command.set(self);e->state=state;
+  e->context=as<Device>(as<Queue>(command->queue.value)->device.value)->context;state->encoder_active=true;
+  return ret(autorelease(reinterpret_cast<id>(e)));
+}
+std::uint64_t compute_end(id self,SEL) {
+  auto &e=*as<ComputeEncoder>(self);std::lock_guard lock(e.state->mutex);
+  if(e.ended){e.state->fail("compute endEncoding called twice");return 0;}
+  e.ended=true;e.state->encoder_active=false;return 0;
+}
+std::uint64_t compute_pipeline(id self,SEL,id pipeline) {
+  auto &e=*as<ComputeEncoder>(self);std::lock_guard lock(e.state->mutex);
+  if(!encoding(e))return 0;
+  if(!is_kind(pipeline,MM_FW_CLASS_REF(MEVKComputePipelineState))){e.state->fail("invalid compute pipeline");return 0;}
+  e.pipeline=as<ComputePipelineObject>(pipeline)->backend;return 0;
+}
+std::uint64_t compute_dispatch(id self,SEL,const std::uint64_t *groups,const std::uint64_t *threads) {
+  auto &e=*as<ComputeEncoder>(self);std::lock_guard lock(e.state->mutex);if(!encoding(e))return 0;
+  if(!groups||!threads){e.state->fail("null compute dispatch dimensions");return 0;}
+  std::array<std::uint32_t,3> g{},t{};
+  for(unsigned i=0;i<3;++i){if(groups[i]>UINT32_MAX||threads[i]>UINT32_MAX){e.state->fail("compute dispatch dimension overflow");return 0;}g[i]=static_cast<std::uint32_t>(groups[i]);t[i]=static_cast<std::uint32_t>(threads[i]);}
+  std::string error;if(!e.state->backend->dispatch(e.pipeline,e.bindings,g,t,error))e.state->fail(error);return 0;
 }
 std::uint64_t render_viewport(id self, SEL, const mevk::Viewport *viewport) {
   auto &encoder = *as<RenderEncoder>(self);
@@ -739,7 +997,7 @@ std::uint64_t draw_common(id self, std::uint64_t primitive, std::uint64_t start,
           static_cast<std::uint32_t>(base_instance),
           indices ? as<Buffer>(indices)->backend : nullptr, offset,
           static_cast<std::uint32_t>(index_type),
-          static_cast<std::int32_t>(base_vertex), error))
+          static_cast<std::int32_t>(base_vertex), error,&encoder.depth,&encoder.raster))
     encoder.state->fail(error);
   if (indices)
     encoder.state->resources.emplace_back(indices);
@@ -1002,7 +1260,19 @@ void register_render_classes(Class device, Class command) {
   DEFINE(TextureObject, MEVKTexture);
   DEFINE(PipelineObject, MEVKRenderPipelineState);
   DEFINE(RenderEncoder, MEVKRenderCommandEncoder);
+  DEFINE(ComputeEncoder, MEVKComputeCommandEncoder);
+  DEFINE(ComputePipelineObject, MEVKComputePipelineState);
   DEFINE(TextureDescriptor, MTLTextureDescriptor);
+  DEFINE(SamplerDescriptor, MTLSamplerDescriptor);
+  DEFINE(SamplerObject, MEVKSamplerState);
+  DEFINE(VertexDescriptor, MTLVertexDescriptor);
+  DEFINE(VertexAttribute, MTLVertexAttributeDescriptor);
+  DEFINE(VertexBufferLayout, MTLVertexBufferLayoutDescriptor);
+  DEFINE(AttachmentArray, MTLVertexAttributeDescriptorArray);
+  DEFINE(AttachmentArray, MTLVertexBufferLayoutDescriptorArray);
+  DEFINE(DepthDescriptor, MTLDepthStencilDescriptor);
+  DEFINE(DepthObject, MEVKDepthStencilState);
+  DEFINE(PassColor, MTLRenderPassDepthAttachmentDescriptor);
   DEFINE(PipelineDescriptor, MTLRenderPipelineDescriptor);
   DEFINE(PipelineColor, MTLRenderPipelineColorAttachmentDescriptor);
   DEFINE(AttachmentArray, MTLRenderPipelineColorAttachmentDescriptorArray);
@@ -1015,17 +1285,25 @@ void register_render_classes(Class device, Class command) {
   MM_METHODS(
       device,
       {"newLibraryWithFile:error:", MM_IMP(library_file), "@32@0:8@16^@24"},
+      {"newLibraryWithData:error:", MM_IMP(library_data), "@32@0:8@16^@24"},
       {"newLibraryWithURL:error:", MM_IMP(library_url), "@32@0:8@16^@24"},
       {"newDefaultLibrary", MM_IMP(library_default), "@16@0:8"},
       {"newDefaultLibraryWithBundle:error:", MM_IMP(library_default_bundle),
        "@32@0:8@16^@24"},
       {"newTextureWithDescriptor:", MM_IMP(new_texture), "@24@0:8@16"},
+      {"newSamplerStateWithDescriptor:",MM_IMP(new_sampler),"@24@0:8@16"},
+      {"newDepthStencilStateWithDescriptor:",MM_IMP(new_depth_state),"@24@0:8@16"},
+      {"newComputePipelineStateWithFunction:error:",MM_IMP(new_compute_pipeline),"@32@0:8@16^@24"},
       {"newRenderPipelineStateWithDescriptor:error:", MM_IMP(new_pipeline),
        "@32@0:8@16^@24"});
   MM_METHODS(command,
+             {"computeCommandEncoder",MM_IMP(compute_encoder),"@16@0:8"},
              {"renderCommandEncoderWithDescriptor:", MM_IMP(render_encoder),
               "@24@0:8@16"},
              {"presentDrawable:", MM_IMP(command_present), "v24@0:8@16"});
+  MM_METHODS(cls("MEVKBlitCommandEncoder"),
+      {"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+       MM_IMP(blit_buffer_to_texture),"v120@0:8@16Q24Q32Q40{MTLSize=QQQ}48@72Q80Q88{MTLOrigin=QQQ}96"});
   MM_METHODS(
       MEVKLibrary,
       {"device", MM_IMP((get_object<Library, &Library::device>)), "@16@0:8"},
@@ -1046,17 +1324,18 @@ void register_render_classes(Class device, Class command) {
       {"width", MM_IMP(texture_width), "Q16@0:8"},
       {"height", MM_IMP(texture_height), "Q16@0:8"},
       {"pixelFormat", MM_IMP(texture_format), "Q16@0:8"},
-      {"depth", MM_IMP(one), "Q16@0:8"},
-      {"arrayLength", MM_IMP(one), "Q16@0:8"},
-      {"mipmapLevelCount", MM_IMP(one), "Q16@0:8"},
+      {"depth", MM_IMP((texture_description<&mevk::TextureDescription::depth>)), "Q16@0:8"},
+      {"arrayLength", MM_IMP((texture_description<&mevk::TextureDescription::array_length>)), "Q16@0:8"},
+      {"mipmapLevelCount", MM_IMP((texture_description<&mevk::TextureDescription::mips>)), "Q16@0:8"},
       {"sampleCount", MM_IMP(one), "Q16@0:8"},
-      {"textureType", MM_IMP(two), "Q16@0:8"},
+      {"textureType", MM_IMP((texture_description<&mevk::TextureDescription::type>)), "Q16@0:8"},
       {"storageMode", MM_IMP((get<TextureObject, &TextureObject::storage>)),
        "Q16@0:8"},
       {"usage", MM_IMP((get<TextureObject, &TextureObject::usage>)), "Q16@0:8"},
       {"replaceRegion:mipmapLevel:withBytes:bytesPerRow:",
        MM_IMP(texture_replace),
        "v88@0:8{MTLRegion={MTLOrigin=QQQ}{MTLSize=QQQ}}16Q64^v72Q80"},
+      {"replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:",MM_IMP(texture_replace_slice),"v104@0:8{MTLRegion={MTLOrigin=QQQ}{MTLSize=QQQ}}16Q64Q72^v80Q88Q96"},
       {"getBytes:bytesPerRow:fromRegion:mipmapLevel:",
        MM_IMP(texture_get_bytes),
        "v88@0:8^v16Q24{MTLRegion={MTLOrigin=QQQ}{MTLSize=QQQ}}32Q80"});
@@ -1064,6 +1343,22 @@ void register_render_classes(Class device, Class command) {
       MTLTextureDescriptor,
       {"texture2DDescriptorWithPixelFormat:width:height:mipmapped:",
        MM_IMP(texture_factory), "@48@0:8Q16Q24Q32B40"});
+  MM_METHODS(MEVKSamplerState,{"device",MM_IMP((get_object<SamplerObject,&SamplerObject::device>)),"@16@0:8"});
+#define S(g,s,f) MM_METHODS(MTLSamplerDescriptor,{g,MM_IMP((sampler_get<&mevk::SamplerDescription::f>)),"Q16@0:8"},{s,MM_IMP((sampler_set<&mevk::SamplerDescription::f>)),"v24@0:8Q16"})
+  S("minFilter","setMinFilter:",min_filter);S("magFilter","setMagFilter:",mag_filter);S("mipFilter","setMipFilter:",mip_filter);
+  S("sAddressMode","setSAddressMode:",address_s);S("tAddressMode","setTAddressMode:",address_t);S("rAddressMode","setRAddressMode:",address_r);
+  S("maxAnisotropy","setMaxAnisotropy:",max_anisotropy);S("compareFunction","setCompareFunction:",compare);
+#undef S
+  MM_METHODS(MTLSamplerDescriptor,{"normalizedCoordinates",MM_IMP((sampler_get<&mevk::SamplerDescription::normalized>)),"B16@0:8"},{"setNormalizedCoordinates:",MM_IMP((sampler_set<&mevk::SamplerDescription::normalized>)),"v24@0:8B16"},
+    {"lodMinClamp",MM_IMP((sampler_float_get<&mevk::SamplerDescription::lod_min>)),"f16@0:8"},{"setLodMinClamp:",MM_IMP((sampler_float_set<&mevk::SamplerDescription::lod_min>)),"v24@0:8f16"},
+    {"lodMaxClamp",MM_IMP((sampler_float_get<&mevk::SamplerDescription::lod_max>)),"f16@0:8"},{"setLodMaxClamp:",MM_IMP((sampler_float_set<&mevk::SamplerDescription::lod_max>)),"v24@0:8f16"});
+  MM_METHODS(MEVKRenderCommandEncoder,{"setVertexSamplerState:atIndex:",MM_IMP(render_sampler),"v32@0:8@16Q24"},{"setFragmentSamplerState:atIndex:",MM_IMP(render_sampler),"v32@0:8@16Q24"});
+  MM_METHODS(MEVKComputePipelineState,{"device",MM_IMP((get_object<ComputePipelineObject,&ComputePipelineObject::device>)),"@16@0:8"});
+  MM_METHODS(MEVKComputeCommandEncoder,{"endEncoding",MM_IMP(compute_end),"v16@0:8"},{"setComputePipelineState:",MM_IMP(compute_pipeline),"v24@0:8@16"},
+    {"setBuffer:offset:atIndex:",MM_IMP(render_buffer),"v40@0:8@16Q24Q32"},{"setBufferOffset:atIndex:",MM_IMP(render_buffer_offset),"v32@0:8Q16Q24"},
+    {"setBytes:length:atIndex:",MM_IMP(render_bytes),"v40@0:8^v16Q24Q32"},{"setTexture:atIndex:",MM_IMP(render_texture),"v32@0:8@16Q24"},
+    {"setSamplerState:atIndex:",MM_IMP(render_sampler),"v32@0:8@16Q24"},
+    {"dispatchThreadgroups:threadsPerThreadgroup:",MM_IMP(compute_dispatch),"v64@0:8{MTLSize=QQQ}16{MTLSize=QQQ}40"});
 #define U(c, T, g, s, f) uint_property<T, &T::f>(c, g, s)
   U(MTLTextureDescriptor, TextureDescriptor, "width", "setWidth:", width);
   U(MTLTextureDescriptor, TextureDescriptor, "height", "setHeight:", height);
@@ -1127,7 +1422,25 @@ void register_render_classes(Class device, Class command) {
     "setRenderTargetHeight:", height);
   U(MTLRenderPassDescriptor, PassDescriptor, "renderTargetArrayLength",
     "setRenderTargetArrayLength:", array_length);
+  U(MTLVertexAttributeDescriptor,VertexAttribute,"format","setFormat:",format);
+  U(MTLVertexAttributeDescriptor,VertexAttribute,"offset","setOffset:",offset);
+  U(MTLVertexAttributeDescriptor,VertexAttribute,"bufferIndex","setBufferIndex:",buffer);
+  U(MTLVertexBufferLayoutDescriptor,VertexBufferLayout,"stride","setStride:",stride);
+  U(MTLVertexBufferLayoutDescriptor,VertexBufferLayout,"stepFunction","setStepFunction:",step_function);
+  U(MTLVertexBufferLayoutDescriptor,VertexBufferLayout,"stepRate","setStepRate:",step_rate);
+  U(MTLDepthStencilDescriptor,DepthDescriptor,"depthCompareFunction","setDepthCompareFunction:",compare);
+  U(MTLRenderPassDepthAttachmentDescriptor,PassColor,"loadAction","setLoadAction:",load);
+  U(MTLRenderPassDepthAttachmentDescriptor,PassColor,"storeAction","setStoreAction:",store);
+  U(MTLRenderPassDepthAttachmentDescriptor,PassColor,"level","setLevel:",level);
+  U(MTLRenderPassDepthAttachmentDescriptor,PassColor,"slice","setSlice:",slice);
+  U(MTLRenderPassDepthAttachmentDescriptor,PassColor,"depthPlane","setDepthPlane:",plane);
 #undef U
+  bool_property<DepthDescriptor,&DepthDescriptor::write>(MTLDepthStencilDescriptor,"isDepthWriteEnabled","setDepthWriteEnabled:");
+  object_property<PassColor,&PassColor::texture>(MTLRenderPassDepthAttachmentDescriptor,"texture","setTexture:");
+  MM_METHODS(MEVKDepthStencilState,{"device",MM_IMP((get_object<DepthObject,&DepthObject::device>)),"@16@0:8"});
+  MM_METHODS(MTLVertexDescriptor,{"attributes",MM_IMP(vertex_array<true>),"@16@0:8"},{"layouts",MM_IMP(vertex_array<false>),"@16@0:8"});
+  MM_CLASS_METHODS(MTLVertexDescriptor,{"vertexDescriptor",MM_IMP(vertex_factory),"@16@0:8"});
+  MM_METHODS(MTLRenderPassDepthAttachmentDescriptor,{"clearDepth",MM_IMP(pass_clear_depth),"d16@0:8"},{"setClearDepth:",MM_IMP(set_pass_clear_depth),"v24@0:8d16"});
   object_property<PipelineDescriptor, &PipelineDescriptor::vertex>(
       MTLRenderPipelineDescriptor, "vertexFunction", "setVertexFunction:");
   object_property<PipelineDescriptor, &PipelineDescriptor::fragment>(
@@ -1145,7 +1458,7 @@ void register_render_classes(Class device, Class command) {
   MM_CLASS_METHODS(MTLRenderPassDescriptor,
                    {"renderPassDescriptor", MM_IMP(pass_factory), "@16@0:8"});
   for (Class array : {MTLRenderPassColorAttachmentDescriptorArray,
-                      MTLRenderPipelineColorAttachmentDescriptorArray})
+                      MTLRenderPipelineColorAttachmentDescriptorArray,MTLVertexAttributeDescriptorArray,MTLVertexBufferLayoutDescriptorArray})
     MM_METHODS(array,
                {"objectAtIndexedSubscript:", MM_IMP(array_at), "@24@0:8Q16"},
                {"objectAtIndex:", MM_IMP(array_at), "@24@0:8Q16"});
@@ -1157,6 +1470,12 @@ void register_render_classes(Class device, Class command) {
       MEVKRenderCommandEncoder, {"device", MM_IMP(render_device), "@16@0:8"},
       {"endEncoding", MM_IMP(render_end), "v16@0:8"},
       {"setRenderPipelineState:", MM_IMP(render_pipeline), "v24@0:8@16"},
+      {"setDepthStencilState:",MM_IMP(render_depth_state),"v24@0:8@16"},
+      {"setCullMode:",MM_IMP((render_raster<&mevk::RasterState::cull>)),"v24@0:8Q16"},
+      {"setFrontFacingWinding:",MM_IMP((render_raster<&mevk::RasterState::winding>)),"v24@0:8Q16"},
+      {"setTriangleFillMode:",MM_IMP((render_raster<&mevk::RasterState::fill>)),"v24@0:8Q16"},
+      {"setDepthClipMode:",MM_IMP((render_raster<&mevk::RasterState::depth_clip>)),"v24@0:8Q16"},
+      {"setDepthBias:slopeScale:clamp:",MM_IMP(render_depth_bias),"v28@0:8f16f20f24"},
       {"setVertexBuffer:offset:atIndex:", MM_IMP(render_buffer),
        "v40@0:8@16Q24Q32"},
       {"setFragmentBuffer:offset:atIndex:", MM_IMP(render_buffer),

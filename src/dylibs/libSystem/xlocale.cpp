@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <cwchar>
 #include <langinfo.h>
@@ -139,6 +140,22 @@ char *darwin_nl_langinfo(int item) { return nl_langinfo(langinfo_item_from_darwi
 char *darwin_nl_langinfo_l(int item, locale_t loc) DARWIN(nl_langinfo_l);
 char *darwin_nl_langinfo_l(int item, locale_t loc) {
     return with_locale(loc, [&] { return nl_langinfo(langinfo_item_from_darwin(item)); });
+}
+
+/* libc++ uses a NULL locale for its classic time facets. Darwin treats
+ * that as the current locale, while glibc's explicit *_l entry points
+ * dereference it. struct tm has the same layout on these 64-bit targets. */
+std::size_t darwin_strftime_l(char *, std::size_t, const char *, const std::tm *, locale_t) DARWIN(strftime_l);
+std::size_t darwin_strftime_l(char *text, std::size_t size, const char *format, const std::tm *time, locale_t loc) {
+    return with_locale(loc, [&] { return std::strftime(text, size, format, time); });
+}
+std::size_t darwin_wcsftime_l(wchar_t *, std::size_t, const wchar_t *, const std::tm *, locale_t) DARWIN(wcsftime_l);
+std::size_t darwin_wcsftime_l(wchar_t *text, std::size_t size, const wchar_t *format, const std::tm *time, locale_t loc) {
+    return with_locale(loc, [&] { return std::wcsftime(text, size, format, time); });
+}
+char *darwin_strptime_l(const char *, const char *, std::tm *, locale_t) DARWIN(strptime_l);
+char *darwin_strptime_l(const char *text, const char *format, std::tm *time, locale_t loc) {
+    return with_locale(loc, [&] { return ::strptime(text, format, time); });
 }
 
 /* Numeric conversions: NULL locales are used by Live's preferences parser. */

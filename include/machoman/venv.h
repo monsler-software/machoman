@@ -9,6 +9,8 @@
 #define MACHOMAN_VENV_H
 
 #include <filesystem>
+#include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,6 +21,8 @@ enum class mm_venv_status {
     manifest_write_failed,
     not_found,
     bad_dylib_name,
+    invalid_manifest,
+    invalid_environment,
 };
 
 /* Fixed relative layout created under a venv root. */
@@ -31,6 +35,9 @@ inline constexpr std::string_view MM_VENV_LAUNCHER_MAGIC = "machoman-app-v1";
 
 struct mm_venv {
     std::filesystem::path root;
+    /* Persistent launch defaults; null removes an inherited variable. */
+    std::map<std::string, std::optional<std::string>, std::less<>> env;
+    std::string manifest_error;
 
     std::filesystem::path path(std::string_view relative) const { return root / relative; }
 };
@@ -44,6 +51,12 @@ mm_venv_status mm_venv_create(const std::filesystem::path &root_path, mm_venv &o
  * validate every framework stub exists; that is left to whichever layer
  * actually needs a given dependency. */
 mm_venv_status mm_venv_open(const std::filesystem::path &root_path, mm_venv &out);
+
+/* Atomic read-modify-write preserving unrelated manifest fields. An absent
+ * value masks the variable; inherit=true removes its persistent override.
+ * Serializes concurrent writers with a per-venv configuration lock. */
+mm_venv_status mm_venv_update_environment(mm_venv &venv, std::string_view name,
+    std::optional<std::string_view> value, bool inherit = false);
 
 /* Registers that `dylib_name` should resolve within this venv, creating an
  * empty placeholder stub under usr/lib if none exists yet. Accepts the

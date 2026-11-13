@@ -5,11 +5,15 @@ Objective-C, guest runtime, Wayland or MEVK dependency. The caller supplies a
 current OpenGL context, its default framebuffer, and a list of controls in
 logical points with a top-left origin.
 
-Rounded controls, focus, pressed and disabled states, clipping and text
-compositing run on OpenGL. Pango shapes Unicode text and Cairo rasterizes glyph
-masks, which are cached in GL textures. Supported items are labels, buttons,
-checkboxes and text fields. Images, tables, scroll views and arbitrary guest
-`drawRect:` implementations are not yet rendered by this package.
+The dark appearance uses macOS-style rounded controls, vertical bezel
+gradients, soft shadows, blue default buttons and popup arrows, inset fields
+and titled groups.
+Focus, pressed and disabled states, clipping and text compositing run on OpenGL.
+Pango shapes Unicode text and Cairo rasterizes glyph masks, cached in GL textures.
+Items include labels, buttons, checkboxes, radio buttons, text fields, popup and
+combo boxes, sliders, progress indicators, segmented controls, images, groups,
+tables and scroll views. The AppKit adapter supplies guest `drawRect:` bitmap
+snapshots through image items.
 
 Dependencies: libepoxy and pangocairo; EGL for framebuffer tests.
 

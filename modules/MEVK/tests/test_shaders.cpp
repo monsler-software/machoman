@@ -15,19 +15,20 @@ void check(bool yes, const char *message) {
     std::exit(1);
   }
 }
-std::vector<std::uint8_t> bitcode(const std::string &instructions) {
+std::vector<std::uint8_t> assembly_bitcode(const std::string &assembly) {
   llvm::LLVMContext context;
   llvm::SMDiagnostic diagnostic;
-  auto module = llvm::parseAssemblyString(
-      "define <4 x float> @test() {\n" + instructions +
-          "\nret <4 x float> zeroinitializer\n}\n!air.fragment = !{!0}\n"
-          "!0 = !{ptr @test, !1, !1}\n!1 = !{}\n",
-      diagnostic, context);
+  auto module = llvm::parseAssemblyString(assembly, diagnostic, context);
   check(bool(module), "assemble AIR test input");
   llvm::SmallVector<char, 0> data;
   llvm::raw_svector_ostream stream(data);
   llvm::WriteBitcodeToFile(*module, stream);
   return {data.begin(), data.end()};
+}
+std::vector<std::uint8_t> bitcode(const std::string &instructions) {
+  return assembly_bitcode("define <4 x float> @test() {\n" + instructions +
+          "\nret <4 x float> zeroinitializer\n}\n!air.fragment = !{!0}\n"
+          "!0 = !{ptr @test, !1, !1}\n!1 = !{}\n");
 }
 void put(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint64_t n,
          unsigned width) {
@@ -37,6 +38,28 @@ void put(std::vector<std::uint8_t> &bytes, std::size_t offset, std::uint64_t n,
 int main() {
   mevk::ShaderFunction shader;
   std::string error;
+  auto packed = assembly_bitcode(
+      "declare float @air.fast_exp2.f32(float)\n"
+      "define <{ <4 x float> }> @test(<4 x float> %color) {\n"
+      "%bits = bitcast <4 x float> %color to <4 x i32>\n"
+      "%floats = bitcast <4 x i32> %bits to <4 x float>\n"
+      "%e = call float @air.fast_exp2.f32(float 0.0)\n"
+      "%v = insertelement <4 x float> %floats, float %e, i32 3\n"
+      "%r = insertvalue <{ <4 x float> }> undef, <4 x float> %v, 0\n"
+      "ret <{ <4 x float> }> %r\n}\n"
+      "!air.fragment = !{!0}\n!0 = !{ptr @test, !1, !3}\n"
+      "!1 = !{!2}\n!2 = !{!\"air.render_target\", i32 0}\n"
+      "!3 = !{!4}\n!4 = !{i32 0, !\"air.fragment_input\", !\"user(locn4)\"}\n");
+  check(mevk::translate_air(packed, shader, error) && !shader.spirv.empty(),
+        "packed fragment color, vector bitcasts and exp2 compile");
+  check(shader.glsl.find("layout(location=4) in vec4") != std::string::npos,
+        "fragment varying preserves AIR location instead of argument order");
+  auto invalid_target = assembly_bitcode(
+      "define <{ <4 x float> }> @test() { ret <{ <4 x float> }> zeroinitializer }\n"
+      "!air.fragment = !{!0}\n!0 = !{ptr @test, !1, !3}\n"
+      "!1 = !{!2}\n!2 = !{!\"air.render_target\", i32 8}\n!3 = !{}\n");
+  check(!mevk::translate_air(invalid_target, shader, error) && !error.empty(),
+        "unsupported fragment render target rejected");
   auto good = bitcode("%i = zext i32 3 to i64\n%p = getelementptr float, ptr "
                       "null, i64 %i\n%v = load float, ptr %p");
   if (!mevk::translate_air(good, shader, error)) {

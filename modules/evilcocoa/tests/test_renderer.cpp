@@ -1,6 +1,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <epoxy/egl.h>
 #include <epoxy/gl.h>
 #include <evilcocoa/renderer.h>
@@ -58,11 +60,23 @@ int main() {
         renderer.draw(items, 240, 140);
         auto normal = read();
         require(pixel(normal, 15, 70) > pixel(normal, 200, 120), "button fill visible");
+        require(pixel(normal, 20, 56) > pixel(normal, 20, 84), "button has a vertical gradient");
+        require(pixel(normal, 80, 91) < pixel(normal, 200, 120), "shadow extends below the button");
         int text_pixels = 0;
         for (int y = 8; y < 36; y++)
             for (int x = 10; x < 230; x++)
                 text_pixels += pixel(normal, x, y) > 180;
         require(text_pixels > 40, "Unicode glyphs composited");
+        items[0].text_color = {1.f,0.f,0.f,1.f};
+        renderer.draw(items,240,140);
+        auto red_text = read();
+        int red_glyphs = 0;
+        for (int y=8; y<36; ++y) for (int x=10; x<230; ++x) {
+            const auto offset=(std::size_t(139-y)*240+x)*4;
+            red_glyphs += red_text[offset]>180 && red_text[offset+1]<80 && red_text[offset+2]<80;
+        }
+        require(red_glyphs>40,"attributed foreground colors tint glyphs");
+        items[0].text_color.reset();
         items[1].pressed = true;
         renderer.draw(items, 240, 140);
         auto pressed = read();
@@ -76,6 +90,7 @@ int main() {
         renderer.draw(items, 240, 140);
         auto clipped = read();
         require(pixel(clipped, 15, 70) == pixel(clipped, 200, 120), "clip excludes control");
+        require(pixel(clipped, 80, 91) == pixel(clipped, 200, 120), "containing clip also excludes shadow");
         renderer.draw(items, 240, 140, 2);
         read();
         evilcocoa::item centered;
@@ -114,6 +129,19 @@ int main() {
         require(channel(12, 48, 2) > 230, "image bottom row remains below top row");
         require(channel(48, 48, 0) > 130 && channel(48, 48, 0) < 170,
                 "premultiplied alpha blends without multiplying twice");
+        evilcocoa::item menu;
+        menu.type = evilcocoa::kind::menu_item;
+        menu.frame = {10,50,180,30}; menu.clip = {0,0,240,140};
+        renderer.draw(std::span(&menu,1),240,140);
+        auto resting = read();
+        menu.pressed = true;
+        renderer.draw(std::span(&menu,1),240,140);
+        require(renderer.animating(),"hover transition requests subsequent frames");
+        std::this_thread::sleep_for(std::chrono::milliseconds(140));
+        renderer.draw(std::span(&menu,1),240,140);
+        auto hovered = read();
+        require(!renderer.animating() && pixel(hovered,30,65)>pixel(resting,30,65),
+                "hover settles into the selected fill and stops requesting frames");
         for (auto kind :
              {evilcocoa::kind::checkbox, evilcocoa::kind::radio, evilcocoa::kind::popup, evilcocoa::kind::combo_box,
               evilcocoa::kind::slider, evilcocoa::kind::progress, evilcocoa::kind::scroller,

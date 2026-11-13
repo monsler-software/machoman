@@ -84,8 +84,11 @@ const char *length_str(length l) {
 }
 
 /* One argument fetch honoring positional directives (each slot is 8 bytes). */
-mm_guest_va_list arg_source(mm_guest_va_list &seq, std::uint64_t base, int position) {
-    if (position > 0) return mm_guest_va_list(base + static_cast<std::uint64_t>(position - 1) * 8);
+mm_guest_va_list arg_source(mm_guest_va_list &seq, mm_guest_va_list base, int position) {
+    if (position > 0) {
+        for (int i = 1; i < position; ++i) base.next_u64();
+        return base;
+    }
     return seq;
 }
 
@@ -103,7 +106,7 @@ template <typename T> void put(std::string &out, const std::string &spec, T v) {
 /* Formats `fmt` with guest arguments starting at `args` into `out`. */
 std::string format_guest(std::string_view fmt, mm_guest_va_list args) {
     std::string out;
-    const std::uint64_t base = args.position();
+    const mm_guest_va_list base = args;
     std::size_t i = 0;
     while (i < fmt.size()) {
         const char c = fmt[i];
@@ -254,26 +257,26 @@ int scan_guest(const char *input, std::string_view fmt, mm_guest_va_list args) {
 extern "C" {
 
 int darwin_printf(const char *fmt, ...) DARWIN(printf);
-int darwin_printf(const char *fmt, ...) { return emit_to_file(stdout, format_guest(fmt, mm_guest_va_list::at_call_site())); }
+int darwin_printf(const char *fmt, ...) { return emit_to_file(stdout, format_guest(fmt, mm_guest_va_list::at_call_site(1))); }
 
 int darwin_fprintf(FILE *f, const char *fmt, ...) DARWIN(fprintf);
-int darwin_fprintf(FILE *f, const char *fmt, ...) { return emit_to_file(f, format_guest(fmt, mm_guest_va_list::at_call_site())); }
+int darwin_fprintf(FILE *f, const char *fmt, ...) { return emit_to_file(f, format_guest(fmt, mm_guest_va_list::at_call_site(2))); }
 
 int darwin_sprintf(char *dst, const char *fmt, ...) DARWIN(sprintf);
 int darwin_sprintf(char *dst, const char *fmt, ...) {
-    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site());
+    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site(2));
     std::memcpy(dst, s.c_str(), s.size() + 1);
     return static_cast<int>(s.size());
 }
 
 int darwin_snprintf(char *dst, std::size_t size, const char *fmt, ...) DARWIN(snprintf);
 int darwin_snprintf(char *dst, std::size_t size, const char *fmt, ...) {
-    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site()));
+    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site(3)));
 }
 
 int darwin_asprintf(char **out, const char *fmt, ...) DARWIN(asprintf);
 int darwin_asprintf(char **out, const char *fmt, ...) {
-    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site());
+    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site(2));
     *out = static_cast<char *>(std::malloc(s.size() + 1));
     if (!*out) return -1;
     std::memcpy(*out, s.c_str(), s.size() + 1);
@@ -282,12 +285,12 @@ int darwin_asprintf(char **out, const char *fmt, ...) {
 
 int darwin_snprintf_l(char *dst, std::size_t size, void *, const char *fmt, ...) DARWIN(snprintf_l);
 int darwin_snprintf_l(char *dst, std::size_t size, void *, const char *fmt, ...) {
-    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site()));
+    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site(4)));
 }
 
 int darwin_asprintf_l(char **out, void *, const char *fmt, ...) DARWIN(asprintf_l);
 int darwin_asprintf_l(char **out, void *, const char *fmt, ...) {
-    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site());
+    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site(3));
     *out = static_cast<char *>(std::malloc(s.size() + 1));
     if (!*out) return -1;
     std::memcpy(*out, s.c_str(), s.size() + 1);
@@ -297,12 +300,12 @@ int darwin_asprintf_l(char **out, void *, const char *fmt, ...) {
 int darwin_snprintf_chk(char *dst, std::size_t size, int, std::size_t capacity, const char *fmt, ...) DARWIN(__snprintf_chk);
 int darwin_snprintf_chk(char *dst, std::size_t size, int, std::size_t capacity, const char *fmt, ...) {
     if (capacity != static_cast<std::size_t>(-1) && size > capacity) std::abort();
-    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site()));
+    return copy_out(dst, size, format_guest(fmt, mm_guest_va_list::at_call_site(5)));
 }
 
 int darwin_sprintf_chk(char *dst, int, std::size_t size, const char *fmt, ...) DARWIN(__sprintf_chk);
 int darwin_sprintf_chk(char *dst, int, std::size_t size, const char *fmt, ...) {
-    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site());
+    const std::string s = format_guest(fmt, mm_guest_va_list::at_call_site(4));
     if (size != static_cast<std::size_t>(-1) && s.size() + 1 > size) std::abort();
     std::memcpy(dst, s.c_str(), s.size() + 1);
     return static_cast<int>(s.size());
@@ -357,10 +360,10 @@ int darwin_vasprintf_l(char **out, void *, const char *fmt, std::uint64_t ap) DA
 int darwin_vasprintf_l(char **out, void *, const char *fmt, std::uint64_t ap) { return darwin_vasprintf(out, fmt, ap); }
 
 int darwin_sscanf(const char *in, const char *fmt, ...) DARWIN(sscanf);
-int darwin_sscanf(const char *in, const char *fmt, ...) { return scan_guest(in, fmt, mm_guest_va_list::at_call_site()); }
+int darwin_sscanf(const char *in, const char *fmt, ...) { return scan_guest(in, fmt, mm_guest_va_list::at_call_site(2)); }
 
 int darwin_sscanf_l(const char *in, void *, const char *fmt, ...) DARWIN(sscanf_l);
-int darwin_sscanf_l(const char *in, void *, const char *fmt, ...) { return scan_guest(in, fmt, mm_guest_va_list::at_call_site()); }
+int darwin_sscanf_l(const char *in, void *, const char *fmt, ...) { return scan_guest(in, fmt, mm_guest_va_list::at_call_site(3)); }
 
 int darwin_vsscanf(const char *in, const char *fmt, std::uint64_t ap) DARWIN(vsscanf);
 int darwin_vsscanf(const char *in, const char *fmt, std::uint64_t ap) { return scan_guest(in, fmt, mm_guest_va_list(ap)); }

@@ -312,6 +312,7 @@ id date_from_epoch(double seconds) {
     o->seconds = seconds;
     return &o->base;
 }
+double date_to_epoch(id date) { return as<date_object>(date)->seconds; }
 void register_threading() {
     Class base = cls("NSObject");
     Class date = mm_objc_define_class("NSDate", base, sizeof(date_object), FND_CLASS_REF(NSDate), FND_META_REF(NSDate));

@@ -26,6 +26,7 @@
 #include <array>
 
 extern "C" std::uint64_t mm_hostcall(mm_cpu_context *ctx, const void *fn);
+#include "native_abi.h"
 
 #define DARWIN(name) __attribute__((visibility("default"))) __asm__("_" #name)
 #define EXPORT __attribute__((visibility("default")))
@@ -374,8 +375,13 @@ std::uint64_t send_host_or_guest(id receiver, const method_entry &m, int nargs, 
         }
         return result;
     }
-    if (m.guest)
+    if (m.guest) {
+        if (mm_cpu_context *ctx = g_api && g_api->current_context ? g_api->current_context() : nullptr;
+            ctx && ctx->native_mode && m.types && std::strchr(m.types, '{'))
+            return native_abi::call_guest(*ctx, *g_api, m.imp, stub_abi::signature(m.types), a,
+                                          static_cast<unsigned>(2 + nargs));
         return g_api->call_guest(reinterpret_cast<std::uintptr_t>(m.imp), a, 2 + nargs);
+    }
     if (mm_cpu_context *ctx = g_api && g_api->current_context ? g_api->current_context() : nullptr) {
         /* Host framework sends carry geometry in the guest's v registers,
          * just like objc_msgSend. Use the ABI trampoline so host IMPs get
@@ -925,7 +931,7 @@ void load_image(const void *header, std::uint64_t slide) {
 
 /* Resolves receiver/selector and hands the IMP to the runtime. Returns the
  * receiver so x0 is unchanged when the guest resumes at the IMP. */
-std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
+std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start, bool stret = false) {
     if (!receiver) {
         std::memset(ctx->v, 0, sizeof(ctx->v[0]) * 4);
         ctx->x[1] = 0;
@@ -954,8 +960,8 @@ std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
                 const std::uint64_t a = reinterpret_cast<std::uintptr_t>(sel);
                 const auto target = reinterpret_cast<id>(send_host_or_guest(receiver, *f, 1, &a));
                 if (target && target != receiver) {
-                    ctx->x[0] = reinterpret_cast<std::uintptr_t>(target);
-                    return dispatch(ctx, target, sel, target->isa);
+                    ctx->x[stret ? 1 : 0] = reinterpret_cast<std::uintptr_t>(target);
+                    return dispatch(ctx, target, sel, target->isa, stret);
                 }
             }
             m = resolve_stub(c, sel);
@@ -1007,8 +1013,16 @@ std::uint64_t dispatch(mm_cpu_context *ctx, id receiver, SEL sel, Class start) {
         if (g_api && g_api->print_guest_backtrace) g_api->print_guest_backtrace();
     }
     if (m->guest) ctx->resume_va = reinterpret_cast<std::uintptr_t>(m->imp);
-    else ctx->host_tail_fn = reinterpret_cast<std::uintptr_t>(m->imp);
-    return reinterpret_cast<std::uintptr_t>(receiver);
+    else if (ctx->native_mode && (stret || (m->types && std::strchr(m->types, '{')))) {
+        const auto sig = stub_abi::signature(m->types ? m->types : "");
+        if (sig.empty()) {
+            std::fprintf(stderr, "objc: cannot bridge Intel aggregate method %s with encoding %s\n", sel, m->types ? m->types : "(missing)");
+            std::abort();
+        }
+        return native_abi::call_host(*ctx, m->imp, sig, reinterpret_cast<std::uintptr_t>(receiver),
+                                    reinterpret_cast<std::uintptr_t>(sel), stret ? ctx->x[0] : 0);
+    } else ctx->host_tail_fn = reinterpret_cast<std::uintptr_t>(m->imp);
+    return stret ? ctx->x[0] : reinterpret_cast<std::uintptr_t>(receiver);
 }
 
 struct objc_super { id receiver; Class super_class; };
@@ -1142,6 +1156,26 @@ std::uint64_t objc_msgSendSuper(objc_super *sup, std::uint64_t sel) {
     mm_cpu_context *ctx = g_api->current_context();
     ctx->x[0] = reinterpret_cast<std::uintptr_t>(sup->receiver);
     return dispatch(ctx, sup->receiver, reinterpret_cast<SEL>(sel), sup->super_class);
+}
+
+/* Intel's hidden aggregate result pointer precedes self and _cmd. Guest
+ * implementations keep this ABI; host Cocoa implementations use flattened
+ * operands and are adapted using their registered method encoding. */
+std::uint64_t objc_msgSend_stret(std::uint64_t out, id receiver, SEL sel) DARWIN(objc_msgSend_stret);
+std::uint64_t objc_msgSend_stret(std::uint64_t, id receiver, SEL sel) {
+    return dispatch(g_api->current_context(), receiver, sel, receiver ? receiver->isa : nullptr, true);
+}
+std::uint64_t objc_msgSendSuper2_stret(std::uint64_t out, objc_super *sup, SEL sel) DARWIN(objc_msgSendSuper2_stret);
+std::uint64_t objc_msgSendSuper2_stret(std::uint64_t, objc_super *sup, SEL sel) {
+    auto *ctx = g_api->current_context();
+    ctx->x[1] = reinterpret_cast<std::uintptr_t>(sup->receiver);
+    return dispatch(ctx, sup->receiver, sel, sup->super_class->superclass, true);
+}
+std::uint64_t objc_msgSendSuper_stret(std::uint64_t out, objc_super *sup, SEL sel) DARWIN(objc_msgSendSuper_stret);
+std::uint64_t objc_msgSendSuper_stret(std::uint64_t, objc_super *sup, SEL sel) {
+    auto *ctx = g_api->current_context();
+    ctx->x[1] = reinterpret_cast<std::uintptr_t>(sup->receiver);
+    return dispatch(ctx, sup->receiver, sel, sup->super_class, true);
 }
 
 /* Fast paths the compiler emits for common messages. */
@@ -1529,7 +1563,10 @@ mm_id mm_objc_autorelease(mm_id obj) { return obj ? reinterpret_cast<mm_id>(NSOb
 mm_SEL mm_objc_sel_of(mm_SEL sel) { return sel_intern(sel); }
 const mm_host_api *mm_objc_host_api() { return g_api; }
 void mm_objc_return_words_hi(uint64_t x1) {
-    if (mm_cpu_context *ctx = g_api ? g_api->current_context() : nullptr) ctx->x[1] = x1;
+    if (mm_cpu_context *ctx = g_api ? g_api->current_context() : nullptr) {
+        ctx->x[1] = x1;
+        if (ctx->native_mode) { ctx->native_x[MM_RDX] = x1; ctx->native_hi_valid = 1; }
+    }
 }
 void mm_objc_return_doubles_hi(double v2, double v3) {
     mm_cpu_context *ctx = g_api ? g_api->current_context() : nullptr;

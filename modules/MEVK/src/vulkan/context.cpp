@@ -4,6 +4,13 @@
 #include <vector>
 
 namespace mevk {
+std::uint64_t Context::allocated_size()const{std::lock_guard lock(impl_->mutex);return impl_->allocated_bytes;}
+std::uint64_t Context::recommended_working_set_size()const {
+    std::uint64_t total=0;
+    for(unsigned i=0;i<impl_->memory_properties.memoryHeapCount;++i)
+        if(impl_->memory_properties.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)total+=impl_->memory_properties.memoryHeaps[i].size;
+    return total/4*3;
+}
 namespace {
 
 int device_score(VkPhysicalDeviceType type) {
@@ -130,6 +137,19 @@ std::unique_ptr<Context> Context::create(std::string& error) {
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    VkPhysicalDeviceFeatures supported{},enabled{};
+    vkGetPhysicalDeviceFeatures(impl->physical_device,&supported);
+    enabled.samplerAnisotropy=supported.samplerAnisotropy;
+    enabled.textureCompressionBC=supported.textureCompressionBC;
+    impl->texture_compression_bc=enabled.textureCompressionBC!=0;
+    enabled.depthClamp=supported.depthClamp;enabled.depthBiasClamp=supported.depthBiasClamp;
+    enabled.fillModeNonSolid=supported.fillModeNonSolid;enabled.robustBufferAccess=supported.robustBufferAccess;
+    impl->depth_clamp=enabled.depthClamp!=0;impl->depth_bias_clamp=enabled.depthBiasClamp!=0;impl->wireframe=enabled.fillModeNonSolid!=0;
+    enabled.shaderStorageImageWriteWithoutFormat=supported.shaderStorageImageWriteWithoutFormat;
+    enabled.shaderStorageImageExtendedFormats=supported.shaderStorageImageExtendedFormats;
+    impl->storage_write_without_format=enabled.shaderStorageImageWriteWithoutFormat!=0;
+    impl->sampler_anisotropy=enabled.samplerAnisotropy!=0;
+    device_info.pEnabledFeatures=&enabled;
     const char *swapchain_extension = "VK_KHR_swapchain";
     std::uint32_t device_extension_count = 0;
     vkEnumerateDeviceExtensionProperties(impl->physical_device, nullptr, &device_extension_count, nullptr);

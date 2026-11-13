@@ -10,11 +10,15 @@
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/third_party/llvm-project"
-BUILD="$ROOT/third_party/guest-runtimes/build"
-INSTALL="$ROOT/third_party/guest-runtimes/install"
+ARCH="${MACHOMAN_GUEST_ARCH:-arm64}"
+case "$ARCH" in arm64|x86_64) ;; *) echo "unsupported guest architecture: $ARCH" >&2; exit 1 ;; esac
+RUNTIME_ROOT="$ROOT/third_party/guest-runtimes"
+if [ "$ARCH" != arm64 ]; then RUNTIME_ROOT="$RUNTIME_ROOT/$ARCH"; fi
+BUILD="$RUNTIME_ROOT/build"
+INSTALL="$RUNTIME_ROOT/install"
 TAG="${LLVM_TAG:-llvmorg-22.1.8}"
 SDK="${MACOSX_SDK:-$(ls -d "$ROOT"/third_party/sdk/MacOSX*.sdk | head -1)}"
-TARGET="${MACHOMAN_GUEST_TARGET:-arm64-apple-macos12}"
+TARGET="${MACHOMAN_GUEST_TARGET:-$ARCH-apple-macos12}"
 
 if [ ! -d "$SRC/libunwind" ]; then
     if [ ! -d "$SRC/libcxx" ]; then
@@ -33,8 +37,8 @@ for patch in "$ROOT"/scripts/patches/*.patch; do
 done
 
 cmake -S "$SRC/runtimes" -B "$BUILD" -G Ninja \
-    -DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-    -DCMAKE_OSX_SYSROOT="$SDK" -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+    -DCMAKE_SYSTEM_NAME=Darwin -DCMAKE_SYSTEM_PROCESSOR="$ARCH" \
+    -DCMAKE_OSX_SYSROOT="$SDK" -DCMAKE_OSX_ARCHITECTURES="$ARCH" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_C_COMPILER_TARGET="$TARGET" -DCMAKE_CXX_COMPILER_TARGET="$TARGET" \
     -DCMAKE_ASM_COMPILER_TARGET="$TARGET" \
@@ -49,5 +53,5 @@ cmake -S "$SRC/runtimes" -B "$BUILD" -G Ninja \
     -DLIBUNWIND_ENABLE_SHARED=ON -DLIBUNWIND_ENABLE_STATIC=OFF \
     -DLIBCXX_INCLUDE_TESTS=OFF -DLIBCXX_INCLUDE_BENCHMARKS=OFF -DLIBCXXABI_INCLUDE_TESTS=OFF -DLIBUNWIND_INCLUDE_TESTS=OFF \
     -DLIBCXX_INSTALL_MODULES=OFF
-ninja -C "$BUILD" install-unwind install-cxxabi install-cxx
+ninja -C "$BUILD" -j "${MACHOMAN_BUILD_JOBS:-4}" install-unwind install-cxxabi install-cxx
 echo "guest runtimes installed to $INSTALL"

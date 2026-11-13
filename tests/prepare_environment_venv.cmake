@@ -1,0 +1,6 @@
+if(NOT EXISTS "${VENV}/machoman-venv.json")
+    execute_process(COMMAND "${MACHOMAN}" venv-init "${VENV}" COMMAND_ERROR_IS_FATAL ANY)
+endif()
+execute_process(COMMAND "${MACHOMAN}" env "${VENV}" set MM_VENV_VALUE from-json COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${MACHOMAN}" env "${VENV}" set MM_CLI_VALUE from-json COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${MACHOMAN}" env "${VENV}" unset MM_VENV_MASK COMMAND_ERROR_IS_FATAL ANY)

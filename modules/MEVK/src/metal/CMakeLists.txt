@@ -20,7 +20,7 @@ add_library(MEVK_CoreGraphics SHARED coregraphics_metal.cpp
     "${PROJECT_SOURCE_DIR}/src/dylibs/symbol-synthesis/synthesise.cpp")
 target_include_directories(MEVK_CoreGraphics PRIVATE
     "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/src/dylibs/symbol-synthesis")
-target_link_libraries(MEVK_CoreGraphics PRIVATE MEVK_Metal libobjc)
+target_link_libraries(MEVK_CoreGraphics PRIVATE MEVK_Metal libobjc AppKit)
 target_compile_options(MEVK_CoreGraphics PRIVATE -Wall -Wextra -fvisibility=hidden)
 set(MEVK_COREGRAPHICS_DIR "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreGraphics.framework/Versions/A")
 if(IS_SYMLINK "${MEVK_COREGRAPHICS_DIR}/CoreGraphics.so")
@@ -29,8 +29,8 @@ endif()
 set_target_properties(MEVK_CoreGraphics PROPERTIES
     PREFIX "" OUTPUT_NAME "CoreGraphics" SUFFIX ".so"
     LIBRARY_OUTPUT_DIRECTORY "${MEVK_COREGRAPHICS_DIR}"
-    BUILD_RPATH "${MEVK_METAL_DIR};${CMAKE_BINARY_DIR}/dylibs/usr/lib"
-    INSTALL_RPATH "${MEVK_METAL_DIR};${CMAKE_BINARY_DIR}/dylibs/usr/lib")
+    BUILD_RPATH "${MEVK_METAL_DIR};${CMAKE_BINARY_DIR}/dylibs/usr/lib;${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/AppKit.framework/Versions/C"
+    INSTALL_RPATH "${MEVK_METAL_DIR};${CMAKE_BINARY_DIR}/dylibs/usr/lib;${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/AppKit.framework/Versions/C")
 
 if(MEVK_BUILD_TESTS)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../tests/metal" "${CMAKE_CURRENT_BINARY_DIR}/tests")

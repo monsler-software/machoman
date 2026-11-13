@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <mutex>
 #include <memory>
+#include <map>
 #include <unordered_map>
 #include <pwd.h>
 #include <sys/stat.h>
@@ -171,19 +172,23 @@ void init_constant_strings() {
 
 /* ---- NSURL ---------------------------------------------------------------- */
 
-/* Only file:// URLs matter to Live; the object keeps the absolute path and
- * whether it denotes a directory. */
+/* File URLs keep a resolved path for filesystem access and, when relative,
+ * the original path and retained base URL for Foundation's accessors. */
 std::atomic<std::uint64_t> url_cache_generation{0};
 struct url_cached_value { id value = nullptr; bool temporary = false, cocoa = false; std::uint64_t generation = 0; };
 struct url_object {
     mm_objc_object base;
     std::string path;
     std::string scheme{"file"};
+    std::string serialized_url, host, query, fragment;
+    bool has_query = false, has_fragment = false;
     bool is_dir = false;
+    std::string relative_path;
+    id base_url = nullptr;
     std::recursive_mutex resource_mutex;
     std::unordered_map<std::string, url_cached_value> resources;
     std::uint64_t resource_generation = 0;
-    ~url_object() { for (auto &[key, entry] : resources) release(entry.value); }
+    ~url_object() { release(base_url); for (auto &[key, entry] : resources) release(entry.value); }
 };
 
 url_object *u(id o) { return as<url_object>(o); }
@@ -215,7 +220,23 @@ std::uint64_t url_pathComponents(id self, SEL) {
     id path = string_from_utf8(u(self)->path);
     auto result = send(path, "pathComponents"); release(path); return result;
 }
-std::uint64_t url_absoluteString(id self, SEL) { return ret(autorelease(string_from_utf8(u(self)->scheme + "://" + percent_encode(u(self)->path)))); }
+std::string url_encoded_path(std::string_view path, bool directory) {
+    auto encoded = percent_encode(path);
+    if (directory && !encoded.empty() && encoded.back() != '/') encoded += '/';
+    return encoded;
+}
+std::string url_string(id self) {
+    const auto *o = u(self);
+    return o->scheme == "file" ? "file://" + url_encoded_path(o->path, o->is_dir) : o->serialized_url;
+}
+std::uint64_t url_absoluteString(id self, SEL) { return ret(autorelease(string_from_utf8(url_string(self)))); }
+std::uint64_t url_relativePath(id self, SEL) { return ret(autorelease(string_from_utf8(u(self)->base_url ? u(self)->relative_path : u(self)->path))); }
+std::uint64_t url_relativeString(id self, SEL) {
+    return u(self)->base_url ? ret(autorelease(string_from_utf8(url_encoded_path(u(self)->relative_path, u(self)->is_dir)))) : url_absoluteString(self, nullptr);
+}
+std::uint64_t url_baseURL(id self, SEL) { return ret(u(self)->base_url); }
+std::uint64_t url_fileSystemRepresentation(id self, SEL) { return u(self)->scheme == "file" ? reinterpret_cast<std::uintptr_t>(u(self)->path.c_str()) : 0; }
+std::uint64_t url_hasDirectoryPath(id self, SEL) { return u(self)->is_dir; }
 std::uint64_t url_isFileURL(id self, SEL) { return u(self)->scheme == "file"; }
 std::uint64_t url_lastPathComponent(id self, SEL) {
     std::string_view p = u(self)->path;
@@ -235,6 +256,43 @@ id url_new(std::string path, bool is_dir) {
     o->is_dir = is_dir;
     return reinterpret_cast<id>(o);
 }
+std::uint64_t url_absoluteURL(id self, SEL) {
+    return u(self)->base_url ? ret(autorelease(url_new(u(self)->path, u(self)->is_dir))) : ret(self);
+}
+void url_set_file_path(id self, std::string path, int directory, id base) {
+    auto *o = u(self);
+    const bool relative = !std::filesystem::path(path).is_absolute();
+    id retained_base = relative && is_url(base) ? retain(base) : nullptr;
+    std::filesystem::path resolved(path);
+    if (relative) {
+        if (retained_base) {
+            auto root = std::filesystem::path(u(retained_base)->path);
+            if (!u(retained_base)->is_dir) root = root.parent_path();
+            resolved = root / resolved;
+        } else {
+            std::error_code error;
+            const auto cwd = std::filesystem::current_path(error);
+            if (!error) resolved = cwd / resolved;
+        }
+    }
+    release(o->base_url);
+    o->base_url = retained_base;
+    o->relative_path = retained_base ? path : std::string{};
+    o->path = resolved.lexically_normal().string();
+    while (o->path.size() > 1 && o->path.back() == '/') o->path.pop_back();
+    o->scheme = "file";
+    o->serialized_url.clear(); o->host.clear(); o->query.clear(); o->fragment.clear();
+    o->has_query = o->has_fragment = false;
+    if (directory < 0) {
+        struct stat st{};
+        o->is_dir = (!path.empty() && path.back() == '/') || (::stat(o->path.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
+    } else o->is_dir = directory != 0;
+}
+id url_file_new(std::string path, int directory, id base) {
+    id result = url_new({}, false);
+    url_set_file_path(result, std::move(path), directory, base);
+    return result;
+}
 std::uint64_t url_URLByDeletingLastPathComponent(id self, SEL) {
     std::string p = u(self)->path;
     while (p.size() > 1 && p.back() == '/') p.pop_back();
@@ -247,21 +305,57 @@ std::uint64_t url_URLByAppendingPathComponent(id self, SEL, id comp) {
     p += to_utf8(comp);
     return ret(autorelease(url_new(std::move(p), false)));
 }
-std::uint64_t url_initFileURLWithPath(id self, SEL, id path) { u(self)->path = to_utf8(path); return ret(self); }
-std::uint64_t url_initFileURLWithPathIsDirectory(id self, SEL, id path, std::uint64_t dir) { u(self)->path = to_utf8(path); u(self)->is_dir = dir != 0; return ret(self); }
+std::uint64_t url_initFileURLWithPath(id self, SEL, id path) { url_set_file_path(self, to_utf8(path), -1, nullptr); return ret(self); }
+std::uint64_t url_initFileURLWithPathIsDirectory(id self, SEL, id path, std::uint64_t dir) { url_set_file_path(self, to_utf8(path), dir != 0, nullptr); return ret(self); }
+std::uint64_t url_initFileURLWithPathRelative(id self, SEL, id path, id base) { url_set_file_path(self, to_utf8(path), -1, base); return ret(self); }
+std::uint64_t url_initFileURLWithPathDirectoryRelative(id self, SEL, id path, std::uint64_t dir, id base) { url_set_file_path(self, to_utf8(path), dir != 0, base); return ret(self); }
+std::uint64_t url_initFileURLWithFSRelative(id self, SEL, const char *path, std::uint64_t dir, id base) { url_set_file_path(self, path ? path : "", dir != 0, base); return ret(self); }
 std::uint64_t url_initWithString(id self, SEL, id str) {
     std::string s = to_utf8(str);
-    const auto sep = s.find("://");
-    if (sep != std::string::npos) { u(self)->scheme = s.substr(0, sep); s = s.substr(sep + 3); }
-    u(self)->path = percent_decode(s);
+    auto *o = u(self);
+    const auto colon = s.find(':');
+    const bool has_scheme = colon != std::string::npos && colon > 0 &&
+        std::isalpha(static_cast<unsigned char>(s[0])) &&
+        std::all_of(s.begin() + 1, s.begin() + static_cast<std::ptrdiff_t>(colon), [](unsigned char c) {
+            return std::isalnum(c) || c == '+' || c == '-' || c == '.';
+        });
+    o->scheme = has_scheme ? s.substr(0, colon) : std::string{};
+    std::transform(o->scheme.begin(), o->scheme.end(), o->scheme.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    o->serialized_url = s; o->host.clear(); o->query.clear(); o->fragment.clear();
+    o->has_query = o->has_fragment = false;
+    std::string_view remainder(s);
+    if (has_scheme) remainder.remove_prefix(colon + 1);
+    const auto fragment = remainder.find('#');
+    if (fragment != std::string_view::npos) {
+        o->has_fragment = true; o->fragment = remainder.substr(fragment + 1); remainder = remainder.substr(0, fragment);
+    }
+    const auto query = remainder.find('?');
+    if (query != std::string_view::npos) {
+        o->has_query = true; o->query = remainder.substr(query + 1); remainder = remainder.substr(0, query);
+    }
+    if (remainder.starts_with("//")) {
+        remainder.remove_prefix(2);
+        const auto slash = remainder.find('/');
+        auto authority = remainder.substr(0, slash);
+        const auto at = authority.rfind('@');
+        if (at != std::string_view::npos) authority.remove_prefix(at + 1);
+        const auto end = authority.starts_with('[') ? authority.find(']') : authority.find(':');
+        o->host = authority.substr(0, authority.starts_with('[') && end != std::string_view::npos ? end + 1 : end);
+        remainder = slash == std::string_view::npos ? std::string_view{} : remainder.substr(slash);
+    }
+    o->path = percent_decode(remainder);
+    o->is_dir = !remainder.empty() && remainder.back() == '/';
     return ret(self);
 }
 std::uint64_t url_description(id self, SEL) { return url_absoluteString(self, nullptr); }
-std::uint64_t url_isEqual(id self, SEL, id o) { return o && is_url(o) && u(self)->path == u(o)->path; }
-std::uint64_t url_hash(id self, SEL) { std::uint64_t h = 1469598103934665603ull; for (unsigned char c : u(self)->path) { h ^= c; h *= 1099511628211ull; } return h; }
+std::uint64_t url_isEqual(id self, SEL, id o) { return o && is_url(o) && url_string(self) == url_string(o); }
+std::uint64_t url_hash(id self, SEL) { std::uint64_t h = 1469598103934665603ull; for (unsigned char c : url_string(self)) { h ^= c; h *= 1099511628211ull; } return h; }
 std::uint64_t url_copyWithZone(id self, SEL, void *) { return ret(retain(self)); }
 std::uint64_t url_scheme(id self, SEL) { return ret(autorelease(string_from_utf8(u(self)->scheme))); }
-std::uint64_t urlc_fileURLWithPath(id, SEL, id path) { return ret(autorelease(url_new(to_utf8(path), false))); }
+std::uint64_t urlc_fileURLWithPath(id, SEL, id path) { return ret(autorelease(url_file_new(to_utf8(path), -1, nullptr))); }
+std::uint64_t urlc_fileURLWithPathRelative(id, SEL, id path, id base) { return ret(autorelease(url_file_new(to_utf8(path), -1, base))); }
+std::uint64_t urlc_fileURLWithPathDirectoryRelative(id, SEL, id path, std::uint64_t dir, id base) { return ret(autorelease(url_file_new(to_utf8(path), dir != 0, base))); }
+std::uint64_t urlc_fileURLWithFSRelative(id, SEL, const char *path, std::uint64_t dir, id base) { return ret(autorelease(url_file_new(path ? path : "", dir != 0, base))); }
 
 /* Bookmarks: opaque data that names a file across moves and renames. What
  * makes them work on macOS is the file's inode, which a program never sees
@@ -360,7 +454,7 @@ std::uint64_t urlc_writeBookmarkData(id, SEL, id data, id url, std::uint64_t, id
     if ((!written || !closed) && error) *error = autorelease(error_create(NSCocoaErrorDomain_, 512, nullptr));
     return written && closed;
 }
-std::uint64_t urlc_fileURLWithPathIsDirectory(id, SEL, id path, std::uint64_t dir) { return ret(autorelease(url_new(to_utf8(path), dir != 0))); }
+std::uint64_t urlc_fileURLWithPathIsDirectory(id, SEL, id path, std::uint64_t dir) { return ret(autorelease(url_file_new(to_utf8(path), dir != 0, nullptr))); }
 std::uint64_t urlc_URLWithString(id c, SEL, id s) { return ret(autorelease(obj(send(obj(send(c, "alloc")), "initWithString:", ret(s))))); }
 
 struct url_resource_snapshot {
@@ -551,7 +645,17 @@ struct error_dtor : error_object { ~error_dtor() { release(domain); release(user
 
 /* ---- NSBundle / CFBundle ---------------------------------------------------- */
 
-struct bundle_object { mm_objc_object base; std::string path; id info = nullptr; };
+struct bundle_object {
+    mm_objc_object base;
+    std::string path;
+    id info = nullptr;
+    std::map<std::string, id> string_tables;
+    std::mutex strings_mutex;
+    ~bundle_object() {
+        release(info);
+        for (auto &[path, table] : string_tables) release(table);
+    }
+};
 bundle_object *bun(id o) { return as<bundle_object>(o); }
 
 std::string executable_path() {
@@ -610,12 +714,39 @@ std::uint64_t bundle_objectForInfoDictionaryKey(id self, SEL, id key) { return b
 std::uint64_t bundle_bundleIdentifier(id self, SEL) { return bun(self)->info ? ret(dictionary_get(bun(self)->info, constant_string("CFBundleIdentifier"))) : 0; }
 std::uint64_t bundle_executablePath(id, SEL) { return ret(autorelease(string_from_utf8(executable_path()))); }
 std::uint64_t bundle_executableURL(id, SEL) { return ret(autorelease(url_new(executable_path(), false))); }
+std::vector<std::filesystem::path> bundle_resource_dirs(id self) {
+    namespace fs = std::filesystem;
+    const fs::path root = bun(self)->path + "/Contents/Resources";
+    std::vector<fs::path> paths;
+    auto add = [&](const std::string &language) {
+        if (language.empty() || language.find('/') != language.npos || language == "..") return;
+        const auto path = root / (language + ".lproj");
+        if (std::find(paths.begin(), paths.end(), path) == paths.end()) paths.push_back(path);
+    };
+    id defaults = obj(send(reinterpret_cast<id>(cls("NSUserDefaults")), "standardUserDefaults"));
+    id languages = obj(send(defaults, "objectForKey:", ret(constant_string("AppleLanguages"))));
+    if (!is_array(languages)) languages = obj(send(reinterpret_cast<id>(cls("NSLocale")), "preferredLanguages"));
+    for (id language : array_storage(languages)) {
+        auto name = to_utf8(language);
+        std::replace(name.begin(), name.end(), '_', '-');
+        add(name);
+        if (const auto dash = name.find('-'); dash != name.npos) add(name.substr(0, dash));
+    }
+    if (bun(self)->info) {
+        id region = dictionary_get(bun(self)->info, constant_string("CFBundleDevelopmentRegion"));
+        if (region) add(to_utf8(region));
+    }
+    add("Base"); add("en"); paths.push_back(root);
+    return paths;
+}
 std::uint64_t bundle_pathForResourceOfType(id self, SEL, id name, id type) {
-    std::string p = bun(self)->path + "/Contents/Resources/" + to_utf8(name);
-    if (type && string_chars(type).length) { p += '.'; p += to_utf8(type); }
-    struct stat st;
-    if (stat(p.c_str(), &st) != 0) return 0;
-    return ret(autorelease(string_from_utf8(p)));
+    auto file = to_utf8(name);
+    if (type && string_chars(type).length) file += '.' + to_utf8(type);
+    std::error_code error;
+    for (const auto &dir : bundle_resource_dirs(self))
+        if (const auto path = dir / file; std::filesystem::exists(path, error))
+            return ret(autorelease(string_from_utf8(path.string())));
+    return 0;
 }
 std::uint64_t bundle_pathForResourceOfTypeInDirectory(id self, SEL, id name, id type, id dir) {
     std::string p = bun(self)->path + "/Contents/Resources/";
@@ -645,7 +776,34 @@ std::uint64_t bundle_pathsForResourcesOfTypeInDirectory(id self, SEL, id type, i
     std::sort(paths.begin(),paths.end(),[](id a,id b){return to_utf8(a)<to_utf8(b);});
     id result=array_create(paths.data(),paths.size(),false);for(id p:paths)release(p);return ret(autorelease(result));
 }
-std::uint64_t bundle_localizedString(id self, SEL, id key, id value, id) { (void)self; return ret(value && string_chars(value).length ? value : key); }
+std::uint64_t bundle_localizedString(id self, SEL, id key, id value, id table) {
+    auto name = table ? to_utf8(table) : std::string();
+    if (name.empty()) name = "Localizable";
+    if (name.find('/') == name.npos && name != "..") {
+        const auto dirs = bundle_resource_dirs(self);
+        auto *bundle = bun(self);
+        std::lock_guard lock(bundle->strings_mutex);
+        for (const auto &dir : dirs) {
+            const auto path = (dir / (name + ".strings")).string();
+            auto it = bundle->string_tables.find(path);
+            if (it == bundle->string_tables.end()) {
+                id strings = nullptr;
+                if (FILE *file = std::fopen(path.c_str(), "rb")) {
+                    std::string bytes; char buffer[4096];
+                    for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file));) bytes.append(buffer, n);
+                    std::fclose(file);
+                    strings = plist_parse(bytes, nullptr);
+                    if (strings && !is_dictionary(strings)) { release(strings); strings = nullptr; }
+                }
+                it = bundle->string_tables.emplace(path, strings).first;
+            }
+            if (it->second)
+                if (id translated = dictionary_get(it->second, key); translated && is_string(translated))
+                    return ret(translated);
+        }
+    }
+    return ret(value && string_chars(value).length ? value : key);
+}
 std::uint64_t bundlec_mainBundle(id, SEL) { return ret(main_bundle()); }
 std::uint64_t bundlec_bundleWithPath(id, SEL, id path) { return ret(autorelease(make_bundle(to_utf8(path)))); }
 std::uint64_t bundlec_bundleForClass(id, SEL, id) { return ret(main_bundle()); }
@@ -665,7 +823,7 @@ struct prefs_store {
         std::string app = "defaults";
         if (id b = main_bundle(); bun(b)->info)
             if (id v = dictionary_get(bun(b)->info, constant_string("CFBundleIdentifier"))) app = to_utf8(v);
-        const char *home = std::getenv("HOME");
+        const char *home = mm_host_getenv(api(), "HOME");
         const std::string dir = std::string(home ? home : ".") + "/.config/machoman";
         ::mkdir(std::string(home ? home : ".").append("/.config").c_str(), 0755);
         ::mkdir(dir.c_str(), 0755);
@@ -756,7 +914,7 @@ std::uint64_t proc_arguments(id, SEL) {
 std::uint64_t proc_environment(id, SEL) {
     id d = dictionary_create(false);
     const mm_host_api *a = api();
-    for (char **e = a ? a->envp : nullptr; e && *e; e++) {
+    for (char **e = mm_host_environment(a); e && *e; e++) {
         const std::string_view kv(*e);
         const auto eq = kv.find('=');
         if (eq == std::string_view::npos) continue;
@@ -1305,13 +1463,34 @@ std::uint64_t aem_removeEventHandler(id self, SEL, std::uint32_t, std::uint32_t)
 }
 std::uint64_t aem_nil(id, SEL) { return 0; }
 
+/* ---- NSOperationQueue --------------------------------------------------------- */
+struct operation_queue_object {
+    mm_objc_object base;
+    bool main = false;
+};
+std::uint64_t operation_queue_main(id, SEL) {
+    static id queue = [] {
+        auto *q = make<operation_queue_object>(g_opqueue);
+        q->main = true;
+        return &q->base;
+    }();
+    return ret(queue);
+}
+std::uint64_t operation_queue_current(id, SEL) {
+    return api() && api()->thread_self && api()->thread_self() == 1 ? operation_queue_main(nullptr, nullptr) : 0;
+}
+std::uint64_t operation_queue_add_block(id self, SEL, id block) {
+    if (block) dispatch_submit_owned_block(as<operation_queue_object>(self)->main ? dispatch_main_queue_handle() : nullptr, retain(block));
+    return 0;
+}
+
 /* ---- NSNotificationCenter ------------------------------------------------------ */
 
 /* A notification is its name, the object that posted it and a user info
  * dictionary; an observer is a receiver plus the selector to send it,
  * optionally narrowed to one name and one posting object. Blocks registered
- * with -addObserverForName:object:queue:usingBlock: are called on the
- * posting thread, which is what a nil queue means on macOS. */
+ * with a nil queue run on the posting thread; an operation queue keeps
+ * callback execution on the requested queue. */
 struct notification_object {
     mm_objc_object base;
     id name = nullptr, object = nullptr, user_info = nullptr;
@@ -1326,6 +1505,7 @@ struct observer_entry {
     bool any_name = true;
     id object = nullptr;     /* null = every poster */
     id token = nullptr;      /* the object -addObserverForName: returned */
+    id queue = nullptr;
 };
 
 struct center_object {
@@ -1354,7 +1534,7 @@ std::uint64_t notificationc_notificationWithNameUserInfo(id, SEL, id name, id ob
 
 center_object *center_of(id self) { return as<center_object>(self); }
 
-void center_add(id self, id observer, SEL sel, id block, id name, id object, id token) {
+void center_add(id self, id observer, SEL sel, id block, id name, id object, id token, id queue = nullptr) {
     center_object *c = center_of(self);
     observer_entry e;
     e.observer = observer;
@@ -1364,6 +1544,7 @@ void center_add(id self, id observer, SEL sel, id block, id name, id object, id 
     if (name) e.name = to_utf8(name);
     e.object = object;
     e.token = token;
+    e.queue = retain(queue);
     std::lock_guard lock(c->mu);
     c->observers.push_back(e);
 }
@@ -1372,10 +1553,10 @@ std::uint64_t center_addObserver(id self, SEL, id observer, SEL sel, id name, id
     center_add(self, observer, sel, nullptr, name, object, nullptr);
     return 0;
 }
-std::uint64_t center_addObserverForName(id self, SEL, id name, id object, id, id block) {
+std::uint64_t center_addObserverForName(id self, SEL, id name, id object, id queue, id block) {
     /* The token is what the caller later passes to -removeObserver:. */
     id token = mm_objc_alloc(cls("NSObject"), 0);
-    center_add(self, nullptr, nullptr, block, name, object, token);
+    center_add(self, nullptr, nullptr, block, name, object, token, queue);
     return ret(token);
 }
 std::uint64_t center_removeObserver(id self, SEL, id observer) {
@@ -1384,6 +1565,7 @@ std::uint64_t center_removeObserver(id self, SEL, id observer) {
     std::erase_if(c->observers, [&](const observer_entry &e) {
         const bool gone = e.observer == observer || (e.token && e.token == observer);
         if (gone && e.block) release(e.block);
+        if (gone) release(e.queue);
         return gone;
     });
     return 0;
@@ -1397,6 +1579,7 @@ std::uint64_t center_removeObserverName(id self, SEL, id observer, id name, id o
         if (name && (e.any_name || e.name != wanted)) return false;
         if (object && e.object && e.object != object) return false;
         if (e.block) release(e.block);
+        release(e.queue);
         return true;
     });
     return 0;
@@ -1414,18 +1597,32 @@ std::uint64_t center_postNotification(id self, SEL, id note) {
         std::lock_guard lock(c->mu);
         for (const observer_entry &e : c->observers) {
             if (!e.any_name && e.name != posted) continue;
-            if (e.object && object && e.object != object) continue;
+            if (e.object && e.object != object) continue;
             matches.push_back(e);
+            matches.back().block = retain(e.block);
+            matches.back().queue = retain(e.queue);
         }
     }
     if (trace() && !matches.empty())
         std::fprintf(stderr, "Foundation: posting %s to %zu observer(s)\n", posted.c_str(), matches.size());
     for (const observer_entry &e : matches) {
-        if (e.block) mm_objc_block_invoke(e.block, 1, reinterpret_cast<const std::uint64_t *>(&note));
+        if (e.block && e.queue && is_kind(e.queue, g_opqueue)) {
+            struct delivery { id block, notification; };
+            auto *item = new delivery{retain(e.block), retain(note)};
+            auto invoke = +[](void *context) {
+                auto *item = static_cast<delivery *>(context);
+                const auto argument = ret(item->notification);
+                mm_objc_block_invoke(item->block, 1, &argument);
+                release(item->notification); release(item->block); delete item;
+            };
+            dispatch_submit_callback(as<operation_queue_object>(e.queue)->main ? dispatch_main_queue_handle() : nullptr,
+                                     reinterpret_cast<void *>(invoke), item);
+        } else if (e.block) mm_objc_block_invoke(e.block, 1, reinterpret_cast<const std::uint64_t *>(&note));
         else if (e.observer && e.selector) {
             const std::uint64_t arg = ret(note);
             mm_objc_send(e.observer, e.selector, 1, &arg);
         }
+        release(e.block); release(e.queue);
     }
     return 0;
 }
@@ -1483,7 +1680,7 @@ id error_create(id domain, std::int64_t code, id user_info) {
 }
 
 std::string home_directory() {
-    if (const char *h = std::getenv("HOME")) return h;
+    if (const char *h = mm_host_getenv(api(), "HOME")) return h;
     const passwd *pw = getpwuid(getuid());
     return pw && pw->pw_dir ? pw->pw_dir : "/";
 }
@@ -1537,8 +1734,16 @@ void register_misc() {
         {"path", IMP(url_path_m), "@16@0:8"},
         {"pathComponents", IMP(url_pathComponents), "@16@0:8"},
         {"absoluteString", IMP(url_absoluteString), "@16@0:8"},
-        {"relativePath", IMP(url_path_m), "@16@0:8"},
+        {"absoluteURL", IMP(url_absoluteURL), "@16@0:8"},
+        {"relativeString", IMP(url_relativeString), "@16@0:8"},
+        {"relativePath", IMP(url_relativePath), "@16@0:8"},
+        {"baseURL", IMP(url_baseURL), "@16@0:8"},
+        {"fileSystemRepresentation", IMP(url_fileSystemRepresentation), "*16@0:8"},
+        {"hasDirectoryPath", IMP(url_hasDirectoryPath), "B16@0:8"},
         {"scheme", IMP(url_scheme), "@16@0:8"},
+        {"host", IMP(+[](id s, SEL) { return u(s)->host.empty() ? 0 : ret(autorelease(string_from_utf8(u(s)->host))); }), "@16@0:8"},
+        {"query", IMP(+[](id s, SEL) { return u(s)->has_query ? ret(autorelease(string_from_utf8(u(s)->query))) : 0; }), "@16@0:8"},
+        {"fragment", IMP(+[](id s, SEL) { return u(s)->has_fragment ? ret(autorelease(string_from_utf8(u(s)->fragment))) : 0; }), "@16@0:8"},
         {"isFileURL", IMP(url_isFileURL), "B16@0:8"},
         {"lastPathComponent", IMP(url_lastPathComponent), "@16@0:8"},
         {"pathExtension", IMP(url_pathExtension), "@16@0:8"},
@@ -1548,6 +1753,9 @@ void register_misc() {
         {"URLByResolvingSymlinksInPath", IMP(url_copyWithZone), "@16@0:8"},
         {"initFileURLWithPath:", IMP(url_initFileURLWithPath), "@24@0:8@16"},
         {"initFileURLWithPath:isDirectory:", IMP(url_initFileURLWithPathIsDirectory), "@32@0:8@16B24"},
+        {"initFileURLWithPath:relativeToURL:", IMP(url_initFileURLWithPathRelative), "@32@0:8@16@24"},
+        {"initFileURLWithPath:isDirectory:relativeToURL:", IMP(url_initFileURLWithPathDirectoryRelative), "@40@0:8@16B24@32"},
+        {"initFileURLWithFileSystemRepresentation:isDirectory:relativeToURL:", IMP(url_initFileURLWithFSRelative), "@40@0:8*16B24@32"},
         {"getResourceValue:forKey:error:", IMP(url_getResource), "B40@0:8^@16@24^@32"},
         {"resourceValuesForKeys:error:", IMP(url_resourceValues), "@32@0:8@16^@24"},
         {"removeCachedResourceValueForKey:", IMP(url_clearResource), "v24@0:8@16"},
@@ -1573,6 +1781,9 @@ void register_misc() {
         {"writeBookmarkData:toURL:options:error:", IMP(urlc_writeBookmarkData), "B48@0:8@16@24Q32^@40"},
         {"fileURLWithPath:", IMP(urlc_fileURLWithPath), "@24@0:8@16"},
         {"fileURLWithPath:isDirectory:", IMP(urlc_fileURLWithPathIsDirectory), "@32@0:8@16B24"},
+        {"fileURLWithPath:relativeToURL:", IMP(urlc_fileURLWithPathRelative), "@32@0:8@16@24"},
+        {"fileURLWithPath:isDirectory:relativeToURL:", IMP(urlc_fileURLWithPathDirectoryRelative), "@40@0:8@16B24@32"},
+        {"fileURLWithFileSystemRepresentation:isDirectory:relativeToURL:", IMP(urlc_fileURLWithFSRelative), "@40@0:8*16B24@32"},
         {"URLWithString:", IMP(urlc_URLWithString), "@24@0:8@16"});
 
     g_error = mm_objc_define_class("NSError", nsobject, sizeof(error_object), FND_CLASS_REF(NSError), FND_META_REF(NSError));
@@ -1767,7 +1978,12 @@ void register_misc() {
         {"isValid", IMP(timer_isValid), "B16@0:8"},
         {"userInfo", IMP(timer_userInfo), "@16@0:8"},
         {"timeInterval", IMP(timer_timeInterval), "d16@0:8"});
-    g_opqueue = mm_objc_define_class("NSOperationQueue", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSOperationQueue), FND_META_REF(NSOperationQueue));
+    g_opqueue = mm_objc_define_class("NSOperationQueue", nsobject, sizeof(operation_queue_object), FND_CLASS_REF(NSOperationQueue), FND_META_REF(NSOperationQueue));
+    register_lifecycle<operation_queue_object>(g_opqueue);
+    FND_CLASS_METHODS(g_opqueue,
+        {"mainQueue", IMP(operation_queue_main), "@@:"},
+        {"currentQueue", IMP(operation_queue_current), "@@:"});
+    FND_METHODS(g_opqueue, {"addOperationWithBlock:", IMP(operation_queue_add_block), "v@:@?"});
     register_threading();
     g_charset = mm_objc_define_class("NSCharacterSet", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSCharacterSet), FND_META_REF(NSCharacterSet));
 }
@@ -2086,15 +2302,15 @@ int CFRunLoopIsWaiting_(id) { return 0; }
 /* NSLog and the Foundation free functions. */
 void NSLog_(id fmt, ...) DARWIN(NSLog);
 void NSLog_(id fmt, ...) {
-    id s = obj(send(reinterpret_cast<id>(cls("NSString")), "stringWithFormat:", ret(fmt)));
-    std::fprintf(stderr, "%s\n", describe(s).c_str());
+    /* NSLog has one named integer operand; sending stringWithFormat:
+     * would incorrectly skip self/selector/format in the Intel save area. */
+    const auto text = format_call_arguments(fmt, 1);
+    std::fprintf(stderr, "%s\n", text.c_str());
 }
 void NSLogv_(id fmt, std::uint64_t va) DARWIN(NSLogv);
 void NSLogv_(id fmt, std::uint64_t va) {
-    id s = obj(send(reinterpret_cast<id>(cls("NSString")), "alloc"));
-    s = obj(send(s, "initWithFormat:arguments:", ret(fmt), va));
-    std::fprintf(stderr, "%s\n", describe(s).c_str());
-    release(s);
+    const auto text = format_va_arguments(fmt, va);
+    std::fprintf(stderr, "%s\n", text.c_str());
 }
 id NSStringFromClass_(Class c) DARWIN(NSStringFromClass);
 id NSStringFromClass_(Class c) { return c ? autorelease(string_from_utf8(mm_objc_class_name(c))) : nullptr; }
@@ -2107,7 +2323,7 @@ SEL NSSelectorFromString_(id name) { return mm_objc_sel(to_utf8(name).c_str()); 
 id NSHomeDirectory_() DARWIN(NSHomeDirectory);
 id NSHomeDirectory_() { return autorelease(string_from_utf8(home_directory())); }
 id NSTemporaryDirectory_() DARWIN(NSTemporaryDirectory);
-id NSTemporaryDirectory_() { const char *t = std::getenv("TMPDIR"); return autorelease(string_from_utf8(t ? t : "/tmp")); }
+id NSTemporaryDirectory_() { const char *t = mm_host_getenv(api(), "TMPDIR"); return autorelease(string_from_utf8(t ? t : "/tmp")); }
 id NSUserName_() DARWIN(NSUserName);
 id NSUserName_() { const passwd *pw = getpwuid(getuid()); return autorelease(string_from_utf8(pw && pw->pw_name ? pw->pw_name : "user")); }
 id NSFullUserName_() DARWIN(NSFullUserName);
@@ -2155,7 +2371,16 @@ int NSEqualRects_(double ax, double ay, double aw, double ah, double bx, double 
     return ax == bx && ay == by && aw == bw && ah == bh;
 }
 int NSPointInRect_(double px, double py, double x, double y, double w, double h) DARWIN(NSPointInRect);
-int NSPointInRect_(double px, double py, double x, double y, double w, double h) { return px >= x && py >= y && px < x + w && py < y + h; }
+int NSPointInRect_(double px, double py, double x, double y, double w, double h) {
+    /* Intel passes NSPoint in xmm0/xmm1 but the 32-byte NSRect on the
+     * stack. The arm64 entry instead carries all six flattened doubles. */
+    if (auto *ctx = api()->current_context(); ctx && ctx->native_mode) {
+        double rect[4];
+        std::memcpy(rect, reinterpret_cast<const void *>(ctx->native_x[MM_RSP] + 8), sizeof rect);
+        x = rect[0]; y = rect[1]; w = rect[2]; h = rect[3];
+    }
+    return px >= x && py >= y && px < x + w && py < y + h;
+}
 int NSContainsRect_(double ax, double ay, double aw, double ah, double bx, double by, double bw, double bh) DARWIN(NSContainsRect);
 int NSContainsRect_(double ax, double ay, double aw, double ah, double bx, double by, double bw, double bh) {
     return bx >= ax && by >= ay && bx + bw <= ax + aw && by + bh <= ay + ah;
@@ -2209,6 +2434,9 @@ static void foundation_ctor() {
     register_strings();
     register_collections();
     register_misc();
+    register_dispatch_data();
+    register_cookies();
+    register_url_requests();
     register_formatting();
     register_key_value();
     register_plists();

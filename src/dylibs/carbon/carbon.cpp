@@ -23,7 +23,51 @@
 
 using namespace mmfw;
 
+extern "C" {
+__attribute__((visibility("default"))) id type_identifier_key __asm__("_kUTTypeIdentifierKey") = nullptr;
+__attribute__((visibility("default"))) id type_description_key __asm__("_kUTTypeDescriptionKey") = nullptr;
+__attribute__((visibility("default"))) id type_conforms_key __asm__("_kUTTypeConformsToKey") = nullptr;
+}
+
 namespace {
+
+struct type_declaration {
+    std::string_view identifier, description;
+    std::initializer_list<const char *> parents;
+};
+const type_declaration standard_types[] = {
+    {"public.item","Item",{}}, {"public.content","Content",{}},
+    {"public.data","Data",{"public.item"}}, {"public.directory","Directory",{"public.item"}},
+    {"public.folder","Folder",{"public.directory"}},
+    {"public.audiovisual-content","Audiovisual content",{"public.data","public.content"}},
+    {"public.movie","Movie",{"public.audiovisual-content"}},
+    {"public.video","Video",{"public.movie"}}, {"public.audio","Audio",{"public.audiovisual-content"}},
+    {"public.image","Image",{"public.data","public.content"}},
+    {"public.camera-raw-image","Raw image",{"public.image"}},
+    {"public.text","Text",{"public.data","public.content"}}, {"public.plain-text","Plain text",{"public.text"}},
+    {"public.executable","Executable",{"public.item"}},
+    {"com.apple.application","Application",{"public.executable"}},
+    {"com.apple.package","Package",{"public.directory"}},
+    {"com.apple.bundle","Bundle",{"public.directory"}},
+    {"com.apple.application-bundle","Application bundle",{"com.apple.application","com.apple.bundle","com.apple.package"}},
+    {"public.archive","Archive",{"public.data"}},
+    {"public.zip-archive","ZIP archive",{"public.archive"}},
+    {"public.png","PNG image",{"public.image"}},
+    {"public.avi","AVI movie",{"public.movie"}}, {"public.mpeg","MPEG movie",{"public.movie"}},
+    {"public.midi-audio","MIDI audio",{"public.audio"}},
+};
+id type_string(const char *text) {
+    return obj(send(reinterpret_cast<id>(cls("NSString")),"stringWithUTF8String:",ret(text)));
+}
+id declaration_dictionary(id identifier, id description, std::initializer_list<const char *> parents) {
+    id declaration = obj(send(reinterpret_cast<id>(cls("NSMutableDictionary")),"dictionary"));
+    send(declaration,"setObject:forKey:",ret(identifier),ret(type_identifier_key));
+    send(declaration,"setObject:forKey:",ret(description),ret(type_description_key));
+    id conforms = obj(send(reinterpret_cast<id>(cls("NSMutableArray")),"array"));
+    for(const char *parent:parents) send(conforms,"addObject:",ret(type_string(parent)));
+    send(declaration,"setObject:forKey:",ret(conforms),ret(type_conforms_key));
+    return retain(declaration);
+}
 
 /* The input source object: an NSObject the program only ever passes back. */
 id input_source() {
@@ -68,29 +112,41 @@ extern "C" {
 
 /* ---- CoreServices file type descriptions ---------------------------------- */
 
+__attribute__((visibility("default"))) void machoman_dylib_start() {
+    if (type_identifier_key) return;
+    type_identifier_key = retain(type_string("UTTypeIdentifier"));
+    type_description_key = retain(type_string("UTTypeDescription"));
+    type_conforms_key = retain(type_string("UTTypeConformsTo"));
+}
+
+id UTTypeCopyDeclaration_(id identifier) DARWIN(UTTypeCopyDeclaration);
+id UTTypeCopyDeclaration_(id identifier) {
+    if (!identifier || !is_kind(identifier,cls("NSString"))) return nullptr;
+    const char *text = reinterpret_cast<const char *>(send(identifier,"UTF8String"));
+    if (!text) return nullptr;
+    for(const auto &type:standard_types)
+        if(type.identifier==text) return declaration_dictionary(identifier,type_string(type.description.data()),type.parents);
+    for(const auto &type:mm_av_file_types) if(type.identifier==text)
+        return declaration_dictionary(identifier,type_string(type.description.data()),{type.parent.data()});
+    id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")),"mainBundle"));
+    for(const char *key:{"UTExportedTypeDeclarations","UTImportedTypeDeclarations"}) {
+        id declarations = obj(send(bundle,"objectForInfoDictionaryKey:",ret(type_string(key))));
+        for(std::uint64_t i=0;i<send(declarations,"count");++i) {
+            id declaration = obj(send(declarations,"objectAtIndex:",i));
+            id name = obj(send(declaration,"objectForKey:",ret(type_identifier_key)));
+            if(name && send(name,"isEqual:",ret(identifier))) return retain(declaration);
+        }
+    }
+    return nullptr;
+}
+
 id UTTypeCopyDescription_(id identifier) DARWIN(UTTypeCopyDescription);
 id UTTypeCopyDescription_(id identifier) {
-    if (!identifier || !is_kind(identifier, cls("NSString"))) return nullptr;
-    const char *text = reinterpret_cast<const char *>(send(identifier, "UTF8String"));
-    if (!text) return nullptr;
-    std::string_view description;
-    for (const auto &type : mm_av_file_types)
-        if (type.identifier == text) { description = type.description; break; }
-    if (description.empty()) {
-        constexpr std::pair<std::string_view, std::string_view> types[] = {
-            {"public.data", "Data"}, {"public.content", "Content"}, {"public.item", "Item"},
-            {"public.directory", "Directory"}, {"public.folder", "Folder"},
-            {"public.text", "Text"}, {"public.plain-text", "Plain text"},
-            {"public.audio", "Audio"}, {"public.movie", "Movie"}, {"public.video", "Video"},
-            {"public.image", "Image"}, {"public.png", "PNG image"}, {"public.avi", "AVI movie"},
-            {"public.mpeg", "MPEG movie"}, {"public.midi-audio", "MIDI audio"},
-        };
-        for (const auto &[uti, value] : types)
-            if (uti == text) { description = value; break; }
-    }
-    if (description.empty()) return nullptr;
-    return retain(obj(send(reinterpret_cast<id>(cls("NSString")), "stringWithUTF8String:",
-                           reinterpret_cast<std::uintptr_t>(description.data()))));
+    id declaration = UTTypeCopyDeclaration_(identifier);
+    if (!declaration) return nullptr;
+    id description = retain(obj(send(declaration,"objectForKey:",ret(type_description_key))));
+    release(declaration);
+    return description;
 }
 
 /* ---- text input sources --------------------------------------------------- */

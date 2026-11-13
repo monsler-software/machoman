@@ -62,9 +62,13 @@ std::uint64_t supports_sample_count(id, SEL, std::uint64_t count) {
 
 std::uint64_t new_buffer(id self, SEL, std::uint64_t size,
                          std::uint64_t options) {
-  // Managed buffers use coherent backing: didModifyRange and resource sync
-  // need no extra copy, while reported storage mode preserves the Metal API.
-  if (options != 0 && options != 0x10 && options != 0x200 && options != 0x210) {
+  // Backing is coherent for shared/managed buffers and remains inaccessible
+  // through Metal's contents API for private buffers. Vulkan operations use
+  // the backend allocation directly in all three modes.
+  const auto storage = (options >> 4) & 0xf;
+  const auto cache = options & 0xf;
+  const auto hazards = (options >> 8) & 3;
+  if ((options & ~std::uint64_t{0x3ff}) || storage > 2 || cache > 1 || hazards > 2) {
     std::fprintf(stderr,
                  "MEVK Metal: unsupported buffer resource options 0x%llx\n",
                  static_cast<unsigned long long>(options));
@@ -79,7 +83,9 @@ std::uint64_t new_buffer(id self, SEL, std::uint64_t size,
   auto *result = make<Buffer>(MM_FW_CLASS_REF(MEVKBuffer));
   result->device.set(self);
   result->backend = std::move(backend);
-  result->storage_mode = (options >> 4) & 0xf;
+  result->storage_mode = storage;
+  result->cpu_cache_mode = cache;
+  result->hazard_tracking_mode = hazards ? hazards : 2;
   return ret(result); // new... returns a retained object.
 }
 std::uint64_t new_buffer_bytes(id self, SEL sel, const void *bytes,
@@ -110,9 +116,13 @@ std::uint64_t buffer_length(id self, SEL) {
   return as<Buffer>(self)->backend->size();
 }
 std::uint64_t buffer_contents(id self, SEL) {
+  if (as<Buffer>(self)->storage_mode == 2) return 0;
   return ret(as<Buffer>(self)->backend->contents());
 }
 std::uint64_t shared_mode(id, SEL) { return 0; }
+std::uint64_t buffer_cache_mode(id self, SEL) {
+  return as<Buffer>(self)->cpu_cache_mode;
+}
 std::uint64_t buffer_storage_mode(id self, SEL) {
   return as<Buffer>(self)->storage_mode;
 }
@@ -134,12 +144,16 @@ std::uint64_t synchronize_resource(id self, SEL, id resource) {
     encoder.state->resources.emplace_back(resource);
   return 0;
 }
-std::uint64_t tracked_mode(id, SEL) { return 2; }
+std::uint64_t tracked_mode(id self, SEL) {
+  return as<Buffer>(self)->hazard_tracking_mode;
+}
 std::uint64_t resource_options(id self, SEL) {
-  return (as<Buffer>(self)->storage_mode << 4) | (std::uint64_t{2} << 8);
+  const auto *buffer = as<Buffer>(self);
+  return (buffer->storage_mode << 4) | buffer->cpu_cache_mode |
+         (buffer->hazard_tracking_mode << 8);
 }
 
-std::uint64_t queue_command_buffer(id self, SEL) {
+std::uint64_t queue_command_buffer(id self, SEL selector) {
   std::string error;
   auto backend = as<Device>(as<Queue>(self)->device.value)
                      ->context->create_command_buffer(error);
@@ -151,6 +165,7 @@ std::uint64_t queue_command_buffer(id self, SEL) {
   result->queue.set(self);
   result->state = std::make_shared<CommandState>();
   result->state->backend = std::move(backend);
+  result->retained_references=std::strstr(selector,"Unretained")==nullptr;
   return ret(autorelease(reinterpret_cast<id>(result)));
 }
 std::uint64_t command_queue(id self, SEL) {
@@ -159,7 +174,9 @@ std::uint64_t command_queue(id self, SEL) {
 std::uint64_t command_device(id self, SEL) {
   return ret(as<Queue>(as<Command>(self)->queue.value)->device.value);
 }
-std::uint64_t retained_references(id, SEL) { return 1; }
+std::uint64_t retained_references(id self, SEL) { return as<Command>(self)->retained_references?1u:0u; }
+std::uint64_t current_allocated_size(id self,SEL){return as<Device>(self)->context->allocated_size();}
+std::uint64_t recommended_working_set_size(id self,SEL){return as<Device>(self)->context->recommended_working_set_size();}
 
 std::uint64_t blit_encoder(id self, SEL) {
   auto state = as<Command>(self)->state;
@@ -464,6 +481,8 @@ void register_classes() {
   lifecycle<Encoder>(encoder);
   MM_METHODS(
       device, {"name", MM_IMP(device_name), "@16@0:8"},
+      {"currentAllocatedSize",MM_IMP(current_allocated_size),"Q16@0:8"},
+      {"recommendedMaxWorkingSetSize",MM_IMP(recommended_working_set_size),"Q16@0:8"},
       {"newBufferWithLength:options:", MM_IMP(new_buffer), "@32@0:8Q16Q24"},
       {"newBufferWithBytes:length:options:", MM_IMP(new_buffer_bytes),
        "@40@0:8^v16Q24Q32"},
@@ -485,13 +504,13 @@ void register_classes() {
       {"contents", MM_IMP(buffer_contents), "^v16@0:8"},
       {"storageMode", MM_IMP(buffer_storage_mode), "Q16@0:8"},
       {"didModifyRange:", MM_IMP(buffer_modified), "v32@0:8{_NSRange=QQ}16"},
-      {"cpuCacheMode", MM_IMP(shared_mode), "Q16@0:8"},
+      {"cpuCacheMode", MM_IMP(buffer_cache_mode), "Q16@0:8"},
       {"hazardTrackingMode", MM_IMP(tracked_mode), "Q16@0:8"},
       {"resourceOptions", MM_IMP(resource_options), "Q16@0:8"});
   MM_METHODS(queue, {"device", MM_IMP(queue_device), "@16@0:8"},
              {"commandBuffer", MM_IMP(queue_command_buffer), "@16@0:8"},
              {"commandBufferWithUnretainedReferences",
-              MM_IMP(unsupported_device), "@16@0:8"});
+              MM_IMP(queue_command_buffer), "@16@0:8"});
   MM_METHODS(command, {"device", MM_IMP(command_device), "@16@0:8"},
              {"commandQueue", MM_IMP(command_queue), "@16@0:8"},
              {"retainedReferences", MM_IMP(retained_references), "B16@0:8"},

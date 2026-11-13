@@ -554,6 +554,39 @@ std::uint64_t n_description(id self, SEL) {
     return ret(autorelease(string_from_utf8(s)));
 }
 std::uint64_t n_init(id self, SEL) { return ret(self); }
+std::string base64_encode(std::string_view bytes, std::uint64_t options) {
+    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    encoded.reserve((bytes.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < bytes.size(); i += 3) {
+        const auto a = static_cast<unsigned char>(bytes[i]);
+        const auto b = i + 1 < bytes.size() ? static_cast<unsigned char>(bytes[i + 1]) : 0;
+        const auto c = i + 2 < bytes.size() ? static_cast<unsigned char>(bytes[i + 2]) : 0;
+        encoded += alphabet[a >> 2];
+        encoded += alphabet[((a & 3) << 4) | (b >> 4)];
+        encoded += i + 1 < bytes.size() ? alphabet[((b & 15) << 2) | (c >> 6)] : '=';
+        encoded += i + 2 < bytes.size() ? alphabet[c & 63] : '=';
+    }
+    const std::size_t width = options & 1 ? 64 : options & 2 ? 76 : 0;
+    if (!width || encoded.size() <= width) return encoded;
+    std::string separator;
+    if (options & 16) separator += '\r';
+    if (options & 32) separator += '\n';
+    if (separator.empty()) separator = "\r\n";
+    std::string wrapped;
+    for (std::size_t i = 0; i < encoded.size(); i += width) {
+        if (i) wrapped += separator;
+        wrapped.append(encoded, i, std::min(width, encoded.size() - i));
+    }
+    return wrapped;
+}
+std::uint64_t n_base64String(id self, SEL, std::uint64_t options) {
+    return ret(autorelease(string_from_utf8(base64_encode(dat(self)->bytes, options))));
+}
+std::uint64_t n_base64Data(id self, SEL, std::uint64_t options) {
+    const auto bytes = base64_encode(dat(self)->bytes, options);
+    return ret(autorelease(data_create(bytes.data(), static_cast<CFIndex>(bytes.size()), false)));
+}
 std::uint64_t n_initWithBytesLength(id self, SEL, const void *b, std::uint64_t n) { if (b) dat(self)->bytes.assign(static_cast<const char *>(b), n); else dat(self)->bytes.assign(n, '\0'); return ret(self); }
 std::uint64_t n_initWithBytesNoCopy(id self, SEL, void *b, std::uint64_t n, std::uint64_t free_when_done) { dat(self)->bytes.assign(static_cast<const char *>(b), n); if (free_when_done) std::free(b); return ret(self); }
 std::uint64_t n_initWithBytesNoCopy2(id self, SEL, void *b, std::uint64_t n) { return n_initWithBytesNoCopy(self, nullptr, b, n, 1); }
@@ -810,7 +843,9 @@ struct set_dtor : set_object { ~set_dtor() { for (id o : items) release(o); } };
 
 } // namespace
 
+void register_index_sets();
 void register_collections() {
+    register_index_sets();
     Class nsobject = cls("NSObject");
     g_array = mm_objc_define_class("NSArray", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSArray), FND_META_REF(NSArray));
     mm_objc_define_class("NSConstantArray", g_array, sizeof(constant_array), FND_CLASS_REF(NSConstantArray), FND_META_REF(NSConstantArray));
@@ -996,6 +1031,8 @@ void register_collections() {
     FND_METHODS(g_data,
         {"length", IMP(n_length), "Q16@0:8"},
         {"bytes", IMP(n_bytes), "r^v16@0:8"},
+        {"base64EncodedStringWithOptions:", IMP(n_base64String), "@24@0:8Q16"},
+        {"base64EncodedDataWithOptions:", IMP(n_base64Data), "@24@0:8Q16"},
         {"getBytes:length:", IMP(n_getBytesLength), "v32@0:8^v16Q24"},
         {"getBytes:range:", IMP(n_getBytesRange), "v40@0:8^v16{_NSRange=QQ}24"},
         {"isEqualToData:", IMP(n_isEqualToData), "B24@0:8@16"},

@@ -72,6 +72,9 @@ bool same_rect(const rect &a, const rect &b) {
 /* ---- NSView -------------------------------------------------------------- */
 
 std::uint64_t view_initWithFrame(id self, SEL, double x, double y, double width, double height) {
+    if (trace())
+        std::fprintf(stderr, "AppKit: -[%s initWithFrame:] {%g, %g, %g, %g}\n",
+                     mm_objc_class_name(mm_objc_object_class(self)), x, y, width, height);
     v(self)->frame = {x, y, width, height};
     v(self)->bounds = {0, 0, width, height};
     return ret(self);
@@ -109,6 +112,10 @@ std::uint64_t view_setFrame(id self, SEL, double x, double y, double width, doub
         return 0;
     }
     const rect previous = o->frame;
+    if (trace() && !same_rect(previous, {x,y,width,height}))
+        std::fprintf(stderr, "AppKit: -[%s setFrame:] {%g, %g, %g, %g} -> {%g, %g, %g, %g}\n",
+                     mm_objc_class_name(mm_objc_object_class(self)), previous.x, previous.y, previous.w,
+                     previous.h, x, y, width, height);
     const bool resized = previous.w != width || previous.h != height;
     o->frame = {x, y, width, height};
     if (resized) {
@@ -499,12 +506,17 @@ std::uint64_t control_setTitle(id self, SEL, id title) {
     control_object *c = control_of(self);
     id replacement = retain(title);
     release(c->title); c->title = replacement;
+    release(c->attributed_title); c->attributed_title = nullptr;
     view_setNeedsDisplay(self, nullptr, 1);
     return 0;
 }
 std::uint64_t control_setAttributedTitle(id self, SEL, id title) {
-    return control_setTitle(self,nullptr,title?obj(send(title,"string")):nullptr);
+    retain(title);
+    control_setTitle(self,nullptr,title?obj(send(title,"string")):nullptr);
+    control_of(self)->attributed_title = title;
+    return 0;
 }
+std::uint64_t control_attributedTitle(id self, SEL) { return ret(control_of(self)->attributed_title); }
 std::uint64_t control_target(id self, SEL) { return ret(control_of(self)->target); }
 std::uint64_t control_setTarget(id self, SEL, id target) { control_of(self)->target = target; return 0; }
 std::uint64_t control_action(id self, SEL) { return reinterpret_cast<std::uintptr_t>(control_of(self)->action); }
@@ -551,7 +563,7 @@ std::uint64_t control_mouseUp(id self, SEL, id event) {
     for (auto it = parents.rbegin(); it != parents.rend(); ++it) point = point_from_parent(*it, point);
     const auto b = c->view.bounds;
     if (pressed && point.x >= b.x && point.x < b.x+b.w && point.y >= b.y && point.y < b.y+b.h)
-        control_performClick(self, nullptr, nullptr);
+        send(self,"performClick:",0);
     return 0;
 }
 
@@ -644,6 +656,12 @@ std::uint64_t window_setFrameDisplayAnimate(id self, SEL, double x, double y, do
                                             std::uint64_t display, std::uint64_t) {
     return window_setFrame(self, nullptr, x, y, width, height, display);
 }
+std::uint64_t window_setContentSize(id self, SEL, double width, double height) {
+    if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0) return 0;
+    const auto f = w(self)->frame;
+    // Preserve the top edge, as AppKit does when changing content height.
+    return window_setFrame(self, nullptr, f.x, f.y + f.h - height, width, height, 0);
+}
 std::uint64_t window_setMinimumSize(id self, SEL, double width, double height) {
     auto *o = w(self);
     if (!std::isfinite(width) || !std::isfinite(height) || width < 0 || height < 0) return 0;
@@ -719,6 +737,8 @@ void ensure_platform_window(id self) {
          * Expose that geometry immediately, so launch-time drawing uses
          * the same dimensions as the EGL surface. */
         const rect actual = platform::window_frame(o->platform);
+        std::fprintf(stderr, "AppKit layout: platform-window=%p title=\"%s\" requested=%gx%g configured=%gx%g\n",
+                     static_cast<void *>(self),o->title.c_str(),o->frame.w,o->frame.h,actual.w,actual.h);
         if (actual.w != o->frame.w || actual.h != o->frame.h) {
             /* Publish geometry immediately for launch-time GL drawing,
              * then deliver the compositor's resize after the window is
@@ -841,6 +861,16 @@ std::uint64_t window_makeFirstResponder(id self, SEL, id responder) {
     std::unique_ptr<mm_objc_object, decltype(&mm_objc_release)> receiver(retain(self), mm_objc_release);
     window_object *o = w(self);
     if (o->first_responder == responder) return 1;
+    /* A rejected candidate can be requested again by the old responder's
+     * restoration callback. Reject that pending request before resigning
+     * the old responder again, while permitting a callback to select a
+     * different candidate. The outer transaction owns candidate lifetime. */
+    if (std::find(o->first_responder_requests.begin(), o->first_responder_requests.end(), responder) != o->first_responder_requests.end()) return 0;
+    o->first_responder_requests.push_back(responder);
+    struct focus_request_scope {
+        window_object *window;
+        ~focus_request_scope() { window->first_responder_requests.pop_back(); }
+    } request{o};
     std::unique_ptr<mm_objc_object, decltype(&mm_objc_release)> previous(retain(o->first_responder), mm_objc_release);
     std::unique_ptr<mm_objc_object, decltype(&mm_objc_release)> candidate(retain(responder), mm_objc_release);
     if (previous && !send(previous.get(), "resignFirstResponder")) return 0;
@@ -946,7 +976,8 @@ std::uint64_t window_sendEvent(id self, SEL, id event) {
     };
     for (const auto &r : routes) {
         if (r.type != type) continue;
-        if (trace() && (down || up || type == ev_key_down || type == ev_key_up || type == ev_flags_changed))
+        if ((trace() && (down || up || type == ev_key_down || type == ev_key_up || type == ev_flags_changed)) ||
+            (std::getenv("MACHOMAN_APPKIT_POINTER_TRACE") && (down || up)))
             std::fprintf(stderr, "AppKit: %s -> %s %p\n", r.sel, mm_objc_class_name(mm_objc_object_class(target)), static_cast<void *>(target));
         /* The handler can close the window or replace its content view. */
         std::unique_ptr<mm_objc_object, decltype(&mm_objc_release)> responder(retain(target), mm_objc_release);
@@ -1121,6 +1152,7 @@ void register_views() {
 
     mm_objc_add_method(g_view, "beginDraggingSessionWithItems:event:source:", MM_IMP(begin_dragging_session), "@40@0:8@16@24@32");
     MM_METHODS(g_window,
+        {"setContentSize:", MM_IMP(window_setContentSize), "v32@0:8{CGSize=dd}16"},
         {"setMinSize:", MM_IMP(window_setMinimumSize), "v32@0:8{CGSize=dd}16"},
         {"setContentMinSize:", MM_IMP(window_setMinimumSize), "v32@0:8{CGSize=dd}16"},
         {"setMaxSize:", MM_IMP(window_setMaximumSize), "v32@0:8{CGSize=dd}16"},
@@ -1143,7 +1175,7 @@ void register_views() {
                             "setExcludedFromWindowsMenu:", "setShowsResizeIndicator:", "setAutodisplay:",
                             "setPreservesContentDuringLiveResize:", "setDisplaysWhenScreenProfileChanges:",
                             "useOptimizedDrawing:", "setTabbingMode:", "setTitleVisibility:", "setToolbar:",
-                            "setInitialFirstResponder:", "setContentSize:", "setAspectRatio:",
+                            "setInitialFirstResponder:", "setAspectRatio:",
                             "setResizeIncrements:", "setDocumentEdited:", "setRepresentedFilename:",
                             "disableCursorRects", "enableCursorRects", "resetCursorRects",
                             "setOneShot:", "setDepthLimit:",
@@ -1208,6 +1240,7 @@ void register_views() {
         {"stringValue", MM_IMP(control_title), "@16@0:8"},
         {"setStringValue:", MM_IMP(control_setTitle), "v24@0:8@16"},
         {"setAttributedStringValue:", MM_IMP(control_setAttributedTitle), "v24@0:8@16"},
+        {"attributedStringValue", MM_IMP(control_attributedTitle), "@16@0:8"},
         {"target", MM_IMP(control_target), "@16@0:8"},
         {"setTarget:", MM_IMP(control_setTarget), "v24@0:8@16"},
         {"action", MM_IMP(control_action), ":16@0:8"},

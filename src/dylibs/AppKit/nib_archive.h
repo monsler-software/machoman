@@ -1,6 +1,7 @@
 #ifndef MACHOMAN_NIB_ARCHIVE_H
 #define MACHOMAN_NIB_ARCHIVE_H
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,5 +15,6 @@ struct nib_value {
 };
 struct nib_record { std::string class_name; std::vector<nib_value> values; };
 bool parse_nib_archive(std::string_view bytes, std::vector<nib_record> &objects, std::string &error);
+bool parse_nib_geometry(std::string_view text, std::span<double> values);
 }
 #endif

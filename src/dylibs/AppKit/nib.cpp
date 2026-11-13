@@ -21,7 +21,9 @@
 #include "appkit.h"
 #include "nib_archive.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <clocale>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -48,11 +50,16 @@ namespace fs = std::filesystem;
  * graph: a menu's items point back at the menu. */
 class unarchiver {
 public:
-    unarchiver(id objects, id owner) : objects_(objects), owner_(owner) {}
+    unarchiver(id objects, id owner, std::string table = {})
+        : objects_(objects), owner_(owner), localization_table_(std::move(table)) {}
 
     id decode(id ref, int depth = 0);
     const std::vector<id> &top_level() const { return top_level_; }
-    void note_top_level(id o) { if (o) top_level_.push_back(o); }
+    void note_top_level(id o) {
+        if (o && o != owner_ && o != g_NSApp &&
+            std::find(top_level_.begin(), top_level_.end(), o) == top_level_.end())
+            top_level_.push_back(o);
+    }
 
 private:
     id entry(std::uint64_t index) {
@@ -91,6 +98,7 @@ private:
     }
     id objects_;
     id owner_;
+    std::string localization_table_;
     std::unordered_map<std::uint64_t, id> built_;
     std::vector<id> top_level_;
     std::vector<id> awake_;
@@ -147,10 +155,21 @@ id unarchiver::build(id dict, std::uint64_t index, int depth) {
     if (trace()) std::fprintf(stderr, "AppKit: nib: decoding %s\n", klass.empty() ? "(plain dictionary)" : klass.c_str());
     if (klass.empty()) return dict; /* a plain dictionary */
 
-    if (klass == "NSMutableString" || klass == "NSString" || klass == "NSLocalizableString")
+    if (klass == "NSLocalizableString") {
+        id fallback = obj(send(dict, "objectForKey:", ret(string("NS.string"))));
+        id key = value(dict, "NSKey", depth);
+        if (!key) return fallback;
+        id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")), "mainBundle"));
+        return obj(send(bundle, "localizedStringForKey:value:table:", ret(key), ret(fallback),
+                        ret(string(localization_table_))));
+    }
+    if (klass == "NSMutableString" || klass == "NSString")
         return obj(send(dict, "objectForKey:", ret(string("NS.string"))));
     if (klass == "NSMutableData" || klass == "NSData")
         return obj(send(dict, "objectForKey:", ret(string("NS.data"))));
+    // Archived table templates are embedded nib bytes, decoded afresh for
+    // each makeViewWithIdentifier:owner: request.
+    if (klass == "NSNib") return value(dict, "NSNibFileData", depth);
     if (klass == "NSArray" || klass == "NSMutableArray" || klass == "NSSet" || klass == "NSMutableSet") {
         std::vector<id> items = ns_objects(*this, dict, depth);
         id a = obj(send(reinterpret_cast<id>(cls("NSMutableArray")), "array"));
@@ -179,6 +198,9 @@ id unarchiver::build(id dict, std::uint64_t index, int depth) {
     if (klass == "NSTableColumn") {
         id o=obj(send(reinterpret_cast<id>(cls("NSTableColumn")),"alloc"));built_[index]=o;
         auto *column=as<table_column_object>(o);column->identifier=retain(value(dict,"NSIdentifier",depth));column->width=real_value(dict,"NSWidth",depth,120);
+        column->minimum_width=real_value(dict,"NSMinWidth",depth,10);
+        column->maximum_width=std::max(column->minimum_width,real_value(dict,"NSMaxWidth",depth,1000));
+        column->resizing_mask=static_cast<std::uint64_t>(int_value(dict,"NSResizingMask",depth,1));
         return o;
     }
     if (klass == "NSCustomObject") return build_custom_object(dict, depth);
@@ -194,11 +216,29 @@ id unarchiver::build(id dict, std::uint64_t index, int depth) {
         /* The root: the objects, then the connections between them (the
          * connectors apply themselves as they are decoded), then the
          * windows the nib says are visible. */
-        value(dict, "NSRoot", depth);
-        id objects = value(dict, "NSObjectsValues", depth);
-        if (objects) {
-            const auto n = static_cast<std::uint64_t>(send(objects, "count"));
-            for (std::uint64_t i = 0; i < n; i++) note_top_level(obj(send(objects, "objectAtIndex:", i)));
+        id root = value(dict, "NSRoot", depth);
+        id keys_ref = obj(send(dict, "objectForKey:", ret(string("NSObjectsKeys"))));
+        id parents_ref = obj(send(dict, "objectForKey:", ret(string("NSObjectsValues"))));
+        if (keys_ref && parents_ref) {
+            /* These parallel arrays encode object -> parent, not a list
+             * of owned objects. Releasing the values frees the same parent
+             * repeatedly, including File's Owner and cached table cells.
+             * Walk archived slots: decoding an NSArray drops nil objects
+             * (First Responder), which would misalign the parent pairs. */
+            id keys_dict = is_uid(keys_ref) ? entry(send(keys_ref, "value")) : keys_ref;
+            id parents_dict = is_uid(parents_ref) ? entry(send(parents_ref, "value")) : parents_ref;
+            id keys = obj(send(keys_dict, "objectForKey:", ret(string("NS.objects"))));
+            id parents = obj(send(parents_dict, "objectForKey:", ret(string("NS.objects"))));
+            const auto n = std::min(send(keys, "count"), send(parents, "count"));
+            for (std::uint64_t i = 0; i < n; ++i) {
+                id object = decode(obj(send(keys, "objectAtIndex:", i)), depth + 1);
+                id parent = decode(obj(send(parents, "objectAtIndex:", i)), depth + 1);
+                if (parent == root) note_top_level(object);
+            }
+        } else if (id objects = value(dict, "NSObjectsValues", depth)) {
+            /* Older minimal archives can contain only an object list. */
+            const auto n = send(objects, "count");
+            for (std::uint64_t i = 0; i < n; ++i) note_top_level(obj(send(objects, "objectAtIndex:", i)));
         }
         value(dict, "NSConnections", depth);
         if (id visible = value(dict, "NSVisibleWindows", depth)) {
@@ -296,7 +336,11 @@ id unarchiver::build_window(id dict, int depth) {
     /* NSWindowRect is a string like "{{x, y}, {w, h}}". */
     double x = 0, y = 0, w = 480, h = 320;
     const std::string r = string_value(dict, "NSWindowRect", depth);
-    if (!r.empty()) std::sscanf(r.c_str(), "{{%lf, %lf}, {%lf, %lf}}", &x, &y, &w, &h);
+    if (!r.empty()) {
+        double values[4];
+        if (parse_nib_geometry(r,values)) { x=values[0];y=values[1];w=values[2];h=values[3]; }
+        else std::fprintf(stderr,"AppKit layout: invalid nib window rect=\"%s\"\n",r.c_str());
+    }
     const auto style = static_cast<std::uint64_t>(int_value(dict, "NSWindowStyleMask", depth, 15));
     id window = obj(send(reinterpret_cast<id>(cls("NSWindow")), "alloc"));
     if (mm_cpu_context *ctx = api()->current_context()) {
@@ -308,9 +352,35 @@ id unarchiver::build_window(id dict, int depth) {
     const std::uint64_t args[3] = {style, 2 /* NSBackingStoreBuffered */, 0};
     window = obj(mm_objc_send(window, mm_objc_sel("initWithContentRect:styleMask:backing:defer:"), 3, args));
     if (!window) return nullptr;
+    {
+        auto f = as<window_object>(window)->frame;
+        auto *ctx = api()->current_context();
+        std::fprintf(stderr, "AppKit layout: nib-window=%p raw=\"%s\" parsed=%gx%g initialized=%gx%g context=%s arch=%s numeric-locale=%s\n",
+                     static_cast<void *>(window),r.c_str(),w,h,f.w,f.h,ctx ? "yes" : "no",
+                     ctx && ctx->native_mode ? "x86_64" : "arm64",std::setlocale(LC_NUMERIC,nullptr));
+    }
     const std::string title = string_value(dict, "NSWindowTitle", depth);
     if (!title.empty()) send(window, "setTitle:", ret(string(title)));
-    if (id view = value(dict, "NSWindowView", depth)) send(window, "setContentView:", ret(view));
+    if (id view = value(dict, "NSWindowView", depth)) {
+        // Auto Layout nibs can archive a content view larger than the old
+        // window rect. Keep its designed minimum instead of compressing
+        // nested groups until their controls overlap.
+        const auto size = as<view_object>(view)->frame;
+        if (!as<view_object>(view)->constraints.empty() && (size.w > w || size.h > h)) {
+            const double width = std::max(w, size.w), height = std::max(h, size.h);
+            if (auto *ctx = api()->current_context()) {
+                std::memcpy(&ctx->v[0][0], &width, 8);
+                std::memcpy(&ctx->v[1][0], &height, 8);
+            }
+            send(window, "setContentSize:");
+        }
+        send(window, "setContentView:", ret(view));
+        const auto f = as<window_object>(window)->frame;
+        const auto content = as<view_object>(view)->frame;
+        std::fprintf(stderr, "AppKit layout: nib-content window=%p title=\"%s\" designed=%gx%g window=%gx%g content=%gx%g constraints=%zu\n",
+                     static_cast<void *>(window),title.c_str(),size.w,size.h,f.w,f.h,content.w,content.h,
+                     as<view_object>(view)->constraints.size());
+    }
     return window;
 }
 
@@ -326,8 +396,15 @@ id unarchiver::build_view(id dict, const std::string &klass, int depth, std::uin
      * window when it becomes the content view. */
     double x = 0, y = 0, w = 0, h = 0;
     const std::string r = string_value(dict, "NSFrame", depth);
-    if (!r.empty()) std::sscanf(r.c_str(), "{{%lf, %lf}, {%lf, %lf}}", &x, &y, &w, &h);
-    else { const auto size = string_value(dict, "NSFrameSize", depth); std::sscanf(size.c_str(), "{%lf, %lf}", &w, &h); }
+    if (!r.empty()) {
+        double values[4];
+        if (parse_nib_geometry(r,values)) { x=values[0];y=values[1];w=values[2];h=values[3]; }
+        else std::fprintf(stderr,"AppKit layout: invalid nib view class=%s rect=\"%s\"\n",klass.c_str(),r.c_str());
+    } else {
+        const auto size = string_value(dict, "NSFrameSize", depth);
+        double values[2];
+        if (parse_nib_geometry(size,values)) { w=values[0];h=values[1]; }
+    }
     if (trace()) std::fprintf(stderr, "AppKit: nib view %s NSFrame '%s' -> {%g, %g, %g, %g}\n",
                               klass.c_str(), r.c_str(), x, y, w, h);
     id view = obj(send(reinterpret_cast<id>(c), "alloc"));
@@ -346,6 +423,8 @@ id unarchiver::build_view(id dict, const std::string &klass, int depth, std::uin
     vo->translates_mask=!int_value(dict,"NSDoNotTranslateAutoresizingMask",depth);
     if (is_kind(view, cls("NSControl"))) {
         auto *control=as<control_object>(view);
+        if (id identifier = value(dict, "NSReuseIdentifierKey", depth))
+            send(view, "setIdentifier:", ret(identifier));
         control->enabled=int_value(dict,"NSEnabled",depth,1)!=0;
         control->alignment=int_value(dict,"NSControlTextAlignment",depth);
 
@@ -383,17 +462,56 @@ id unarchiver::build_view(id dict, const std::string &klass, int depth, std::uin
         for (std::uint64_t i = 0; i < n; i++)
             if (id sub = obj(send(subviews, "objectAtIndex:", i))) send(view, "addSubview:", ret(sub));
     }
+    if (is_kind(view, cls("NSBox"))) {
+        auto *box = as<control_object>(view);
+        box->box_type = int_value(dict, "NSBoxType", depth);
+        box->title_position = int_value(dict, "NSTitlePosition", depth, 2);
+        box->bordered = int_value(dict, "NSBorderType", depth, 3) != 0;
+        box->box_content = value(dict, "NSContentView", depth);
+        if (box->box_content) {
+            if (as<view_object>(box->box_content)->superview != view)
+                send(view, "addSubview:", ret(box->box_content));
+            box->box_title_height = std::max(0., h - as<view_object>(box->box_content)->frame.h);
+        }
+        id ref = obj(send(dict, "objectForKey:", ret(string("NSTitleCell"))));
+        id cell = is_uid(ref) ? entry(send(ref, "value")) : ref;
+        if (cell) {
+            if (id title = value(cell, "NSContents", depth)) send(view, "setTitle:", ret(title));
+            if (id font = value(cell, "NSSupport", depth)) send(view, "setFont:", ret(font));
+        }
+    }
     if(is_kind(view,cls("NSProgressIndicator"))||is_kind(view,cls("NSSlider"))) {
         auto *control=as<control_object>(view);
         control->minimum=real_value(dict,"NSMinValue",depth,0);control->maximum=real_value(dict,"NSMaxValue",depth,100);
         control->value=real_value(dict,"NSValue",depth,0);
         if(is_kind(view,cls("NSProgressIndicator")))control->indeterminate=(int_value(dict,"NSpiFlags",depth)&2)!=0;
     }
-    if(is_kind(view,cls("NSScrollView")))if(id content=value(dict,"NSContentView",depth))send(view,"setContentView:",ret(content));
+    if(is_kind(view,cls("NSScrollView"))) {
+        if(id content=value(dict,"NSContentView",depth))send(view,"setContentView:",ret(content));
+        if(id scroller=value(dict,"NSVScroller",depth))send(view,"setVerticalScroller:",ret(scroller));
+        if(id scroller=value(dict,"NSHScroller",depth))send(view,"setHorizontalScroller:",ret(scroller));
+        const auto flags=static_cast<std::uint64_t>(int_value(dict,"NSsFlags",depth));
+        send(view,"setAutohidesScrollers:",(flags&512)!=0);
+        send(view,"setHasVerticalScroller:",(flags&16)!=0);
+        send(view,"setHasHorizontalScroller:",(flags&32)!=0);
+        send(view,"setBorderType:",flags&3);
+    }
     if(is_kind(view,cls("NSTableView"))) {
         auto *table=as<table_object>(view);table->row_height=real_value(dict,"NSRowHeight",depth,20);
+        table->column_autoresizing_style=static_cast<std::uint64_t>(int_value(dict,"NSColumnAutoresizingStyle",depth,4));
         if(id columns=value(dict,"NSTableColumns",depth))for(std::uint64_t i=0;i<send(columns,"count");++i)
             send(view,"addTableColumn:",send(columns,"objectAtIndex:",i));
+        if (id nibs = value(dict, "NSTableViewArchivedReusableViewsKey", depth)) {
+            id keys = obj(send(nibs, "allKeys"));
+            for (std::uint64_t i = 0; i < send(keys, "count"); ++i) {
+                id key = obj(send(keys, "objectAtIndex:", i));
+                id data = obj(send(nibs, "objectForKey:", ret(key)));
+                if (!data || !is_kind(data, cls("NSData"))) continue;
+                const char *bytes = reinterpret_cast<const char *>(send(data, "bytes"));
+                const auto length = send(data, "length");
+                if (bytes && length) table->reusable_nibs[to_utf8(key)] = std::string(bytes, length);
+            }
+        }
     }
     if(id list=value(dict,"NSViewConstraints",depth))for(std::uint64_t i=0;i<send(list,"count");++i) {
         id ref=obj(send(list,"objectAtIndex:",i));
@@ -482,9 +600,19 @@ id normalized_nib(const std::vector<nib_record> &records) {
             else put(d, v.key.c_str(), value);
             if (v.key == "NS.bytes" && (record.class_name == "NSString" || record.class_name == "NSLocalizableString"))
                 put(d, "NS.string", string(v.bytes));
+            if (v.key == "NS.bytes" && (record.class_name == "NSData" || record.class_name == "NSMutableData"))
+                put(d, "NS.data", value);
         }
         if (record.class_name == "NSArray" || record.class_name == "NSMutableArray" || record.class_name == "NSSet" || record.class_name == "NSMutableSet")
             put(d, "NS.objects", items);
+        if (record.class_name == "NSDictionary" || record.class_name == "NSMutableDictionary") {
+            id keys = array(), values = array();
+            for (std::uint64_t i = 0; i + 1 < send(items, "count"); i += 2) {
+                send(keys, "addObject:", send(items, "objectAtIndex:", i));
+                send(values, "addObject:", send(items, "objectAtIndex:", i + 1));
+            }
+            put(d, "NS.keys", keys); put(d, "NS.objects", values);
+        }
         send(objects, "addObject:", ret(d));
     }
     id top = dictionary();
@@ -509,11 +637,11 @@ fs::path locate_nib(const std::string &name) {
     const fs::path resources = fs::path(root) / "Contents" / "Resources";
     std::vector<fs::path> dirs{resources};
     std::error_code ec;
-    for (const auto &entry : fs::directory_iterator(resources, ec))
-        if (entry.is_directory(ec) && entry.path().extension() == ".lproj") dirs.push_back(entry.path());
 
     std::string base = name;
     if (base.size() > 4 && base.compare(base.size() - 4, 4, ".nib") == 0) base.resize(base.size() - 4);
+    if (id localized = obj(send(bundle, "pathForResource:ofType:", ret(string(base)), ret(string("nib")))))
+        dirs.insert(dirs.begin(), fs::path(to_utf8(localized)).parent_path());
     for (const auto &dir : dirs) {
         const fs::path candidate = dir / (base + ".nib");
         if (fs::is_directory(candidate, ec)) {
@@ -546,12 +674,17 @@ bool load_nib(const std::string &name, id owner, std::vector<id> *top_level) {
     }
     const std::string bytes = read_file(path);
     if (bytes.empty()) return false;
+    if (trace()) std::fprintf(stderr, "AppKit: nib: loading %s\n", path.c_str());
+    return load_nib_data(bytes, owner, top_level, name);
+}
+
+bool load_nib_data(std::string_view bytes, id owner, std::vector<id> *top_level, const std::string &localization_table) {
 
     id plist = nullptr;
     if (bytes.starts_with("NIBArchive")) {
         std::vector<nib_record> records; std::string error;
         if (!parse_nib_archive(bytes, records, error)) {
-            std::fprintf(stderr, "AppKit: nib: %s: %s\n", path.c_str(), error.c_str()); return false;
+            std::fprintf(stderr, "AppKit: nib: %s\n", error.c_str()); return false;
         }
         plist = normalized_nib(records);
     } else {
@@ -561,18 +694,17 @@ bool load_nib(const std::string &name, id owner, std::vector<id> *top_level) {
             mm_objc_sel("propertyListWithData:options:format:error:"), 4, args));
     }
     if (!plist || !is_kind(plist, cls("NSDictionary"))) {
-        std::fprintf(stderr, "AppKit: nib: %s is not a keyed archive\n", path.c_str());
+        std::fprintf(stderr, "AppKit: nib: data is not a keyed archive\n");
         return false;
     }
     id objects = obj(send(plist, "objectForKey:", ret(string("$objects"))));
     id top = obj(send(plist, "objectForKey:", ret(string("$top"))));
     if (!objects || !top) {
-        std::fprintf(stderr, "AppKit: nib: %s has no $objects\n", path.c_str());
+        std::fprintf(stderr, "AppKit: nib: data has no $objects\n");
         return false;
     }
-    if (trace()) std::fprintf(stderr, "AppKit: nib: loading %s\n", path.c_str());
 
-    unarchiver u(objects, owner);
+    unarchiver u(objects, owner, localization_table);
     /* $top names the root; Interface Builder calls it "IB.objectdata",
      * other archivers "root" or "NSRoot". Any single entry is the root. */
     id root = nullptr;

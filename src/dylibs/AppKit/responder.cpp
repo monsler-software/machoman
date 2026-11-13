@@ -5,6 +5,8 @@
  * `-nextResponder` until something implements the action, which is how
  * AppKit apps expect key handling and menu actions to work. */
 #include "appkit.h"
+#include <locale>
+#include <sstream>
 #include "app_icon.h"
 #include <algorithm>
 #include <cmath>
@@ -25,8 +27,6 @@ MM_FW_CLASS(NSColorSpace);
 MM_FW_CLASS(NSCursor);
 MM_FW_CLASS(NSAppearance);
 MM_FW_CLASS(NSTrackingArea);
-MM_FW_CLASS(NSPasteboard);
-MM_FW_CLASS(NSPasteboardItem);
 MM_FW_CLASS(NSImage);
 MM_FW_CLASS(NSTextInputContext);
 MM_FW_CLASS(NSInputManager);
@@ -208,8 +208,19 @@ std::uint64_t responder_interpretKeyEvents(id self, SEL, id events) {
     const auto count = send(events, "count");
     for (std::uint64_t i = 0; i < count; ++i) {
         id event = obj(send(events, "objectAtIndex:", i));
+        if (send(event, "type") != ev_key_down) continue;
         const auto code = send(event, "keyCode"), modifiers = send(event, "modifierFlags");
+        if (code >= 54 && code <= 62) continue;
         const char *command = nullptr;
+        if ((modifiers & (1ull << 20)) && !(modifiers & ((1ull << 18) | (1ull << 19)))) {
+            switch (code) {
+            case 0: command = "selectAll:"; break;
+            case 8: command = "copy:"; break;
+            case 7: command = "cut:"; break;
+            case 9: command = "paste:"; break;
+            }
+            if (command) { send(self, "doCommandBySelector:", ret(mm_objc_sel(command))); continue; }
+        }
         switch (code) {
         case 36: case 76: command = "insertNewline:"; break;
         case 48: command = modifiers & (1ull << 17) ? "insertBacktab:" : "insertTab:"; break;
@@ -379,8 +390,15 @@ std::uint64_t color_list_init_file(id self, SEL, id name, id path) {
         if(!is_kind(key,cls("NSString"))||!is_kind(rgb,cls("NSData"))){release(self);return 0;}
         const auto length=send(rgb,"length");if(length>1024){release(self);return 0;}
         std::string components(reinterpret_cast<const char *>(send(rgb,"bytes")),length);
-        double r=0,g=0,b=0,a=1;const int parsed=gray?std::sscanf(components.c_str(),"%lf %lf",&r,&a):std::sscanf(components.c_str(),"%lf %lf %lf %lf",&r,&g,&b,&a);
-        if(parsed<(gray?1:3)||!std::isfinite(r)||!std::isfinite(g)||!std::isfinite(b)||!std::isfinite(a)){release(self);return 0;}
+        double r=0,g=0,b=0,a=1;
+        std::istringstream input(components);
+        input.imbue(std::locale::classic());
+        bool parsed = bool(input >> r);
+        if (!gray) parsed = parsed && bool(input >> g >> b);
+        input >> std::ws;
+        if (parsed && input.peek() != std::char_traits<char>::eof() && input.peek() != '\0')
+            parsed = bool(input >> a);
+        if(!parsed||!std::isfinite(r)||!std::isfinite(g)||!std::isfinite(b)||!std::isfinite(a)){release(self);return 0;}
         if(gray)g=b=r;
         id value=obj(color_make(nullptr,nullptr,r,g,b,a));
         list->entries.emplace_back(obj(send(key,"copy")),retain(value));
@@ -566,8 +584,6 @@ void register_responder() {
         {"NSColorSpace", MM_FW_CLASS_REF(NSColorSpace), MM_FW_META_REF(NSColorSpace)},
         {"NSAppearance", MM_FW_CLASS_REF(NSAppearance), MM_FW_META_REF(NSAppearance)},
         {"NSTrackingArea", MM_FW_CLASS_REF(NSTrackingArea), MM_FW_META_REF(NSTrackingArea)},
-        {"NSPasteboard", MM_FW_CLASS_REF(NSPasteboard), MM_FW_META_REF(NSPasteboard)},
-        {"NSPasteboardItem", MM_FW_CLASS_REF(NSPasteboardItem), MM_FW_META_REF(NSPasteboardItem)},
         {"NSTextInputContext", MM_FW_CLASS_REF(NSTextInputContext), MM_FW_META_REF(NSTextInputContext)},
         {"NSInputManager", MM_FW_CLASS_REF(NSInputManager), MM_FW_META_REF(NSInputManager)},
         {"NSAccessibilityElement", MM_FW_CLASS_REF(NSAccessibilityElement), MM_FW_META_REF(NSAccessibilityElement)},

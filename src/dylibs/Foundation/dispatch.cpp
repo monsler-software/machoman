@@ -149,6 +149,16 @@ void dispatch_drain_main_queue() {
     }
 }
 
+void dispatch_submit_owned_block(void *queue, id block) {
+    auto *target = queue ? static_cast<dispatch_queue *>(queue) : &global_queue();
+    target->push({block, nullptr, nullptr});
+}
+void *dispatch_main_queue_handle() { return &main_queue(); }
+void dispatch_submit_callback(void *queue, void *function, void *context) {
+    auto *target = queue ? static_cast<dispatch_queue *>(queue) : &global_queue();
+    target->push({nullptr, function, context});
+}
+
 } // namespace fnd
 
 using namespace fnd;

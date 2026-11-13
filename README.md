@@ -80,6 +80,12 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   macOS SDK) and run as guest code. The C++ ABI (this-returning
   constructors, sret, vtables, exception unwinding) therefore never
   crosses into host code; only libSystem's C ABI does.
+- **Swift runtime foundation**: [`src/dylibs/swiftCore`](src/dylibs/swiftCore/README.md)
+  provides native Swift heap allocation, ARC, guest `swiftself` destructors,
+  stack/static object lifetime, once initialization and dynamic exclusivity
+  checks. Mach-O ABI probes run on arm64 and x86_64. Swift standard-library
+  symbols, type metadata, weak references, Objective-C bridging and async
+  tasks remain unimplemented; arbitrary Swift applications are not supported yet.
 - **libSystem.B.dylib** (`src/dylibs/libSystem/`): only what differs from
   glibc — `open`/`fcntl` flags, `stat`/`dirent` layouts, `errno` numbers,
   `sysconf`/`clock_gettime` ids, `ioctl` requests, `mmap`/`madvise`
@@ -89,12 +95,22 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   stack protector, signals, setjmp/longjmp, the printf/scanf family with
   Darwin's stack-passed variadic arguments, xlocale (`newlocale`, `*_l`,
   `nl_langinfo`, `localeconv`) and the `_DefaultRuneLocale` ctype table.
+  Thread-local values and pthread-key destructors run with the original guest
+  thread identity before TLS storage is freed; locale date functions accept
+  Darwin's null/current and global locales.
+  `setjmp` buffers use the SDK layouts for arm64 and x86_64, restoring
+  callee-saved registers and the requested signal mask. Native recovery
+  signals use a separate host stack, including when the guest uses small fibers.
 - **The system calls a Darwin program makes that Linux spells differently**:
   socket options and addresses (`SOL_SOCKET`, every `SO_*`, `sockaddr`'s
   length byte), signal masks (`SIG_BLOCK` is 1 on Darwin, 0 here), malloc
   zones (a real `malloc_zone_t` whose function pointers the guest calls),
   `posix_spawn`/`NSTask` (a Mach-O helper is re-launched through machoman
   itself), and CRC32/CRC32C, which AArch64 has instructions for.
+  `inet_pton`/`inet_ntop` translate IPv6 address families, including DNS-name
+  classification. Mach host page-size, CPU/load and VM-statistics queries use
+  Linux accounting with SDK layouts and revision counts; XNU-specific cache
+  and compressor counters have no host equivalent and remain zero.
 - **CommonCrypto** (`src/dylibs/libSystem/commoncrypto.cpp`): AES (128/192/256,
   ECB and CBC, PKCS#7) and SHA-256, implemented in-tree because machoman
   takes no external dependencies, and checked against the FIPS vectors.
@@ -109,7 +125,8 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   `-retain`, and a guest subclass of `NSString` is a real class. Covers
   NSString/NSMutableString (UTF-16 storage, Apple's constant-string layout
   for `@""` literals, encodings, formatting with `%@`), the collections,
-  NSData, NSNumber/NSValue, NSURL, NSError, NSBundle (real `Info.plist`
+  NSData, NSNumber/NSValue, NSURL (file constructors with base URL resolution
+  and UTF-8 filesystem representations), NSError, NSBundle (real `Info.plist`
   reading), property lists (XML and binary, both directions),
   CFPreferences/NSUserDefaults, NSProcessInfo, NSFileManager, NSLocale,
   NSUUID and a run loop.
@@ -192,6 +209,60 @@ cmake --build build          # also builds build/dylibs/ (libSystem, libobjc, th
 ctest --test-dir build --output-on-failure
 ```
 
+On Linux x86_64, the runtime also has an experimental direct execution path
+for thin macOS x86_64 executables and matching guest dylibs. Build their C++
+runtimes separately, then rebuild machoman:
+
+```sh
+MACHOMAN_GUEST_ARCH=x86_64 scripts/build-guest-runtimes.sh
+cmake --build build
+```
+
+These runtimes are installed under `build/dylibs/x86_64/usr/lib`; C++ code
+stays in the guest ABI. Native imports use the same host frameworks as
+translated arm64 code, with bridges for callbacks, TLS, variadic arguments
+and Objective-C aggregate calls. Synchronous native faults reach guest
+handlers with Darwin signal contexts; handler returns restore edited
+registers, x87/SSE state and the interrupted stack. Intel-only fat binaries,
+asynchronous signal delivery and alternate signal stacks still need support.
+
+The optional DNS library uses portable wire-format routines from
+[machoman-libresolv](https://github.com/monsler-software/machoman-libresolv)
+and the Linux resolver for configuration and queries:
+
+```sh
+git clone https://github.com/monsler-software/machoman-libresolv modules/libresolv
+cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++
+cmake --build build
+```
+
+Set `MM_TEST_MACOS_SDK` to the local SDK path to enable the arm64 and Intel
+guest integration tests when configuring CMake.
+
+Guest `posix_spawn` starts each Mach-O child in a separate Linux process
+through the same launcher and venv. File actions support descriptor duplication,
+closing, opening and changing the working directory. Exec failures return to
+the parent, and ordinary `waitpid` observes the child's exit status.
+`shm_open`/`shm_unlink` use a namespace under `<venv>/.machoman/ipc/shm`;
+`mmap(..., MAP_SHARED, ...)` then shares real backing pages between processes,
+including children of a different guest architecture. Removing a name preserves
+existing mappings.
+
+Mach IPC uses one automatically started broker per venv. Unix sockets authenticate
+Linux processes with `SO_PEERCRED`; port names stay local to each task. The broker
+owns port rights, message queues, port sets, bootstrap services, notifications
+and exception-port tables, and uses pidfds to clean up when a process exits.
+Complex messages transfer receive/send/send-once rights, OOL memory and port
+arrays between arm64 and Intel guests. Named memory entries carry memfd backing
+through `SCM_RIGHTS` and `mach_vm_map` maps shared pages in each process.
+Guarded receive descriptors and `mach_port_construct`/`destruct` preserve guard
+checks; send-once replies can bypass an ordinary full message queue.
+
+The SDK-built Mach tests cover all four parent/child architecture combinations,
+message layouts, trailers, shared entries, notification ownership and task/thread
+exception-port bookkeeping. This subsystem does not implement Mach vouchers,
+scatter receives or delivery of Linux faults through Mach exception RPCs.
+
 Running the sample:
 
 ```sh
@@ -244,8 +315,20 @@ machoman venv-init <venv-dir>                      # create a venv
 machoman install   <venv-dir> <path-to-dmg>         # install .app bundles and register launch names
 machoman translate [--stats] [--cache] <arm64-macho-binary> # translate, optionally populate/read the disk cache
 machoman run       <venv-dir> <binary-in-venv-bin>   # run until the first thing we cannot do, and say what it was
+machoman audit [-e KEY=VALUE]... <venv-dir> <binary-in-venv-bin> # inventory the dependency closure without executing guest code
 machoman disasm    <arm64-macho-binary> <va> [n]     # decode n instructions at a guest VA, with symbols
 ```
+
+`audit` uses the same search paths and symbol lookup as `run`, including
+guest dylibs and reexports. It writes escaped TSV rows with resolution,
+importing image, dependency, symbol, bind kind, weak flag and provider.
+Exit status 2 means required imports or libraries are missing; 1 means the
+audit could not load the input. Resolver results may be generated stubs or
+metadata, and host resolutions still need ABI/behavior validation. Guest
+initializers and main do not run; host dlopen constructors still do.
+Dynamic Objective-C selectors and later dlopen requests need runtime traces.
+`scripts/summarize-import-audit.py report.tsv --output inventory.md` groups
+one or more reports into a readable inventory.
 
 `run` caches each translated Mach-O in `.machoman-cache` beside its source
 file, using a separate `<binary-name>.x86_64.aot` file for every executable
@@ -276,6 +359,16 @@ including modifier-key codes and `flagsChanged` events. This normalization
 is shared code for native shortcut modifiers; the Wayland backend applies
 it to all keyboard and pointer modifier flags. Set
 `MACHOMAN_NATIVE_SHORTCUTS=0` to disable the keyboard swap.
+
+`NSPasteboard.generalPasteboard` shares the host Wayland clipboard in both
+directions. UTF-8 text, HTML, RTF, PNG, TIFF, PDF and file URLs use native
+MIME types; custom types retain their byte payloads. Named pasteboards are
+local to the process. `NSTextView` supports copy, cut, paste and select-all,
+including Ctrl shortcuts through the Command mapping above. When the
+compositor exposes `ext-data-control-v1`, clipboard access also works without
+a focused window. Otherwise Wayland publishes copies using a focused input
+serial, deferring an earlier copy until input arrives. Headless runs keep
+pasteboard contents in memory.
 
 `NSCursor` supports standard system shapes using the host cursor theme,
 current cursor, nested push/pop, hide/unhide and hiding until mouse motion.

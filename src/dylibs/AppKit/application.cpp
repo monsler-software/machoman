@@ -201,7 +201,7 @@ void deliver(const platform_event &pe) {
         else if (pe.kind == event_kind::scroll) type = ev_scroll_wheel;
         const rect frame = window ? as<window_object>(window)->frame : rect{};
         g_mouse = {pe.where.x + frame.x, pe.where.y + frame.y};
-        if (trace() && (pe.kind == event_kind::mouse_down || pe.kind == event_kind::mouse_up))
+        if ((trace() || std::getenv("MACHOMAN_APPKIT_POINTER_TRACE")) && (pe.kind == event_kind::mouse_down || pe.kind == event_kind::mouse_up))
             std::fprintf(stderr, "AppKit: pointer %s window=%p local={%g,%g} screen={%g,%g}\n",
                          pe.kind == event_kind::mouse_down ? "down" : "up", static_cast<void *>(window),
                          pe.where.x, pe.where.y, g_mouse.x, g_mouse.y);
@@ -470,6 +470,7 @@ std::uint64_t app_sendEvent(id self, SEL, id event) {
     if (dragging_session_event(event)) return 0;
     id window = obj(send(event, "window"));
     if (file_panel_blocks_window(window)) return 0;
+    if (dispatch_cocoa_popup_event(event)) return 0;
     if (send(event, "type") == ev_key_down && !text_input_has_priority(window, event) && app(self)->modals.empty() && app(self)->main_menu &&
         send(app(self)->main_menu, "performKeyEquivalent:", ret(event))) return 0;
     if (window) send(window, "sendEvent:", ret(event));
@@ -1081,7 +1082,14 @@ void register_application() {
         id one = obj(send(reinterpret_cast<id>(cls("NSRunningApplication")), "currentApplication"));
         return send(reinterpret_cast<id>(cls("NSArray")), "arrayWithObject:", ret(one));
     };
+    static auto workspace_icon = [](id, SEL, id file) -> std::uint64_t {
+        std::error_code error;
+        const bool directory = std::filesystem::is_directory(to_utf8(file), error);
+        return send(reinterpret_cast<id>(cls("NSImage")), "imageNamed:",
+                    ret(string(directory ? "NSFolder" : "NSMultipleDocuments")));
+    };
     MM_METHODS(workspace,
+        {"iconForFile:", MM_IMP(+workspace_icon), "@24@0:8@16"},
         {"openURL:", MM_IMP(workspace_openURL), "B24@0:8@16"},
         {"setIcon:forFile:options:", MM_IMP(workspace_setIcon), "B40@0:8@16@24Q32"},
         {"runningApplications", MM_IMP(+workspace_running_apps), "@16@0:8"},

@@ -24,6 +24,28 @@ std::uint64_t attributed_attribute(id self,SEL,id name,id value,std::uint64_t lo
     const auto size=send(as<attributed>(self)->text,"length");
     if(name&&value&&loc<=size&&length<=size-loc)as<attributed>(self)->attributes.push_back({retain(name),retain(value),loc,length});return 0;
 }
+std::uint64_t attributed_attributes(id self, SEL, std::uint64_t location, std::uint64_t *effective_range) {
+    const auto *a = as<attributed>(self);
+    const auto length = send(a->text,"length");
+    if (location>=length) return 0;
+    id result = obj(send(reinterpret_cast<id>(cls("NSMutableDictionary")),"dictionary"));
+    std::uint64_t start = 0, end = length;
+    for (const auto &span : a->attributes) {
+        if (!span.length) continue;
+        for (auto boundary : {span.location,span.location+span.length}) {
+            if (boundary<=location) start = std::max(start,boundary);
+            else end = std::min(end,boundary);
+        }
+        if (location>=span.location && location<span.location+span.length)
+            send(result,"setObject:forKey:",ret(span.value),ret(span.name));
+    }
+    if (effective_range) { effective_range[0]=start; effective_range[1]=end-start; }
+    return ret(result);
+}
+std::uint64_t attributed_get_attribute(id self, SEL, id name, std::uint64_t location, std::uint64_t *effective_range) {
+    id attributes = obj(attributed_attributes(self,nullptr,location,effective_range));
+    return send(attributes,"objectForKey:",ret(name));
+}
 struct formatter {
     mm_objc_object base;
     id decimal = nullptr;
@@ -45,6 +67,8 @@ void register_formatting(){
     Class mut=mm_objc_define_class("NSMutableAttributedString",attr,sizeof(attributed),FND_CLASS_REF(NSMutableAttributedString),FND_META_REF(NSMutableAttributedString));
     register_lifecycle<attributed>(attr);register_lifecycle<attributed>(mut);
     FND_METHODS(attr,{"initWithString:",IMP(attributed_init),"@24@0:8@16"},{"string",IMP(attributed_text),"@16@0:8"},{"length",IMP(attributed_length),"Q16@0:8"});
+    FND_METHODS(attr,{"attributesAtIndex:effectiveRange:",IMP(attributed_attributes),"@32@0:8Q16^{_NSRange=QQ}24"},
+        {"attribute:atIndex:effectiveRange:",IMP(attributed_get_attribute),"@40@0:8@16Q24^{_NSRange=QQ}32"});
     FND_METHODS(mut,{"addAttribute:value:range:",IMP(attributed_attribute),"v48@0:8@16@24{_NSRange=QQ}32"});
     Class base=mm_objc_define_class("NSFormatter",cls("NSObject"),sizeof(formatter),FND_CLASS_REF(NSFormatter),FND_META_REF(NSFormatter));
     Class number=mm_objc_define_class("NSNumberFormatter",base,sizeof(formatter),FND_CLASS_REF(NSNumberFormatter),FND_META_REF(NSNumberFormatter));

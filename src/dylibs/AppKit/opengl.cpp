@@ -53,6 +53,7 @@ platform_window *window_of_view(id view) {
 
 std::uint64_t ctx_initWithFormatShareContext(id self, SEL, id, id share) {
     gc(self)->egl = platform::create_gl_context(nullptr, share ? gc(share)->egl : nullptr);
+    if (trace()) std::fprintf(stderr, "AppKit: initWithFormat:shareContext: self=%p share=%p egl=%p\n", static_cast<void *>(self), static_cast<void *>(share), gc(self)->egl);
     if (gc(self)->egl) {
         std::lock_guard lock(context_mutex);
         contexts()[gc(self)->egl] = gc(self);
@@ -71,6 +72,7 @@ std::uint64_t ctx_makeCurrentContext(id self, SEL) {
     g_current_gl_context = self;
     if (!o->window) o->window = window_of_view(o->view);
     if (trace()) std::fprintf(stderr, "AppKit: ctx_makeCurrentContext: egl=%p window=%p\n", o->egl, o->window);
+    if (trace() && !o->egl && api() && api()->print_guest_backtrace) api()->print_guest_backtrace();
     platform::make_current(o->egl, o->window);
     return 0;
 }

@@ -54,6 +54,9 @@ void platform::set_size_limits(platform_window *, size, size) {}
 rect platform::window_frame(platform_window *w) { return w ? w->frame : rect{}; }
 void platform::set_menu(platform_window *, const std::vector<native_menu_item> &) {}
 void platform::set_cursor(const cursor_spec &) {}
+clipboard_snapshot platform::clipboard_types() { return {}; }
+bool platform::clipboard_read(const std::string &, std::string &) { return false; }
+void platform::clipboard_write(const clipboard_data &) {}
 bool platform::present_metal(platform_window *, const void *, rect, const void *, std::uint32_t, std::uint32_t, std::uint64_t,
                             double, unsigned) { return true; }
 void platform::release_metal(const void *) {}

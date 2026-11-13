@@ -159,9 +159,38 @@ static void check_blits(id<MTLDevice> device) {
     puts("Metal blit ordering, lifetime and GPU readback passed");
 }
 
+static void check_private_buffers(id<MTLDevice> device) {
+    unsigned char pattern[256];
+    for (size_t i = 0; i < sizeof pattern; ++i) pattern[i] = (unsigned char)(i * 23 + 7);
+    MTLResourceOptions options = MTLResourceStorageModePrivate |
+        MTLResourceCPUCacheModeWriteCombined | MTLResourceHazardTrackingModeUntracked;
+    id<MTLBuffer> initialized = [device newBufferWithBytes:pattern length:sizeof pattern options:options];
+    id<MTLBuffer> private = [device newBufferWithLength:sizeof pattern options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> output = [device newBufferWithLength:sizeof pattern options:0];
+    check(initialized && private && output, "private buffer allocation");
+    check(initialized.contents == NULL && private.contents == NULL &&
+          private.storageMode == MTLStorageModePrivate, "private contents are not CPU accessible");
+    check(initialized.cpuCacheMode == MTLCPUCacheModeWriteCombined &&
+          initialized.hazardTrackingMode == MTLHazardTrackingModeUntracked &&
+          initialized.resourceOptions == options, "resource option fields preserved");
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+    [encoder copyFromBuffer:initialized sourceOffset:0 toBuffer:private destinationOffset:0 size:sizeof pattern];
+    [encoder fillBuffer:private range:NSMakeRange(64, 64) value:0x5a];
+    [encoder copyFromBuffer:private sourceOffset:0 toBuffer:output destinationOffset:0 size:sizeof pattern];
+    [encoder endEncoding];
+    finish(command);
+    memset(pattern + 64, 0x5a, 64);
+    check(memcmp(output.contents, pattern, sizeof pattern) == 0, "private initialization, GPU fill and shared readback");
+    [queue release]; [initialized release]; [private release]; [output release];
+    puts("Metal private buffers and GPU readback passed");
+}
+
 static void check_errors(id<MTLDevice> device) {
     check([device newBufferWithLength:0 options:0] == nil, "zero allocation rejected");
-    check([device newBufferWithLength:64 options:MTLResourceStorageModePrivate] == nil, "private storage rejected");
+    check([device newBufferWithLength:64 options:MTLResourceStorageModeMemoryless] == nil, "memoryless buffer rejected");
+    check([device newBufferWithLength:64 options:0x1000] == nil, "unknown resource options rejected");
     const void* missing_bytes = NULL;
     check([device newBufferWithBytes:missing_bytes length:64 options:0] == nil, "null source bytes rejected");
     id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -225,6 +254,7 @@ int main(void) {
         check(device != nil, "MTLCreateSystemDefaultDevice");
         check_identity(device);
         check_blits(device);
+        check_private_buffers(device);
         check_errors(device);
         [device release];
     }

@@ -14,9 +14,12 @@
 
 #include "machoman/objc_framework.h"
 #include "machoman/runtime.h"
+#include "clipboard.h"
 
 #include <cstdint>
 #include <cstring>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 #ifdef MM_APPKIT_EVILCOCOA
@@ -81,6 +84,9 @@ struct platform {
     static rect window_frame(platform_window *w);
     static void set_menu(platform_window *w, const std::vector<native_menu_item> &items);
     static void set_cursor(const cursor_spec &cursor);
+    static clipboard_snapshot clipboard_types();
+    static bool clipboard_read(const std::string &type, std::string &bytes);
+    static void clipboard_write(const clipboard_data &data);
     static bool present_metal(platform_window *w, const void *layer, rect frame,
                               const void *bgra, std::uint32_t width, std::uint32_t height, std::uint64_t stride,
                               double contents_scale, unsigned placement);
@@ -164,6 +170,7 @@ struct view_object {
 struct control_object {
     view_object view;
     id title = nullptr, key_equivalent = nullptr, target = nullptr, image = nullptr, font = nullptr;
+    id attributed_title = nullptr;
     id placeholder = nullptr, identifier = nullptr, text_field = nullptr, image_view = nullptr;
     SEL action = nullptr, double_action = nullptr;
     std::int64_t state = 0, button_type = 0, bezel_style = 1, alignment = 0, image_scaling = 0;
@@ -173,6 +180,9 @@ struct control_object {
     bool editable = false, selectable = false, draws_background = false, bold = false, wraps = false;
     bool indeterminate = false, animating = false, vertical = false;
     bool menu_row = false;
+    id box_content = nullptr; /* weak; retained by view.subviews */
+    std::int64_t box_type = 0, title_position = 2;
+    double box_title_height = 12;
     std::vector<id> choices;
     id choice_menu = nullptr, choice_selection = nullptr;
     std::int64_t selected = -1;
@@ -181,21 +191,32 @@ struct control_object {
 
 struct table_column_object {
     mm_objc_object base;
-    id identifier = nullptr, title = nullptr;
+    id identifier = nullptr, title = nullptr, data_cell = nullptr;
     double width = 120;
-    ~table_column_object() { if (identifier) release(identifier); if (title) release(title); }
+    double minimum_width = 10, maximum_width = 1000;
+    std::uint64_t resizing_mask = 1;
+    ~table_column_object() { release(identifier); release(title); release(data_cell); }
 };
 struct table_object {
     control_object control;
     id delegate = nullptr, data_source = nullptr;
-    std::vector<id> columns, reusable_views;
+    std::vector<id> columns;
+    std::map<std::string, std::string> reusable_nibs;
+    std::map<std::pair<std::int64_t, id>, id> cell_views; /* retained until reloadData */
     double row_height = 20;
     std::int64_t rows = 0, selected_row = -1;
+    std::set<std::int64_t> selected_rows;
     bool alternating = false;
+    bool allows_multiple_selection = false, allows_empty_selection = true;
+    std::uint64_t column_autoresizing_style = 4;
     ~table_object();
 };
 
 void layout_cocoa_view(id view);
+id table_cell_view(id table, id column, std::int64_t row);
+id table_data_cell(id column);
+id prepare_table_data_cell(id table, id column, std::int64_t row);
+bool dispatch_cocoa_popup_event(id event);
 void register_cocoa_controls(Class view, Class control);
 
 struct window_object {
@@ -206,6 +227,7 @@ struct window_object {
     std::uint64_t style = 0;
     std::string title;
     id content_view = nullptr, delegate = nullptr, first_responder = nullptr;
+    std::vector<id> first_responder_requests; /* active focus transactions */
     id parent_window = nullptr; /* weak; a parent retains its child windows */
     std::vector<id> child_windows;
     double alpha = 1;
@@ -330,6 +352,8 @@ id make_window(const rect &frame, std::uint64_t style);
 
 /* Loads a nib from the main bundle (see nib.cpp). */
 bool load_nib(const std::string &name, id owner, std::vector<id> *top_level);
+bool load_nib_data(std::string_view bytes, id owner, std::vector<id> *top_level,
+                   const std::string &localization_table = {});
 
 void ensure_platform_window(id window);
 id make_backing_layer(id view);
@@ -349,6 +373,10 @@ std::uint64_t begin_dragging_session(id view, SEL, id items, id event, id source
 bool dragging_session_event(id event);
 void cancel_dragging_session(id window);
 void register_views();       /* NSView, NSWindow, NSViewController, NSGraphicsContext */
+void register_text_view();   /* NSTextView and field-editor text input */
+void register_stack_view();  /* NSStackView container hierarchy */
+void register_webview();     /* WKWebView shares the NSView object model */
+void register_pasteboard();
 void register_application(); /* NSApplication, NSScreen, NSMenu, NSWorkspace, ... */
 void register_opengl();      /* NSOpenGLContext, NSOpenGLPixelFormat */
 void register_layers();      /* CALayer, NSOpenGLLayer, CATransaction */

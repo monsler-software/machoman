@@ -14,6 +14,7 @@
 
 #include "machoman/objc_host.h"
 #include "machoman/runtime.h"
+#include "machoman/host_environment.h"
 
 #include <cstdint>
 #include <cstring>
@@ -30,6 +31,7 @@ namespace fnd {
 
 using id = mm_id;
 id date_from_epoch(double seconds);
+double date_to_epoch(id date);
 using Class = mm_objc_class *;
 using SEL = mm_SEL;
 using CFIndex = std::int64_t;
@@ -205,10 +207,18 @@ bool is_url(id o);
 /* Runs whatever is waiting on the main dispatch queue (dispatch.cpp).
  * The run loop calls this once per turn: the main queue is the run loop. */
 void dispatch_drain_main_queue();
+void dispatch_submit_owned_block(void *queue, id block);
+void *dispatch_main_queue_handle();
+void dispatch_submit_callback(void *queue, void *function, void *context);
+void register_dispatch_data();
+void register_cookies();
+void register_url_requests();
 
 /* Registration entry points (one per translation unit). */
 void register_strings();
 void register_formatting();
+std::string format_call_arguments(id fmt, unsigned named_integer_args);
+std::string format_va_arguments(id fmt, std::uint64_t va);
 void register_collections();
 void register_plists();
 void register_bundle();

@@ -7,3 +7,4 @@ work/
 .aws/
 .agents/
 third_party/sdk/MacOSX26.1.sdk/
+third_party/guest-runtimes/x86_64/

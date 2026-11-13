@@ -30,7 +30,14 @@ void decode_cocoa_image(id image) {
         namespace fs = std::filesystem;
         std::vector<fs::path> paths;
         const fs::path name(o->name);
-        if (name.is_absolute())
+        if (o->name == "NSFolder" || o->name == "NSMultipleDocuments") {
+            const bool folder = o->name == "NSFolder";
+            const std::string icon = folder ? "folder" : "text-x-generic";
+            const std::string category = folder ? "places" : "mimetypes";
+            paths.push_back(fs::path("/usr/share/icons/breeze") / category / "64" / (icon + ".svg"));
+            paths.push_back(fs::path("/usr/share/icons/Adwaita/scalable") / category / (icon + ".svg"));
+            paths.push_back(fs::path("/usr/share/icons/AdwaitaLegacy/48x48") / category / (icon + ".png"));
+        } else if (name.is_absolute())
             paths.push_back(name);
         else {
             id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")), "mainBundle"));
@@ -101,6 +108,18 @@ void decode_cocoa_image(id image) {
     }
 }
 namespace {
+void text_style(const control_object &control, evilcocoa::item &label, double scale) {
+    label.font_size = control.font_size*std::abs(scale);
+    label.font_family = control.font_family;
+    label.bold = control.bold;
+    if (!control.attributed_title || !send(control.attributed_title,"length")) return;
+    id color = obj(send(control.attributed_title,"attribute:atIndex:effectiveRange:",ret(string("NSForegroundColorAttributeName")),0,0));
+    if (!color) color = obj(send(control.attributed_title,"attribute:atIndex:effectiveRange:",ret(string("NSColor")),0,0));
+    if (color && is_kind(color,cls("NSColor"))) {
+        const auto *rgba = as<color_object>(color);
+        label.text_color = {float(rgba->r),float(rgba->g),float(rgba->b),float(rgba->a)};
+    }
+}
 evilcocoa::rect intersect(evilcocoa::rect a, evilcocoa::rect b) {
     const auto x = std::max(a.x, b.x), y = std::max(a.y, b.y);
     return {x, y, std::max(0., std::min(a.x + a.w, b.x + b.w) - x), std::max(0., std::min(a.y + a.h, b.y + b.h) - y)};
@@ -114,6 +133,7 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
     const auto method = cocoa_method(mm_objc_object_class(view), mm_objc_sel("drawRect:"));
     if (v->layer)
         return false;
+    const auto containing_clip = clip;
     clip = intersect(clip, frame);
     if (clip.w <= 0 || clip.h <= 0)
         return true;
@@ -131,15 +151,14 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
     if (is_kind(view, cls("NSControl"))) {
         auto *c = as<control_object>(view);
         supported = true;
+        i.clip = containing_clip;
         i.text = c->title ? to_utf8(c->title) : "";
         i.placeholder = c->placeholder ? to_utf8(c->placeholder) : "";
         i.enabled = c->enabled;
         i.pressed = c->highlighted;
         i.checked = c->state != 0;
         i.selected = c->state == -1 ? 0 : -1;
-        i.font_size = c->font_size * std::abs(sy);
-        i.font_family=c->font_family;
-        i.bold = c->bold;
+        text_style(*c,i,sy);
         i.wrap = c->wraps;
         i.bordered = c->bordered;
         i.background = c->draws_background;
@@ -180,8 +199,10 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
             if(c->indeterminate&&c->animating)i.value=std::fmod(std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count()/1.5,1.);
         } else if (is_kind(view, cls("NSScroller")))
             i.type = evilcocoa::kind::scroller;
-        else if (is_kind(view, cls("NSBox")))
-            i.type = c->bezel_style == 2 ? evilcocoa::kind::separator : evilcocoa::kind::box;
+        else if (is_kind(view, cls("NSBox"))) {
+            i.type = c->box_type == 2 ? evilcocoa::kind::separator : evilcocoa::kind::box;
+            if (c->title_position == 0) i.text.clear();
+        }
         else if (is_kind(view, cls("NSTableView"))) {
             i.type = evilcocoa::kind::table;
             i.bordered = false;
@@ -227,27 +248,28 @@ bool collect(id view, evilcocoa::rect frame, evilcocoa::rect clip, std::vector<e
             background.type = evilcocoa::kind::table_row;
             background.frame = child_frame({0, double(row) * h, v->bounds.w, h});
             background.clip = clip;
-            background.checked = table->selected_row == row;
+            background.checked = table->selected_rows.contains(row);
             background.background = table->alternating && (row % 2);
             out.push_back(background);
             double x = 0;
             for (id column : table->columns) {
                 auto *c = as<table_column_object>(column);
-                id cell = nullptr;
-                if (table->delegate && responds(table->delegate, "tableView:viewForTableColumn:row:"))
-                    cell = obj(send(table->delegate, "tableView:viewForTableColumn:row:", ret(view), ret(column), row));
+                id cell = table_cell_view(view, column, row);
                 if (cell && is_kind(cell, cls("NSView"))) {
+                    layout_cocoa_view(cell);
                     auto f = child_frame({x, double(row) * h, c->width, h});
                     if (!collect(cell, f, clip, out, depth + 1))
                         return false;
-                } else if (table->data_source &&
-                           responds(table->data_source, "tableView:objectValueForTableColumn:row:")) {
-                    id value = obj(send(table->data_source, "tableView:objectValueForTableColumn:row:", ret(view),
-                                        ret(column), row));
+                } else {
+                    id data_cell = prepare_table_data_cell(view,column,row);
                     auto label = background;
                     label.type = evilcocoa::kind::label;
                     label.frame = child_frame({x + 6, double(row) * h + 2, c->width - 12, h - 4});
-                    label.text = value ? to_utf8(obj(send(value, "description"))) : "";
+                    label.text = to_utf8(obj(send(data_cell,"stringValue")));
+                    if (is_kind(data_cell,cls("NSControl"))) {
+                        auto *control = as<control_object>(data_cell);
+                        text_style(*control,label,sy);
+                    }
                     out.push_back(std::move(label));
                 }
                 x += c->width;

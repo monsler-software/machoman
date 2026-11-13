@@ -16,11 +16,15 @@
 #include "machoman/runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +63,8 @@ void init_stdio() { darwin_stdinp = stdin; darwin_stdoutp = stdout; darwin_stder
 namespace {
 
 const mm_host_api *g_api = nullptr;
+thread_local int guest_errno = 0;
+thread_local int synchronized_guest_errno = 0;
 
 /* ---- errno ------------------------------------------------------------ */
 
@@ -74,9 +80,11 @@ int to_darwin_errno(int e) {
     case EOVERFLOW:    return 84;
     case ENOTSUP:      return 45;
     case ETIMEDOUT:    return 60;
+    case ENODATA:      return 93; /* ENOATTR */
     case EINPROGRESS:  return 36;
     case EALREADY:     return 37;
     case ENOTSOCK:     return 38;
+    case EAFNOSUPPORT: return 47;
     case EADDRINUSE:   return 48;
     case ECONNRESET:   return 54;
     case ECONNREFUSED: return 61;
@@ -88,6 +96,7 @@ int to_darwin_errno(int e) {
 
 int from_darwin_errno(int e) {
     switch (e) {
+    case 93: return ENODATA;
     case 35: return EAGAIN;
     case 11: return EDEADLK;
     case 63: return ENAMETOOLONG;
@@ -101,6 +110,7 @@ int from_darwin_errno(int e) {
     case 36: return EINPROGRESS;
     case 37: return EALREADY;
     case 38: return ENOTSOCK;
+    case 47: return EAFNOSUPPORT;
     case 48: return EADDRINUSE;
     case 54: return ECONNRESET;
     case 61: return ECONNREFUSED;
@@ -187,12 +197,12 @@ struct tlv_descriptor { void *thunk; std::uint64_t key; std::uint64_t offset; };
  * __thread_bss, as laid out in memory. One copy per host thread. */
 struct tlv_image { const std::uint8_t *data = nullptr; std::size_t data_size = 0, total_size = 0; };
 
-tlv_image find_tlv_image() {
+tlv_image find_tlv_image(const void *header, std::uint64_t slide) {
     tlv_image t;
-    if (!g_api || !g_api->main_image)
+    if (!header)
         return t;
-    const auto *hdr = static_cast<const mm_mach_header_64 *>(g_api->main_image);
-    std::span<const std::uint8_t> bytes(static_cast<const std::uint8_t *>(g_api->main_image),
+    const auto *hdr = static_cast<const mm_mach_header_64 *>(header);
+    std::span<const std::uint8_t> bytes(static_cast<const std::uint8_t *>(header),
                                         sizeof(mm_mach_header_64) + hdr->sizeofcmds);
     mm_macho_image img;
     if (mm_macho_parse(bytes, img) != mm_macho_status::ok)
@@ -203,10 +213,10 @@ tlv_image find_tlv_image() {
             const auto name = mm_macho_name(sect.sectname);
             if (name != "__thread_data" && name != "__thread_bss")
                 continue;
-            lo = std::min(lo, sect.addr);
-            hi = std::max(hi, sect.addr + sect.size);
+            lo = std::min(lo, sect.addr + slide);
+            hi = std::max(hi, sect.addr + slide + sect.size);
             if (name == "__thread_data")
-                data_end = std::max(data_end, sect.addr + sect.size);
+                data_end = std::max(data_end, sect.addr + slide + sect.size);
         }
     if (hi <= lo)
         return t;
@@ -216,20 +226,117 @@ tlv_image find_tlv_image() {
     return t;
 }
 
-thread_local std::uint8_t *t_tlv_block = nullptr;
+/* Darwin pthread_key_t is unsigned long, and its values belong to the
+ * guest, not glibc's key namespace. In particular, glibc must never call a
+ * Mach-O destructor directly after the runtime has restored the host GS. */
+constexpr std::size_t guest_key_limit = 512;
+struct guest_key { bool used = false; std::uint64_t generation = 0; const void *destructor = nullptr; };
+std::array<guest_key, guest_key_limit> g_keys;
+std::mutex g_keys_mu;
+struct guest_key_value { std::uint64_t generation = 0; const void *value = nullptr; };
+struct thread_local_state {
+    std::unordered_map<const void *, std::unique_ptr<std::uint8_t[]>> blocks;
+    std::array<guest_key_value, guest_key_limit> values{};
+    std::vector<std::pair<const void *, void *>> destructors;
+    bool destroying = false;
+};
+/* Ownership is a private host pthread key, rather than a C++ TLS destructor:
+ * guest destructors must run before the TLV backing storage is released.
+ * Runtime-owned threads explicitly drain it while their identity is active;
+ * native framework workers use the host-key destructor as a fallback. */
+thread_local thread_local_state *t_local_state = nullptr;
+void destroy_thread_local_state(void *value);
+pthread_key_t local_state_key() {
+    static const pthread_key_t key = [] {
+        pthread_key_t created;
+        if (pthread_key_create(&created, destroy_thread_local_state) != 0) std::abort();
+        return created;
+    }();
+    return key;
+}
+thread_local_state &local_state() {
+    if (!t_local_state) {
+        auto state = std::make_unique<thread_local_state>();
+        if (pthread_setspecific(local_state_key(), state.get()) != 0) std::abort();
+        t_local_state = state.release();
+    }
+    return *t_local_state;
+}
+void destroy_thread_local_state(void *value) {
+    auto *state = static_cast<thread_local_state *>(value);
+    if (!state || state->destroying) return;
+    state->destroying = true;
+    auto drain_tlv = [&] {
+        while (!state->destructors.empty()) {
+            const auto [function, argument] = state->destructors.back();
+            state->destructors.pop_back();
+            const auto arg = reinterpret_cast<std::uintptr_t>(argument);
+            mm_call_callback(function, &arg, 1);
+        }
+    };
+    drain_tlv();
+    /* POSIX clears a value before calling its destructor and permits a
+     * destructor to re-arm the key, for PTHREAD_DESTRUCTOR_ITERATIONS passes. */
+    for (int pass = 0; pass < 4; ++pass) {
+        bool invoked = false;
+        for (std::size_t i = 0; i < guest_key_limit; ++i) {
+            const void *function = nullptr, *argument = nullptr;
+            {
+                std::lock_guard lock(g_keys_mu);
+                auto &slot = state->values[i];
+                const auto &key = g_keys[i];
+                if (key.used && key.generation == slot.generation && slot.value && key.destructor) {
+                    function = key.destructor;
+                    argument = slot.value;
+                    slot.value = nullptr;
+                }
+            }
+            if (function) {
+                invoked = true;
+                const auto arg = reinterpret_cast<std::uintptr_t>(argument);
+                mm_call_callback(function, &arg, 1);
+            }
+        }
+        drain_tlv();
+        if (!invoked) break;
+    }
+    pthread_setspecific(local_state_key(), nullptr);
+    t_local_state = nullptr;
+    delete state;
+}
 
 } // namespace
 
 extern "C" {
 
+__attribute__((visibility("default"))) void machoman_dylib_guest_enter() {
+    errno = from_darwin_errno(guest_errno);
+    synchronized_guest_errno = guest_errno;
+}
+__attribute__((visibility("default"))) void machoman_dylib_guest_leave() {
+    /* Guest code may have written through the pointer returned by __error.
+     * At an import trap those writes precede the upcoming host API call. */
+    if (guest_errno != synchronized_guest_errno) errno = from_darwin_errno(guest_errno);
+    else guest_errno = to_darwin_errno(errno);
+    synchronized_guest_errno = guest_errno;
+}
+
 /* ---- runtime hookup ---------------------------------------------------- */
 
-__attribute__((visibility("default"))) void machoman_dylib_init(const mm_host_api *api) { g_api = api; }
+__attribute__((visibility("default"))) void machoman_dylib_init(const mm_host_api *api) {
+    g_api = api;
+    mm_libsystem_environment_init(api);
+}
+
+__attribute__((visibility("default"))) void machoman_dylib_thread_exit() {
+    destroy_thread_local_state(t_local_state);
+}
 
 } /* extern "C" */
 
 const mm_host_api *mm_libsystem_api() { return g_api; }
 int mm_darwin_errno(int error) { return to_darwin_errno(error); }
+int mm_darwin_open_flags(int flags) { return open_flags_from_darwin(flags); }
 
 std::uint64_t mm_call_callback(const void *fn, const std::uint64_t *args, int n) {
     if (g_api && g_api->is_guest_code(reinterpret_cast<std::uintptr_t>(fn)))
@@ -241,20 +348,14 @@ std::uint64_t mm_call_callback(const void *fn, const std::uint64_t *args, int n)
     return reinterpret_cast<fn8>(const_cast<void *>(fn))(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
 }
 
-mm_guest_va_list mm_guest_va_list::at_call_site() {
-    const mm_cpu_context *ctx = g_api && g_api->current_context ? g_api->current_context() : nullptr;
-    return mm_guest_va_list(ctx ? ctx->x[31] : 0);
-}
-
 extern "C" {
 
 /* ---- errno ------------------------------------------------------------ */
 
 int *darwin_error() DARWIN(_error);
 int *darwin_error() {
-    static thread_local int e;
-    e = to_darwin_errno(errno);
-    return &e;
+    if (!g_api) guest_errno = to_darwin_errno(errno);
+    return &guest_errno;
 }
 
 int darwin_strerror_r(int errnum, char *buf, std::size_t len) DARWIN(strerror_r);
@@ -265,16 +366,34 @@ int darwin_strerror_r(int errnum, char *buf, std::size_t len) {
 
 /* ---- files ------------------------------------------------------------- */
 
+/* Apple Libc string/NetBSD/memset_s.c: bounds errors still overwrite smax
+ * bytes when the destination size itself is valid. Return Darwin errors
+ * without changing errno. Volatile stores keep secret erasure observable. */
+int darwin_memset_s(void *destination, std::size_t capacity, int byte, std::size_t count) DARWIN(memset_s);
+int darwin_memset_s(void *destination, std::size_t capacity, int byte, std::size_t count) {
+    constexpr auto rsize_max = std::numeric_limits<std::size_t>::max() >> 1;
+    if (!destination) return 22; /* EINVAL */
+    if (capacity > rsize_max) return 7; /* E2BIG */
+    int error = 0;
+    if (count > rsize_max) { error = 7; count = capacity; }
+    if (count > capacity) { error = 84; count = capacity; } /* Darwin EOVERFLOW */
+    auto *out = static_cast<volatile unsigned char *>(destination);
+    for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<unsigned char>(byte);
+    return error;
+}
+
 /* open(path, flags, ...): the mode is a variadic argument, i.e. on the guest stack. */
 int darwin_open(const char *path, int flags, ...) DARWIN(open);
 int darwin_open(const char *path, int flags, ...) {
-    const int mode = (flags & 0x200) ? mm_guest_va_list::at_call_site().next_i32() : 0; /* O_CREAT */
+    const int mode = (flags & 0x200) ? mm_guest_va_list::at_call_site(2).next_i32() : 0; /* O_CREAT */
     return open(path, open_flags_from_darwin(flags), mode);
 }
 
 int darwin_fcntl(int fd, int cmd, ...) DARWIN(fcntl);
 int darwin_fcntl(int fd, int cmd, ...) {
-    const long arg = static_cast<long>(mm_guest_va_list::at_call_site().next_i64());
+    /* GETFD/GETFL have no anonymous argument; do not read a guest stack
+     * slot for a parameter the caller did not supply. */
+    const long arg = cmd == 1 || cmd == 3 ? 0 : static_cast<long>(mm_guest_va_list::at_call_site(2).next_i64());
     switch (cmd) {
     case 0:  return fcntl(fd, F_DUPFD, arg);
     case 1:  return fcntl(fd, F_GETFD);
@@ -284,6 +403,48 @@ int darwin_fcntl(int fd, int cmd, ...) {
         return r < 0 ? r : open_flags_to_darwin(r);
     }
     case 4:  return fcntl(fd, F_SETFL, open_flags_from_darwin(static_cast<int>(arg)));
+    case 7: case 8: case 9: /* F_GETLK, F_SETLK, F_SETLKW */
+    case 90: case 91: case 92: { /* open-file-description variants */
+        /* SDK sys/fcntl.h: the offsets precede pid/type/whence on both
+         * Darwin architectures. Linux puts type and whence first. */
+        struct darwin_flock {
+            std::int64_t start, length;
+            std::int32_t pid;
+            std::int16_t type, whence;
+        };
+        static_assert(sizeof(darwin_flock) == 24);
+        auto *guest = reinterpret_cast<darwin_flock *>(arg);
+        if (!guest) { errno = EFAULT; return -1; }
+        struct flock host{};
+        switch (guest->type) {
+        case 1: host.l_type = F_RDLCK; break;
+        case 2: host.l_type = F_UNLCK; break;
+        case 3: host.l_type = F_WRLCK; break;
+        default: errno = EINVAL; return -1;
+        }
+        host.l_whence = guest->whence;
+        host.l_start = guest->start;
+        host.l_len = guest->length;
+        host.l_pid = guest->pid;
+        int operation;
+        switch (cmd) {
+        case 7: operation = F_GETLK; break;
+        case 8: operation = F_SETLK; break;
+        case 9: operation = F_SETLKW; break;
+        case 90: operation = F_OFD_SETLK; break;
+        case 91: operation = F_OFD_SETLKW; break;
+        default: operation = F_OFD_GETLK; break;
+        }
+        const int result = fcntl(fd, operation, &host);
+        if (result == 0 && (cmd == 7 || cmd == 92)) {
+            guest->type = host.l_type == F_RDLCK ? 1 : host.l_type == F_WRLCK ? 3 : 2;
+            guest->whence = host.l_whence;
+            guest->start = host.l_start;
+            guest->length = host.l_len;
+            guest->pid = host.l_pid;
+        }
+        return result;
+    }
     case 67: return fcntl(fd, F_DUPFD_CLOEXEC, arg);
     default:
         errno = EINVAL;
@@ -344,7 +505,7 @@ darwin_dirent *darwin_readdir(DIR *dir) {
 
 int darwin_ioctl(int fd, unsigned long req, ...) DARWIN(ioctl);
 int darwin_ioctl(int fd, unsigned long req, ...) {
-    void *arg = mm_guest_va_list::at_call_site().next_ptr<void>();
+    void *arg = mm_guest_va_list::at_call_site(2).next_ptr<void>();
     switch (req) {
     case 0x40087468: return ioctl(fd, TIOCGWINSZ, arg);
     case 0x4004667F: return ioctl(fd, FIONREAD, arg);
@@ -424,7 +585,7 @@ std::size_t darwin_confstr(int name, char *buf, std::size_t len) {
         /* A display's runtime directory can be read-only to this process.
          * Respect an explicit TMPDIR and only report a directory that we
          * could create and can write to. */
-        const char *bases[] = {std::getenv("TMPDIR"), std::getenv("XDG_RUNTIME_DIR"), "/tmp"};
+        const char *bases[] = {mm_host_getenv(g_api, "TMPDIR"), std::getenv("XDG_RUNTIME_DIR"), "/tmp"};
         for (const char *base : bases) {
             if (!base || !*base) continue;
             std::string dir = std::string(base) + "/machoman-" + std::to_string(getuid());
@@ -481,7 +642,11 @@ int darwin_sysctlbyname(const char *name, void *out, std::size_t *outlen, const 
     if (n == "hw.cachelinesize") return give_u64(64);
     if (n == "hw.cpufrequency") return give_u64(2400000000ull);
     if (n == "hw.model") return give_str("MacBookPro18,1");
-    if (n == "hw.machine" || n == "hw.targettype") return give_str("arm64");
+    if (n == "hw.machine" || n == "hw.targettype") {
+        const auto *api = mm_libsystem_api();
+        const auto *ctx = api && api->current_context ? api->current_context() : nullptr;
+        return give_str(ctx && ctx->native_mode ? "x86_64" : "arm64");
+    }
     if (n == "kern.ostype") return give_str("Darwin");
     if (n == "kern.osrelease") return give_str("22.0.0");
     if (n == "kern.osversion") return give_str("22A380");
@@ -575,12 +740,6 @@ int darwin_clock_gettime(int id, struct timespec *ts) {
     }
 }
 
-int darwin_getpwuid_r(unsigned uid, void *pwd, char *buf, std::size_t len, void **result) DARWIN(getpwuid_r);
-int darwin_getpwuid_r(unsigned, void *, char *, std::size_t, void **result) {
-    *result = nullptr; /* no such user: the guest falls back to $HOME etc. */
-    return 0;
-}
-
 int darwin_CCRandomGenerateBytes(void *buf, std::size_t n) DARWIN(CCRandomGenerateBytes);
 int darwin_CCRandomGenerateBytes(void *buf, std::size_t n) {
     auto *p = static_cast<std::uint8_t *>(buf);
@@ -593,7 +752,7 @@ int darwin_CCRandomGenerateBytes(void *buf, std::size_t n) {
     return 0;
 }
 
-/* ---- signals: recorded but never delivered to guest code yet ----------- */
+/* ---- signals: guest dispositions and masks ---------------------------- */
 
 /* Darwin struct sigaction: { handler; uint32 sa_mask; int sa_flags } = 16 bytes.
  * Handlers are guest functions; the runtime keeps and delivers them. */
@@ -642,7 +801,11 @@ int darwin_sigismember(const std::uint32_t *set, int sig) { return set && (*set 
  * Darwin's `how` values are not Linux's, either: SIG_BLOCK is 1 there and
  * 0 here, and passing Darwin's SIG_SETMASK (3) to the host libc fails with
  * EINVAL — which is exactly the error that stopped Live's helper. */
-thread_local std::uint32_t t_signal_mask = 0;
+std::uint32_t initial_signal_mask() {
+    const char *mask = std::getenv("MACHOMAN_INITIAL_SIGNAL_MASK");
+    return mask ? static_cast<std::uint32_t>(std::strtoul(mask, nullptr, 10)) : 0;
+}
+thread_local std::uint32_t t_signal_mask = initial_signal_mask();
 
 int darwin_set_signal_mask(int how, const std::uint32_t *set, std::uint32_t *old) {
     const std::uint32_t previous = t_signal_mask;
@@ -671,86 +834,8 @@ int darwin_pthread_sigmask(int how, const std::uint32_t *set, std::uint32_t *old
 
 /* ---- process ----------------------------------------------------------- */
 
-/* posix_spawn: a real fork/exec. A Mach-O program is run through machoman
- * with this process's venv, the way NSTask does it — the runtime publishes
- * both in the environment. The file actions and attributes Darwin passes
- * are opaque structures this build does not model, so a caller that set
- * them up gets a plain spawn; the ones a program usually asks for (dup2 of
- * a pipe) are what NSTask covers. */
-bool file_is_macho(const char *path) {
-    std::FILE *f = path ? std::fopen(path, "rb") : nullptr;
-    if (!f) return false;
-    std::uint32_t magic = 0;
-    const bool read = std::fread(&magic, 1, 4, f) == 4;
-    std::fclose(f);
-    return read && (magic == 0xFEEDFACFu || magic == 0xCFFAEDFEu || magic == 0xBEBAFECAu || magic == 0xCAFEBABEu);
-}
-
-int spawn_common(int *pid_out, const char *path, char *const *argv, char *const *envp, bool search) {
-    std::vector<std::string> args;
-    const char *launcher = std::getenv("MACHOMAN_EXE");
-    const char *venv = std::getenv("MACHOMAN_VENV");
-    const bool nested = file_is_macho(path) && launcher && venv;
-    if (nested && std::getenv("MACHOMAN_DISABLE_GUEST_SUBPROCESSES")) {
-        /* Diagnostic isolation: each helper has a separate translation
-         * image and can exhaust the UI run's cgroup memory budget. */
-        std::fprintf(stderr, "posix_spawn: guest helper disabled for this diagnostic run: %s\n", path);
-        return ENOMEM;
-    }
-    if (nested) {
-        args.push_back(launcher);
-        args.push_back("run");
-        args.push_back(venv);
-        args.push_back(path);
-        for (char *const *a = argv ? argv + 1 : nullptr; a && *a; a++) args.push_back(*a);
-    } else {
-        for (char *const *a = argv; a && *a; a++) args.push_back(*a);
-        if (args.empty()) args.push_back(path ? path : "");
-    }
-    std::vector<char *> raw;
-    for (std::string &a : args) raw.push_back(a.data());
-    raw.push_back(nullptr);
-
-    const pid_t pid = fork();
-    if (pid < 0) return errno;
-    if (pid == 0) {
-        const char *program = nested ? launcher : path;
-        if (envp) execve(program, raw.data(), const_cast<char *const *>(envp));
-        else if (search && !nested) execvp(program, raw.data());
-        else execv(program, raw.data());
-        _exit(127);
-    }
-    if (pid_out) *pid_out = pid;
-    return 0;
-}
-
-int darwin_posix_spawnp(int *pid, const char *path, const void *, const void *, char *const *argv, char *const *envp) DARWIN(posix_spawnp);
-int darwin_posix_spawnp(int *pid, const char *path, const void *, const void *, char *const *argv, char *const *envp) {
-    return spawn_common(pid, path, argv, envp, true);
-}
-int darwin_posix_spawn(int *pid, const char *path, const void *, const void *, char *const *argv, char *const *envp) DARWIN(posix_spawn);
-int darwin_posix_spawn(int *pid, const char *path, const void *, const void *, char *const *argv, char *const *envp) {
-    return spawn_common(pid, path, argv, envp, false);
-}
-int darwin_posix_spawnattr_init(void *) DARWIN(posix_spawnattr_init);
-int darwin_posix_spawnattr_init(void *) { return 0; }
-int darwin_posix_spawnattr_destroy(void *) DARWIN(posix_spawnattr_destroy);
-int darwin_posix_spawnattr_destroy(void *) { return 0; }
-int darwin_posix_spawnattr_setflags(void *, short) DARWIN(posix_spawnattr_setflags);
-int darwin_posix_spawnattr_setflags(void *, short) { return 0; }
-int darwin_posix_spawnattr_setpgroup(void *, int) DARWIN(posix_spawnattr_setpgroup);
-int darwin_posix_spawnattr_setpgroup(void *, int) { return 0; }
-int darwin_posix_spawnattr_setsigdefault(void *, const void *) DARWIN(posix_spawnattr_setsigdefault);
-int darwin_posix_spawnattr_setsigdefault(void *, const void *) { return 0; }
-int darwin_posix_spawn_file_actions_init(void *) DARWIN(posix_spawn_file_actions_init);
-int darwin_posix_spawn_file_actions_init(void *) { return 0; }
-int darwin_posix_spawn_file_actions_destroy(void *) DARWIN(posix_spawn_file_actions_destroy);
-int darwin_posix_spawn_file_actions_destroy(void *) { return 0; }
-int darwin_posix_spawn_file_actions_adddup2(void *, int, int) DARWIN(posix_spawn_file_actions_adddup2);
-int darwin_posix_spawn_file_actions_adddup2(void *, int, int) { return 0; }
-
 int darwin_fork() DARWIN(fork);
-int darwin_fork() { errno = ENOSYS; return -1; }
+int darwin_fork() { return ::fork(); }
 
 /* ---- dyld / process introspection ------------------------------------- */
 
@@ -760,12 +845,11 @@ int *darwin_NSGetArgc() { static int argc; argc = g_api ? g_api->argc : 0; retur
 char ***darwin_NSGetArgv() DARWIN(_NSGetArgv);
 char ***darwin_NSGetArgv() { static char **argv; argv = g_api ? g_api->argv : nullptr; return &argv; }
 
-char ***darwin_NSGetEnviron() DARWIN(_NSGetEnviron);
-char ***darwin_NSGetEnviron() { static char **envp; envp = g_api ? g_api->envp : nullptr; return &envp; }
 
 int darwin_NSGetExecutablePath(char *buf, std::uint32_t *size) DARWIN(_NSGetExecutablePath);
 int darwin_NSGetExecutablePath(char *buf, std::uint32_t *size) {
-    const char *path = g_api && g_api->argc > 0 ? g_api->argv[0] : "";
+    const char *path = g_api && g_api->version >= 6 ? g_api->executable_path
+        : g_api && g_api->argc > 0 ? g_api->argv[0] : "";
     const std::size_t need = std::strlen(path) + 1;
     if (*size < need) { *size = static_cast<std::uint32_t>(need); return -1; }
     std::memcpy(buf, path, need);
@@ -840,7 +924,10 @@ int darwin_dyld_find_unwind_sections(void *addr, dyld_unwind_sections *info) {
 }
 
 void *darwin_dlsym(void *, const char *) DARWIN(dlsym);
-void *darwin_dlsym(void *, const char *) { return nullptr; }
+void *darwin_dlsym(void *, const char *name) {
+    return g_api && g_api->version >= 4 && g_api->lookup_symbol
+        ? reinterpret_cast<void *>(g_api->lookup_symbol(name)) : nullptr;
+}
 
 bool darwin_NSIsSymbolNameDefined(const char *name) DARWIN(NSIsSymbolNameDefined);
 bool darwin_NSIsSymbolNameDefined(const char *name) {
@@ -929,49 +1016,97 @@ int darwin_fedisableexcept(int) { return 0; }
 int darwin_feenableexcept(int) DARWIN(feenableexcept);
 int darwin_feenableexcept(int) { return 0; }
 
-/* ---- setjmp/longjmp on guest registers ---------------------------------
- * Darwin arm64 jmp_buf is 192 bytes; we store x19-x28, x29, x30, sp,
- * d8-d15 and the signal mask flag. longjmp "returns" by rewriting the
- * guest resume address (x30) and stack pointer. */
+/* Darwin SDK sizes: x86_64 jmp_buf = 148 bytes, arm64 = 192 bytes.
+ * Match libplatform's register/mask offsets, including the unused arm64
+ * word before d8. Buffers may have only int alignment, so use memcpy. */
+struct arm64_jmp_state {
+    std::uint64_t x[12], sp, reserved, d[8];
+    std::uint32_t mask, mask_reserved, save_mask, onstack;
+};
+struct x86_jmp_state {
+    std::uint64_t rbx, rbp, rsp, r12, r13, r14, r15, rip, flags;
+    std::uint32_t mxcsr;
+    std::uint16_t fpcontrol, fp_reserved;
+    std::uint32_t mask, save_mask, onstack;
+};
+static_assert(sizeof(arm64_jmp_state) == 192 && offsetof(arm64_jmp_state, d) == 112);
+static_assert(offsetof(arm64_jmp_state, mask) == 176 && offsetof(arm64_jmp_state, save_mask) == 184);
+static_assert(offsetof(x86_jmp_state, mask) == 80 && offsetof(x86_jmp_state, save_mask) == 84);
+static_assert(sizeof(x86_jmp_state) <= 148);
 
-struct guest_jmp_buf { std::uint64_t x[12]; std::uint64_t sp; std::uint64_t d[8]; std::uint64_t mask; std::uint64_t magic; };
-constexpr std::uint64_t JMP_MAGIC = 0x4A4D50424946ull; /* "JMPBUF" */
-
-int guest_setjmp(guest_jmp_buf *jb) {
+int guest_setjmp(void *buffer, bool save_mask) {
     mm_cpu_context *c = g_api ? g_api->current_context() : nullptr;
     if (!c) return 0;
-    for (int i = 0; i < 12; i++) jb->x[i] = c->x[19 + i];
-    jb->sp = c->x[31];
-    for (int i = 0; i < 8; i++) jb->d[i] = c->v[8 + i][0];
-    jb->magic = JMP_MAGIC;
+    if (c->native_mode) {
+        x86_jmp_state jb{};
+        jb.rbx = c->native_x[MM_RBX]; jb.rbp = c->native_x[MM_RBP];
+        jb.rsp = c->native_x[MM_RSP] + 8;
+        jb.r12 = c->native_x[MM_R12]; jb.r13 = c->native_x[MM_R13];
+        jb.r14 = c->native_x[MM_R14]; jb.r15 = c->native_x[MM_R15];
+        jb.rip = c->x[30];
+        std::memcpy(&jb.mxcsr, c->native_fp + 24, sizeof jb.mxcsr);
+        std::memcpy(&jb.fpcontrol, c->native_fp, sizeof jb.fpcontrol);
+        if (save_mask) jb.mask = t_signal_mask;
+        jb.save_mask = save_mask ? 1u : 0u;
+        std::memcpy(buffer, &jb, sizeof jb);
+    } else {
+        arm64_jmp_state jb{};
+        std::memcpy(jb.x, c->x + 19, sizeof jb.x);
+        jb.sp = c->x[31];
+        for (int i = 0; i < 8; ++i) jb.d[i] = c->v[8 + i][0];
+        if (save_mask) jb.mask = t_signal_mask;
+        jb.save_mask = save_mask ? 1u : 0u;
+        std::memcpy(buffer, &jb, sizeof jb);
+    }
     return 0;
 }
 
-int guest_longjmp(guest_jmp_buf *jb, int val) {
+int guest_longjmp(const void *buffer, int val, bool restore_mask, bool sigjmp) {
     mm_cpu_context *c = g_api ? g_api->current_context() : nullptr;
-    if (!c || jb->magic != JMP_MAGIC) {
-        std::fprintf(stderr, "libSystem: longjmp with an invalid jmp_buf\n");
+    if (!c) {
+        std::fprintf(stderr, "libSystem: longjmp outside guest execution\n");
         std::abort();
     }
-    for (int i = 0; i < 12; i++) c->x[19 + i] = jb->x[i];
-    c->x[31] = jb->sp;
-    for (int i = 0; i < 8; i++) { c->v[8 + i][0] = jb->d[i]; c->v[8 + i][1] = 0; }
-    /* The runtime resumes at x30 with x0 = our return value. */
-    return val ? val : 1; /* becomes x0 at the (redirected) resume point */
+    const int result = val ? val : 1;
+    if (c->native_mode) {
+        x86_jmp_state jb;
+        std::memcpy(&jb, buffer, sizeof jb);
+        c->native_x[MM_RBX] = jb.rbx; c->native_x[MM_RBP] = jb.rbp;
+        c->native_x[MM_RSP] = jb.rsp;
+        c->native_x[MM_R12] = jb.r12; c->native_x[MM_R13] = jb.r13;
+        c->native_x[MM_R14] = jb.r14; c->native_x[MM_R15] = jb.r15;
+        c->native_x[MM_RAX] = static_cast<std::uint32_t>(result);
+        c->native_flags &= ~std::uint64_t{0x400}; // libplatform clears DF; arithmetic flags are volatile.
+        // libplatform fninit clears the x87 stack/exceptions before restoring its control word.
+        std::memset(c->native_fp, 0, 24);
+        std::memcpy(c->native_fp, &jb.fpcontrol, sizeof jb.fpcontrol);
+        std::memcpy(c->native_fp + 24, &jb.mxcsr, sizeof jb.mxcsr);
+        c->x[29] = jb.rbp; c->x[30] = jb.rip; c->x[31] = jb.rsp;
+        c->resume_va = jb.rip; // Saved RSP is already after RET; skip the ordinary host-return pop.
+        if (restore_mask || (sigjmp && jb.save_mask)) t_signal_mask = jb.mask;
+    } else {
+        arm64_jmp_state jb;
+        std::memcpy(&jb, buffer, sizeof jb);
+        std::memcpy(c->x + 19, jb.x, sizeof jb.x);
+        c->x[31] = jb.sp;
+        for (int i = 0; i < 8; ++i) c->v[8 + i][0] = jb.d[i];
+        if (restore_mask || (sigjmp && jb.save_mask)) t_signal_mask = jb.mask;
+    }
+    return result;
 }
 
-int darwin_setjmp(guest_jmp_buf *jb) DARWIN(setjmp);
-int darwin_setjmp(guest_jmp_buf *jb) { return guest_setjmp(jb); }
-int darwin__setjmp(guest_jmp_buf *jb) DARWIN(_setjmp);
-int darwin__setjmp(guest_jmp_buf *jb) { return guest_setjmp(jb); }
-int darwin_sigsetjmp(guest_jmp_buf *jb, int) DARWIN(sigsetjmp);
-int darwin_sigsetjmp(guest_jmp_buf *jb, int) { return guest_setjmp(jb); }
-int darwin_longjmp(guest_jmp_buf *jb, int val) DARWIN(longjmp);
-int darwin_longjmp(guest_jmp_buf *jb, int val) { return guest_longjmp(jb, val); }
-int darwin__longjmp(guest_jmp_buf *jb, int val) DARWIN(_longjmp);
-int darwin__longjmp(guest_jmp_buf *jb, int val) { return guest_longjmp(jb, val); }
-int darwin_siglongjmp(guest_jmp_buf *jb, int val) DARWIN(siglongjmp);
-int darwin_siglongjmp(guest_jmp_buf *jb, int val) { return guest_longjmp(jb, val); }
+int darwin_setjmp(void *jb) DARWIN(setjmp);
+int darwin_setjmp(void *jb) { return guest_setjmp(jb, true); }
+int darwin__setjmp(void *jb) DARWIN(_setjmp);
+int darwin__setjmp(void *jb) { return guest_setjmp(jb, false); }
+int darwin_sigsetjmp(void *jb, int save_mask) DARWIN(sigsetjmp);
+int darwin_sigsetjmp(void *jb, int save_mask) { return guest_setjmp(jb, save_mask != 0); }
+int darwin_longjmp(const void *jb, int val) DARWIN(longjmp);
+int darwin_longjmp(const void *jb, int val) { return guest_longjmp(jb, val, true, false); }
+int darwin__longjmp(const void *jb, int val) DARWIN(_longjmp);
+int darwin__longjmp(const void *jb, int val) { return guest_longjmp(jb, val, false, false); }
+int darwin_siglongjmp(const void *jb, int val) DARWIN(siglongjmp);
+int darwin_siglongjmp(const void *jb, int val) { return guest_longjmp(jb, val, false, true); }
 
 /* ---- process exit: guest destructors must run as guest code ------------- */
 
@@ -1012,19 +1147,63 @@ __attribute__((visibility("default"), used)) extern const char machoman_preserve
 
 void *darwin_tlv_bootstrap(tlv_descriptor *d) DARWIN(_tlv_bootstrap);
 void *darwin_tlv_bootstrap(tlv_descriptor *d) {
-    if (!t_tlv_block) {
-        static const tlv_image image = find_tlv_image();
-        t_tlv_block = static_cast<std::uint8_t *>(std::calloc(1, image.total_size ? image.total_size : 1));
+    const auto index = g_api ? g_api->image_for_address(reinterpret_cast<std::uintptr_t>(d)) : -1;
+    const void *header = index >= 0 ? g_api->image_header(static_cast<std::size_t>(index)) : nullptr;
+    const auto slide = index >= 0 ? static_cast<std::uint64_t>(g_api->image_slide(static_cast<std::size_t>(index))) : 0;
+    auto &block = local_state().blocks[header];
+    if (!block) {
+        const tlv_image image = find_tlv_image(header, slide);
+        block = std::make_unique<std::uint8_t[]>(image.total_size ? image.total_size : 1);
         if (image.data_size)
-            std::memcpy(t_tlv_block, image.data, image.data_size);
+            std::memcpy(block.get(), image.data, image.data_size);
     }
-    return t_tlv_block + d->offset;
+    return block.get() + d->offset;
 }
 
-void darwin_tlv_atexit(void (*)(void *), void *) DARWIN(_tlv_atexit);
-void darwin_tlv_atexit(void (*)(void *), void *) {}
+void darwin_tlv_atexit(const void *, void *) DARWIN(_tlv_atexit);
+void darwin_tlv_atexit(const void *function, void *argument) {
+    local_state().destructors.emplace_back(function, argument);
+}
 
 /* ---- pthreads ----------------------------------------------------------- */
+
+int darwin_pthread_key_create(std::uint64_t *, const void *) DARWIN(pthread_key_create);
+int darwin_pthread_key_create(std::uint64_t *result, const void *destructor) {
+    if (!result) return 22;
+    std::lock_guard lock(g_keys_mu);
+    for (std::size_t i = 0; i < guest_key_limit; ++i) {
+        auto &key = g_keys[i];
+        if (key.used) continue;
+        key.used = true;
+        ++key.generation;
+        key.destructor = destructor;
+        *result = i;
+        return 0;
+    }
+    return 35; /* EAGAIN */
+}
+int darwin_pthread_key_delete(std::uint64_t) DARWIN(pthread_key_delete);
+int darwin_pthread_key_delete(std::uint64_t index) {
+    std::lock_guard lock(g_keys_mu);
+    if (index >= guest_key_limit || !g_keys[index].used) return 22;
+    g_keys[index].used = false;
+    g_keys[index].destructor = nullptr;
+    return 0;
+}
+void *darwin_pthread_getspecific(std::uint64_t) DARWIN(pthread_getspecific);
+void *darwin_pthread_getspecific(std::uint64_t index) {
+    std::lock_guard lock(g_keys_mu);
+    if (index >= guest_key_limit || !g_keys[index].used || !t_local_state) return nullptr;
+    const auto &slot = t_local_state->values[index];
+    return slot.generation == g_keys[index].generation ? const_cast<void *>(slot.value) : nullptr;
+}
+int darwin_pthread_setspecific(std::uint64_t, const void *) DARWIN(pthread_setspecific);
+int darwin_pthread_setspecific(std::uint64_t index, const void *value) {
+    std::lock_guard lock(g_keys_mu);
+    if (index >= guest_key_limit || !g_keys[index].used) return 22;
+    local_state().values[index] = {g_keys[index].generation, value};
+    return 0;
+}
 
 int darwin_pthread_mutex_init(void *m, const void *attr) DARWIN(pthread_mutex_init);
 int darwin_pthread_mutex_init(void *m, const void *attr) {
@@ -1113,7 +1292,10 @@ int darwin_pthread_create(std::uint64_t *thread, const void *attr, std::uint64_t
 int darwin_pthread_create(std::uint64_t *thread, const void *attr, std::uint64_t start, std::uint64_t arg) {
     if (!g_api) return 78;
     const std::size_t stack = attr ? static_cast<const std::uint64_t *>(attr)[1] : 0;
-    return g_api->thread_create(start, arg, stack, thread);
+    const int saved_errno = errno;
+    const int result = g_api->thread_create(start, arg, stack, thread);
+    errno = saved_errno; /* pthread functions return error numbers without changing errno. */
+    return result;
 }
 int darwin_pthread_join(std::uint64_t thread, std::uint64_t *result) DARWIN(pthread_join);
 int darwin_pthread_join(std::uint64_t thread, std::uint64_t *result) { return g_api ? g_api->thread_join(thread, result) : 78; }
@@ -1122,11 +1304,11 @@ int darwin_pthread_detach(std::uint64_t) { return 0; }
 std::uint64_t darwin_pthread_self() DARWIN(pthread_self);
 std::uint64_t darwin_pthread_self() { return g_api ? g_api->thread_self() : 0; }
 
-/* Mach thread ports are just another id for the same threads. */
+/* Mach ports and pthread IDs have separate namespaces. */
 std::uint32_t darwin_pthread_mach_thread_np(std::uint64_t t) DARWIN(pthread_mach_thread_np);
-std::uint32_t darwin_pthread_mach_thread_np(std::uint64_t t) { return static_cast<std::uint32_t>(t); }
+std::uint32_t darwin_pthread_mach_thread_np(std::uint64_t t) { return mm_mach_thread_port(t); }
 std::uint32_t darwin_mach_thread_self() DARWIN(mach_thread_self);
-std::uint32_t darwin_mach_thread_self() { return static_cast<std::uint32_t>(darwin_pthread_self()); }
+std::uint32_t darwin_mach_thread_self() { return mm_mach_thread_port(darwin_pthread_self()); }
 /* A guest pthread_t is the runtime's thread id, not a host pthread_t, so
  * every function taking one is answered here rather than reaching the host
  * libc (which would dereference the id as a pointer). Scheduling is the

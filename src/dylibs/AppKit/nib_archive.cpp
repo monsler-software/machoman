@@ -1,9 +1,34 @@
 #include "nib_archive.h"
+#include <algorithm>
 #include <bit>
+#include <charconv>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace ak {
+bool parse_nib_geometry(std::string_view text, std::span<double> values) {
+    std::vector<double> parsed;
+    auto skip = [&] {
+        while (!text.empty() && (text.front() == '{' || text.front() == '}' || text.front() == ',' ||
+                                text.front() == ' ' || text.front() == '\t' || text.front() == '\n' || text.front() == '\r'))
+            text.remove_prefix(1);
+    };
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        skip();
+        if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+        if (text.empty()) return false;
+        double value = 0;
+        const auto result = std::from_chars(text.data(),text.data()+text.size(),value);
+        if (result.ec != std::errc{} || !std::isfinite(value)) return false;
+        parsed.push_back(value);
+        text.remove_prefix(static_cast<std::size_t>(result.ptr-text.data()));
+    }
+    skip();
+    if (!text.empty()) return false;
+    std::copy(parsed.begin(),parsed.end(),values.begin());
+    return true;
+}
 namespace {
 struct reader {
     std::string_view bytes;

@@ -13,6 +13,8 @@ struct type {
     char kind = 0, homogeneous = 0;
     std::size_t size = 0, alignment = 1, elements = 0;
     std::string object_class;
+    std::vector<type> members;
+    std::size_t offset = 0;
     bool valid = false;
 };
 inline std::size_t align(std::size_t n, std::size_t a) { return (n + a - 1) & ~(a - 1); }
@@ -57,6 +59,10 @@ inline type parse(std::string_view &s, unsigned depth = 0) {
         s.remove_prefix(1);
         t.size = item.size * count; t.alignment = item.alignment;
         t.homogeneous = item.homogeneous; t.elements = item.elements * count;
+        for (std::size_t i = 0; i < count; ++i) {
+            t.members.push_back(item);
+            t.members.back().offset = i * item.size;
+        }
         break;
     }
     case '{': {
@@ -70,13 +76,15 @@ inline type parse(std::string_view &s, unsigned depth = 0) {
                 if (quote == std::string_view::npos) return {};
                 s.remove_prefix(quote + 1);
             }
-            const auto item = parse(s, depth + 1);
+            auto item = parse(s, depth + 1);
             if (!item.valid || item.size == 0) return {};
-            t.size = align(t.size, item.alignment) + item.size;
+            item.offset = align(t.size, item.alignment);
+            t.size = item.offset + item.size;
             t.alignment = std::max(t.alignment, item.alignment);
             if (first) t.homogeneous = item.homogeneous;
             if (!item.homogeneous || item.homogeneous != t.homogeneous) homogeneous = false;
             t.elements += item.elements; first = false;
+            t.members.push_back(std::move(item));
             if (t.size > 4096) return {};
         }
         if (s.empty() || first) return {};

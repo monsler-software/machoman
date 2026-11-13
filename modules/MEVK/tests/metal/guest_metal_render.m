@@ -105,6 +105,68 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     check(device != nil, "Metal device");
+    NSUInteger allocated_before = device.currentAllocatedSize;
+    MTLTextureDescriptor *volume_descriptor = [[MTLTextureDescriptor alloc] init];
+    volume_descriptor.textureType = MTLTextureType3D;
+    volume_descriptor.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    volume_descriptor.width = 128;
+    volume_descriptor.height = 128;
+    volume_descriptor.depth = 64;
+    volume_descriptor.storageMode = MTLStorageModePrivate;
+    volume_descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> volume = [device newTextureWithDescriptor:volume_descriptor];
+    check(volume && volume.width == 128 && volume.height == 128 &&
+              volume.depth == 64 && volume.textureType == MTLTextureType3D &&
+              volume.usage == (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite),
+          "Roblox read/write 128x128x64 private 3D texture");
+    check(device.currentAllocatedSize >= allocated_before + 128 * 128 * 64 * 4 &&
+              device.recommendedMaxWorkingSetSize > 0,
+          "device reports allocated texture memory and working set");
+    [volume release];
+    [volume_descriptor release];
+    check(device.currentAllocatedSize == allocated_before,
+          "released volume frees its device allocation");
+    MTLTextureDescriptor *packed_descriptor = [[MTLTextureDescriptor alloc] init];
+    packed_descriptor.textureType = MTLTextureTypeCube;
+    packed_descriptor.pixelFormat = MTLPixelFormatRG11B10Float;
+    packed_descriptor.width = 128; packed_descriptor.height = 128;
+    packed_descriptor.mipmapLevelCount = 8;
+    packed_descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    id<MTLTexture> packed_cube = [device newTextureWithDescriptor:packed_descriptor];
+    check(packed_cube && packed_cube.mipmapLevelCount == 8 && packed_cube.pixelFormat == MTLPixelFormatRG11B10Float,
+          "Roblox packed-float cube with eight mip levels");
+    [packed_cube release]; [packed_descriptor release];
+    packed_descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGB9E5Float width:3 height:3 mipmapped:NO];
+    packed_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> packed_shared = [device newTextureWithDescriptor:packed_descriptor];
+    check(packed_shared != nil, "RGB9E5 sampled texture does not require a color attachment format");
+    [packed_shared release];
+    MTLTextureDescriptor *depth_descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:128 height:128 mipmapped:NO];
+    depth_descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    id<MTLTexture> depth_texture = [device newTextureWithDescriptor:depth_descriptor];
+    check(depth_texture && depth_texture.pixelFormat == MTLPixelFormatDepth32Float,
+          "Roblox Depth32Float texture allocation");
+    [depth_texture release];
+    MTLTextureDescriptor *bc_descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBC1_RGBA width:1024 height:1024 mipmapped:YES];
+    bc_descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> bc_texture = [device newTextureWithDescriptor:bc_descriptor];
+    check(bc_texture && bc_texture.mipmapLevelCount == 11, "Roblox BC1 1024x1024 texture with full mip chain");
+    [bc_texture release];
+    MTLSamplerDescriptor *sampler_descriptor = [[MTLSamplerDescriptor alloc] init];
+    sampler_descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+    sampler_descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+    sampler_descriptor.mipFilter = MTLSamplerMipFilterLinear;
+    sampler_descriptor.sAddressMode = MTLSamplerAddressModeRepeat;
+    sampler_descriptor.lodMinClamp = 0.5f;
+    sampler_descriptor.lodMaxClamp = 4.0f;
+    check(sampler_descriptor.lodMinClamp == 0.5f &&
+              sampler_descriptor.lodMaxClamp == 4.0f, "sampler float property ABI");
+    id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_descriptor];
+    check(sampler != nil, "Metal sampler state");
+    [sampler release];
+    [sampler_descriptor release];
     NSError *error = nil;
     id<MTLLibrary> library =
         [device newLibraryWithFile:[NSString stringWithUTF8String:argv[1]]
@@ -115,6 +177,25 @@ int main(int argc, char **argv) {
           "real Ableton AIR library");
     check([library conformsToProtocol:@protocol(MTLLibrary)],
           "library protocol");
+    NSData *file_data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[1]]];
+    check(file_data.length > 1, "in-memory metallib fixture");
+    size_t split = file_data.length / 2;
+    dispatch_data_t first = dispatch_data_create(file_data.bytes, split, NULL, NULL);
+    dispatch_data_t second = dispatch_data_create((const char *)file_data.bytes + split,
+        file_data.length - split, NULL, NULL);
+    dispatch_data_t fragmented = dispatch_data_create_concat(first, second);
+    [(id)first release]; [(id)second release];
+    id<MTLLibrary> memory_library = [device newLibraryWithData:fragmented error:&error];
+    [(id)fragmented release];
+    check(memory_library && !error && memory_library.functionNames.count == 16,
+        "fragmented dispatch data loads real AIR library");
+    [memory_library release];
+    dispatch_data_t invalid = dispatch_data_create("bad", 3, NULL, NULL);
+    memory_library = [device newLibraryWithData:invalid error:&error];
+    [(id)invalid release];
+    check(!memory_library && error && [error.domain isEqualToString:MTLLibraryErrorDomain],
+        "invalid in-memory metallib returns NSError");
+    error = nil;
     id<MTLFunction> vertex = [library newFunctionWithName:@"RectsVertexShader"];
     id<MTLFunction> fragment =
         [library newFunctionWithName:@"IndexedColorFragmentShader"];
@@ -170,6 +251,85 @@ int main(int argc, char **argv) {
           "managed buffers");
     [rect_buffer didModifyRange:NSMakeRange(0, sizeof rect)];
     id<MTLCommandQueue> queue = [device newCommandQueue];
+    MTLVertexDescriptor *vertex_descriptor = [MTLVertexDescriptor vertexDescriptor];
+    vertex_descriptor.attributes[0].format = MTLVertexFormatFloat4;
+    vertex_descriptor.attributes[0].offset = 4;
+    vertex_descriptor.attributes[0].bufferIndex = 30;
+    vertex_descriptor.layouts[30].stride = 20;
+    check(vertex_descriptor.attributes[0].format == MTLVertexFormatFloat4 &&
+              vertex_descriptor.attributes[0].offset == 4 && vertex_descriptor.attributes[0].bufferIndex == 30 &&
+              vertex_descriptor.layouts[30].stride == 20 && vertex_descriptor.layouts[30].stepRate == 1,
+          "vertex descriptor arrays and properties");
+    MTLDepthStencilDescriptor *depth_state_descriptor = [[MTLDepthStencilDescriptor alloc] init];
+    depth_state_descriptor.depthCompareFunction = MTLCompareFunctionAlways;
+    depth_state_descriptor.depthWriteEnabled = YES;
+    id<MTLDepthStencilState> depth_state = [device newDepthStencilStateWithDescriptor:depth_state_descriptor];
+    check(depth_state && depth_state_descriptor.depthCompareFunction == MTLCompareFunctionAlways &&
+              depth_state_descriptor.depthWriteEnabled, "depth state creation and descriptor properties");
+    MTLTextureDescriptor *pass_depth_descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:64 height:64 mipmapped:NO];
+    pass_depth_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    pass_depth_descriptor.storageMode = MTLStorageModeManaged;
+    id<MTLTexture> pass_depth_texture = [device newTextureWithDescriptor:pass_depth_descriptor];
+    check(pass_depth_texture != nil, "depth render target");
+    MTLRenderPipelineDescriptor *depth_pd = [[MTLRenderPipelineDescriptor alloc] init];
+    depth_pd.vertexFunction = vertex; depth_pd.fragmentFunction = fragment;
+    depth_pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    depth_pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    depth_pd.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
+    id<MTLRenderPipelineState> depth_pipeline = [device newRenderPipelineStateWithDescriptor:depth_pd error:&error];
+    check(depth_pipeline && !error, "pipeline with vertex descriptor and depth format");
+    MTLRenderPassDescriptor *depth_pass = pass(target);
+    depth_pass.depthAttachment.texture = pass_depth_texture;
+    depth_pass.depthAttachment.loadAction = MTLLoadActionClear;
+    depth_pass.depthAttachment.storeAction = MTLStoreActionStore;
+    depth_pass.depthAttachment.clearDepth = 0.5;
+    check(depth_pass.depthAttachment.clearDepth == 0.5, "clearDepth double ABI");
+    id<MTLCommandBuffer> depth_command = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> depth_encoder = [depth_command renderCommandEncoderWithDescriptor:depth_pass];
+    check(depth_encoder != nil, "color plus depth render pass");
+    [depth_encoder setRenderPipelineState:depth_pipeline];
+    [depth_encoder setDepthStencilState:depth_state];
+    [depth_encoder setCullMode:MTLCullModeNone];
+    [depth_encoder setFrontFacingWinding:MTLWindingClockwise];
+    [depth_encoder setTriangleFillMode:MTLTriangleFillModeFill];
+    [depth_encoder setDepthClipMode:MTLDepthClipModeClip];
+    [depth_encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+    [depth_encoder setVertexBuffer:rect_buffer offset:0 atIndex:0];
+    [depth_encoder setVertexBuffer:size_buffer offset:4 atIndex:1];
+    [depth_encoder setFragmentBytes:color length:sizeof color atIndex:0];
+    [depth_encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [depth_encoder endEncoding]; finish(depth_command);
+    float depth_readback[64 * 64];
+    [pass_depth_texture getBytes:depth_readback bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+    check(depth_readback[16 * 64 + 16] != 0.5f && depth_readback[0] == 0.5f,
+          "guest depth pass clear, compare and writes produce distinct depth values");
+    [depth_pipeline release]; [depth_pd release]; [pass_depth_texture release];
+    [depth_state release]; [depth_state_descriptor release];
+    id<MTLCommandBuffer> unretained = [queue commandBufferWithUnretainedReferences];
+    check(unretained && !unretained.retainedReferences,
+          "unretained-reference command buffer is available");
+    finish(unretained);
+    uint16_t upload_words[16];
+    for (unsigned i = 0; i < 16; ++i) upload_words[i] = (uint16_t)(300 + i);
+    id<MTLBuffer> texture_upload = [device newBufferWithBytes:upload_words length:sizeof upload_words options:0];
+    MTLTextureDescriptor *integer_descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Uint width:4 height:3 mipmapped:NO];
+    integer_descriptor.storageMode = MTLStorageModeManaged;
+    id<MTLTexture> integer_texture = [device newTextureWithDescriptor:integer_descriptor];
+    check(texture_upload && integer_texture, "R16Uint texture and upload buffer");
+    id<MTLCommandBuffer> upload_command = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> upload_encoder = [upload_command blitCommandEncoder];
+    [upload_encoder copyFromBuffer:texture_upload sourceOffset:4 sourceBytesPerRow:8 sourceBytesPerImage:0
+                       sourceSize:MTLSizeMake(4, 3, 1) toTexture:integer_texture destinationSlice:0
+                 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [upload_encoder endEncoding];
+    finish(upload_command);
+    uint16_t downloaded_words[12];
+    [integer_texture getBytes:downloaded_words bytesPerRow:8 fromRegion:MTLRegionMake2D(0, 0, 4, 3) mipmapLevel:0];
+    check(!memcmp(downloaded_words, upload_words + 2, sizeof downloaded_words),
+          "buffer-to-texture blit struct/stack ABI and R16Uint readback");
+    [texture_upload release]; [integer_texture release];
     dispatch_semaphore_t started = dispatch_semaphore_create(0);
     dispatch_semaphore_t release_handler = dispatch_semaphore_create(0);
     pthread_t caller = pthread_self();

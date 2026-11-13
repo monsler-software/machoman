@@ -2,7 +2,7 @@
  *
  * The filters a Darwin program actually uses on files and sockets map onto
  * epoll (READ/WRITE), timerfd (TIMER) and eventfd (USER); the rest of BSD's
- * filter set (VNODE, PROC, SIGNAL, MACHPORT) has no equivalent and is
+ * filter set (VNODE, PROC, SIGNAL) has no equivalent and is
  * refused with EINVAL rather than silently never firing, so a program that
  * depends on one fails where it registers instead of deadlocking later.
  *
@@ -18,6 +18,7 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <memory>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <semaphore.h>
@@ -49,7 +50,7 @@ struct kevent64_s {
     std::uint64_t ext[2];
 };
 
-constexpr std::int16_t EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_TIMER = -7, EVFILT_USER = -10;
+constexpr std::int16_t EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_TIMER = -7, EVFILT_USER = -10, EVFILT_MACHPORT = -8;
 constexpr std::uint16_t EV_ADD = 0x0001, EV_DELETE = 0x0002, EV_ENABLE = 0x0004, EV_DISABLE = 0x0008,
                         EV_ONESHOT = 0x0010, EV_CLEAR = 0x0020, EV_RECEIPT = 0x0040, EV_ERROR = 0x4000,
                         EV_EOF = 0x8000;
@@ -70,6 +71,7 @@ struct registration {
     std::uint64_t udata = 0;
     bool enabled = true;
     int helper_fd = -1;   /* timerfd/eventfd for TIMER and USER, else -1 */
+    std::uint64_t mach_watch_token = 0;
     bool user_triggered = false;
 };
 
@@ -81,9 +83,9 @@ struct kqueue_state {
 };
 
 std::mutex g_queues_mu;
-std::unordered_map<int, kqueue_state *> g_queues;
+std::unordered_map<int, std::shared_ptr<kqueue_state>> g_queues;
 
-kqueue_state *queue_for(int fd) {
+std::shared_ptr<kqueue_state> queue_for(int fd) {
     std::lock_guard lock(g_queues_mu);
     auto it = g_queues.find(fd);
     return it == g_queues.end() ? nullptr : it->second;
@@ -123,12 +125,13 @@ int apply_change(kqueue_state &q, const kevent64_s &change) {
     if (change.flags & EV_DELETE) {
         if (it == q.registrations.end()) return 2; /* ENOENT */
         epoll_ctl(q.epoll_fd, EPOLL_CTL_DEL, watched_fd(it->second), nullptr);
+        if (it->second.filter == EVFILT_MACHPORT) mm_mach_unwatch_port(static_cast<std::uint32_t>(it->second.ident), it->second.mach_watch_token);
         if (it->second.helper_fd >= 0) close(it->second.helper_fd);
         q.registrations.erase(it);
         return 0;
     }
     if (change.filter != EVFILT_READ && change.filter != EVFILT_WRITE && change.filter != EVFILT_TIMER &&
-        change.filter != EVFILT_USER)
+        change.filter != EVFILT_USER && change.filter != EVFILT_MACHPORT)
         return 22; /* EINVAL: no Linux equivalent for this filter */
 
     if (it == q.registrations.end()) {
@@ -145,6 +148,9 @@ int apply_change(kqueue_state &q, const kevent64_s &change) {
         } else if (change.filter == EVFILT_USER) {
             r.helper_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
             if (r.helper_fd < 0) return errno;
+        } else if (change.filter == EVFILT_MACHPORT) {
+            r.helper_fd = mm_mach_watch_port(static_cast<std::uint32_t>(r.ident), &r.mach_watch_token);
+            if (r.helper_fd < 0) return errno;
         }
         epoll_event ev{};
         ev.events = (change.filter == EVFILT_WRITE) ? EPOLLOUT : EPOLLIN;
@@ -152,6 +158,7 @@ int apply_change(kqueue_state &q, const kevent64_s &change) {
         ev.data.u64 = key;
         if (epoll_ctl(q.epoll_fd, EPOLL_CTL_ADD, watched_fd(r), &ev) != 0) {
             const int e = errno;
+            if (r.filter == EVFILT_MACHPORT) mm_mach_unwatch_port(static_cast<std::uint32_t>(r.ident), r.mach_watch_token);
             if (r.helper_fd >= 0) close(r.helper_fd);
             return e;
         }
@@ -220,6 +227,10 @@ int wait_events(kqueue_state &q, kevent64_s *out, int nevents, const timespec *t
             if (read(r.helper_fd, &value, 8) != 8) value = 1;
             r.user_triggered = false;
             e.data = 0;
+        } else if (r.filter == EVFILT_MACHPORT) {
+            std::uint64_t count = 0; int alive = 1;
+            if (mm_mach_watch_ready(static_cast<std::uint32_t>(r.ident), &count, &alive) < 0) { e.flags |= EV_ERROR; e.data = 5; }
+            else { e.data = static_cast<std::int64_t>(count); if (!alive) e.flags |= EV_EOF; }
         } else {
             /* How much can be read/written, as BSD reports. */
             int available = 0;
@@ -230,6 +241,7 @@ int wait_events(kqueue_state &q, kevent64_s *out, int nevents, const timespec *t
 
         if (r.flags & EV_ONESHOT) {
             epoll_ctl(q.epoll_fd, EPOLL_CTL_DEL, watched_fd(r), nullptr);
+            if (r.filter == EVFILT_MACHPORT) mm_mach_unwatch_port(static_cast<std::uint32_t>(r.ident), r.mach_watch_token);
             if (r.helper_fd >= 0) close(r.helper_fd);
             q.registrations.erase(it);
         }
@@ -241,11 +253,33 @@ int wait_events(kqueue_state &q, kevent64_s *out, int nevents, const timespec *t
 
 extern "C" {
 
+int darwin_close(int) DARWIN(close);
+int darwin_close(int fd) {
+    const int saved_errno = errno;
+    std::shared_ptr<kqueue_state> q;
+    {
+        std::lock_guard lock(g_queues_mu);
+        if (const auto it = g_queues.find(fd); it != g_queues.end()) { q = it->second; g_queues.erase(it); }
+    }
+    if (q) {
+        std::lock_guard lock(q->mu);
+        for (auto &[key, registration] : q->registrations) {
+            (void)key;
+            if (registration.filter == EVFILT_MACHPORT)
+                mm_mach_unwatch_port(static_cast<std::uint32_t>(registration.ident), registration.mach_watch_token);
+            if (registration.helper_fd >= 0) close(registration.helper_fd);
+        }
+        q->registrations.clear();
+    }
+    errno = saved_errno;
+    return close(fd);
+}
+
 int darwin_kqueue() DARWIN(kqueue);
 int darwin_kqueue() {
     const int fd = epoll_create1(EPOLL_CLOEXEC);
     if (fd < 0) return -1;
-    auto *q = new kqueue_state;
+    auto q = std::make_shared<kqueue_state>();
     q->epoll_fd = fd;
     std::lock_guard lock(g_queues_mu);
     g_queues.emplace(fd, q);
@@ -257,7 +291,7 @@ int darwin_kevent64(int kq, const kevent64_s *changes, int nchanges, kevent64_s 
 int darwin_kevent64(int kq, const kevent64_s *changes, int nchanges, kevent64_s *events, int nevents,
                     unsigned flags, const timespec *timeout) {
     (void)flags;
-    kqueue_state *q = queue_for(kq);
+    auto q = queue_for(kq);
     if (!q) { errno = EBADF; return -1; }
     int produced = 0;
     for (int i = 0; i < nchanges; i++) {
@@ -379,26 +413,6 @@ unsigned darwin_mach_task_self() DARWIN(mach_task_self);
 unsigned darwin_mach_task_self() { return mach_task_self_storage; }
 unsigned darwin_mach_host_self() DARWIN(mach_host_self);
 unsigned darwin_mach_host_self() { return 2; }
-int darwin_mach_port_deallocate(unsigned, unsigned) DARWIN(mach_port_deallocate);
-int darwin_mach_port_deallocate(unsigned, unsigned) { return 0; }
-int darwin_mach_port_destroy(unsigned, unsigned) DARWIN(mach_port_destroy);
-int darwin_mach_port_destroy(unsigned, unsigned) { return 0; }
-int darwin_mach_port_mod_refs(unsigned, unsigned, int, int) DARWIN(mach_port_mod_refs);
-int darwin_mach_port_mod_refs(unsigned, unsigned, int, int) { return 0; }
-
-int darwin_vm_allocate(unsigned, std::uint64_t *address, std::uint64_t size, int flags) DARWIN(vm_allocate);
-int darwin_vm_allocate(unsigned, std::uint64_t *address, std::uint64_t size, int flags) {
-    const bool anywhere = (flags & 1) != 0;
-    void *want = anywhere ? nullptr : reinterpret_cast<void *>(*address);
-    void *p = mmap(want, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | (anywhere ? 0 : MAP_FIXED), -1, 0);
-    if (p == MAP_FAILED) return 3; /* KERN_NO_SPACE */
-    *address = reinterpret_cast<std::uint64_t>(p);
-    return 0;
-}
-int darwin_vm_deallocate(unsigned, std::uint64_t address, std::uint64_t size) DARWIN(vm_deallocate);
-int darwin_vm_deallocate(unsigned, std::uint64_t address, std::uint64_t size) {
-    return munmap(reinterpret_cast<void *>(address), size) == 0 ? 0 : 5;
-}
 
 /* Thread scheduling policy. Real-time and precedence policies are a Mach
  * concept; the closest a Linux process can do without privileges is
@@ -464,11 +478,6 @@ int darwin_task_info(unsigned task, int flavor, void *out, unsigned *count) {
     }
     *count = words;
     return 0;
-}
-int darwin_host_info(unsigned, int, void *, unsigned *count) DARWIN(host_info);
-int darwin_host_info(unsigned, int, void *, unsigned *count) {
-    if (count) *count = 0;
-    return 4;
 }
 
 /* Mach semaphores: a port name standing for a host semaphore. Programs use

@@ -5,6 +5,8 @@
 #include "foundation.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -19,6 +21,93 @@ FND_CLASS(__NSCFKeyedArchiverUID);
 namespace {
 
 Class g_uid = nullptr;
+
+/* Cocoa .strings files use the original property-list dictionary syntax,
+ * often encoded as UTF-16. Parse complete assignments before publishing
+ * their values so malformed resources cannot produce partial translations. */
+struct strings_parser {
+    std::string_view s;
+    std::size_t i = 0;
+    bool valid = true;
+    void skip() {
+        for (;;) {
+            while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+            if (s.substr(i, 2) == "//") {
+                const auto end = s.find('\n', i + 2);
+                i = end == s.npos ? s.size() : end + 1;
+            } else if (s.substr(i, 2) == "/*") {
+                const auto end = s.find("*/", i + 2);
+                if (end == s.npos) { valid = false; i = s.size(); return; }
+                i = end + 2;
+            } else return;
+        }
+    }
+    bool eat(char c) { skip(); if (i < s.size() && s[i] == c) { ++i; return true; } return false; }
+    std::string text() {
+        skip();
+        std::string out;
+        if (i == s.size()) { valid = false; return out; }
+        if (s[i] != '"') {
+            const auto start = i;
+            while (i < s.size() && !std::isspace(static_cast<unsigned char>(s[i])) &&
+                   s[i] != '=' && s[i] != ';' && s[i] != '}') ++i;
+            if (start == i) valid = false;
+            return std::string(s.substr(start, i - start));
+        }
+        ++i;
+        std::u16string unicode;
+        auto flush = [&] { out += utf16_to_utf8(unicode); unicode.clear(); };
+        while (i < s.size()) {
+            char c = s[i++];
+            if (c == '"') { flush(); return out; }
+            if (c == '\\') {
+                if (i == s.size()) break;
+                c = s[i++];
+                if (c == 'U' || c == 'u') {
+                    unsigned value = 0;
+                    if (i + 4 > s.size()) break;
+                    for (int digit = 0; digit < 4; ++digit) {
+                        const char h = s[i++];
+                        unsigned n = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 :
+                                     h >= 'A' && h <= 'F' ? h - 'A' + 10 : 16;
+                        if (n == 16) { valid = false; return {}; }
+                        value = value * 16 + n;
+                    }
+                    unicode.push_back(static_cast<char16_t>(value));
+                    continue;
+                }
+                if (c >= '0' && c <= '7') {
+                    unsigned value = c - '0';
+                    for (int digit = 1; digit < 3 && i < s.size() && s[i] >= '0' && s[i] <= '7'; ++digit)
+                        value = value * 8 + (s[i++] - '0');
+                    c = static_cast<char>(value);
+                } else if (c == 'n') c = '\n';
+                else if (c == 'r') c = '\r';
+                else if (c == 't') c = '\t';
+                else if (c == '\n') continue;
+            }
+            flush(); out += c;
+        }
+        valid = false; return {};
+    }
+    id parse() {
+        id result = dictionary_create(true);
+        const bool braces = eat('{');
+        for (;;) {
+            skip();
+            if (!valid) break;
+            if (braces && eat('}')) { skip(); if (i == s.size() && valid) return result; break; }
+            if (!braces && i == s.size()) return result;
+            auto key = text();
+            if (!valid || !eat('=')) break;
+            auto value = text();
+            if (!valid || !eat(';')) break;
+            id k = string_from_utf8(key), v = string_from_utf8(value);
+            dictionary_set(result, k, v); release(k); release(v);
+        }
+        release(result); return nullptr;
+    }
+};
 
 /* ---- XML ---------------------------------------------------------------- */
 
@@ -122,7 +211,25 @@ struct xml_parser {
         if (tag == "string") return string_from_utf8(text_until("</string>"));
         if (tag == "key") return string_from_utf8(text_until("</key>"));
         if (tag == "integer") return number_from_int64(std::strtoll(text_until("</integer>").c_str(), nullptr, 10));
-        if (tag == "real") return number_from_double(std::strtod(text_until("</real>").c_str(), nullptr));
+        if (tag == "real") {
+            auto text = text_until("</real>");
+            auto first = text.find_first_not_of(" \t\r\n"), last = text.find_last_not_of(" \t\r\n");
+            if (first == std::string::npos) { error = "empty plist real"; return nullptr; }
+            text = text.substr(first,last-first+1);
+            // Older host builds wrote decimal commas under a Russian locale.
+            // Recover those files, then always serialize the standard form.
+            if (text.find('.') == std::string::npos && std::count(text.begin(),text.end(),',') == 1) {
+                std::replace(text.begin(),text.end(),',','.');
+                std::fprintf(stderr,"Foundation plist: recovered legacy decimal-comma real=%s\n",text.c_str());
+            }
+            const char *begin = text.data() + (text.front() == '+' ? 1 : 0);
+            double value = 0;
+            const auto result = std::from_chars(begin,text.data()+text.size(),value);
+            if (result.ec != std::errc{} || result.ptr != text.data()+text.size()) {
+                error = "invalid plist real"; return nullptr;
+            }
+            return number_from_double(value);
+        }
         if (tag == "true" || tag == "true/") { if (tag == "true") eat("</true>"); return retain(number_bool(true)); }
         if (tag == "false" || tag == "false/") { if (tag == "false") eat("</false>"); return retain(number_bool(false)); }
         if (tag == "data") {
@@ -320,7 +427,13 @@ bool write_value(id v, std::string &out, int indent) {
         if (v == number_bool(true)) { out += pad + "<true/>\n"; return true; }
         if (v == number_bool(false)) { out += pad + "<false/>\n"; return true; }
         char buf[64];
-        if (number_is_float(v)) { std::snprintf(buf, sizeof buf, "%.17g", number_double(v)); out += pad + "<real>" + buf + "</real>\n"; }
+        if (number_is_float(v)) {
+            const auto result = std::to_chars(buf,buf+sizeof buf,number_double(v),std::chars_format::general,17);
+            if (result.ec != std::errc{}) return false;
+            out += pad + "<real>";
+            out.append(buf,result.ptr);
+            out += "</real>\n";
+        }
         else { std::snprintf(buf, sizeof buf, "%lld", static_cast<long long>(number_int64(v))); out += pad + "<integer>" + buf + "</integer>\n"; }
         return true;
     }
@@ -452,8 +565,24 @@ id plist_parse(std::string_view bytes, std::string *error) {
         if (!v && error) *error = p.error;
         return v;
     }
+    std::string decoded;
+    if (bytes.starts_with("\xff\xfe") || bytes.starts_with("\xfe\xff")) {
+        if (bytes.size() % 2) { if (error) *error = "truncated UTF-16 plist"; return nullptr; }
+        std::u16string text;
+        const bool little = static_cast<unsigned char>(bytes[0]) == 0xff;
+        for (std::size_t i = 2; i < bytes.size(); i += 2) {
+            const unsigned a = static_cast<unsigned char>(bytes[i]), b = static_cast<unsigned char>(bytes[i + 1]);
+            text.push_back(static_cast<char16_t>(little ? a | (b << 8) : (a << 8) | b));
+        }
+        decoded = utf16_to_utf8(text); bytes = decoded;
+    } else if (bytes.starts_with("\xef\xbb\xbf")) bytes.remove_prefix(3);
     xml_parser p{bytes, 0, {}};
-    if (!p.eat("<plist")) { if (error) *error = "missing <plist>"; return nullptr; }
+    if (!p.eat("<plist")) {
+        strings_parser strings{bytes};
+        id result = strings.parse();
+        if (!result && error) *error = "invalid strings dictionary";
+        return result;
+    }
     p.consume_tag();
     id v = p.value();
     if (!v && error) *error = p.error;

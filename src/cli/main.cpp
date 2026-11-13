@@ -18,14 +18,19 @@
 #include <string_view>
 #include <vector>
 #include <chrono>
+#include <charconv>
 #include "machoman/translation_cache.h"
 
 #include "machoman/arch/arm64_decoder.h"
 #include "machoman/macho.h"
 #include "machoman/runtime.h"
+#if !defined(_WIN32)
+#include "machoman/ipc.h"
+#endif
 #include "machoman/translator.h"
 #include "machoman/venv.h"
 #include "machoman/install.h"
+#include "machoman/json.h"
 
 namespace {
 
@@ -47,6 +52,14 @@ bool load_image(const char *path, std::vector<std::uint8_t> &data, mm_macho_imag
         return false;
     }
     return true;
+}
+
+bool require_arm64(const char *path, const mm_macho_image &img) {
+    if (img.header->cputype == MM_CPU_TYPE_ARM64)
+        return true;
+    std::println(stderr, "error: '{}' is {}; machoman requires arm64 code", path,
+                 mm_cpu_type_name(img.header->cputype));
+    return false;
 }
 
 int cmd_inspect(const char *path) {
@@ -158,7 +171,7 @@ void print_unsupported_stats(std::span<const std::uint8_t> text, const mm_transl
 int cmd_translate(const char *path, bool stats, bool cache = false) {
     std::vector<std::uint8_t> data;
     mm_macho_image img;
-    if (!load_image(path, data, img))
+    if (!load_image(path, data, img) || !require_arm64(path, img))
         return 1;
 
     const mm_section_64 *text = img.find_section("__TEXT", "__text");
@@ -237,7 +250,7 @@ struct disasm_symbols {
 int cmd_disasm(const char *path, const char *va_str, const char *count_str) {
     std::vector<std::uint8_t> data;
     mm_macho_image img;
-    if (!load_image(path, data, img))
+    if (!load_image(path, data, img) || !require_arm64(path, img))
         return 1;
     const auto code = img.executable_code();
     if (code.bytes.empty()) {
@@ -270,17 +283,89 @@ int cmd_disasm(const char *path, const char *va_str, const char *count_str) {
     return 0;
 }
 
-int cmd_run(const char *venv_dir, const char *binary, std::span<char *const> args, std::span<char *const> env) {
+int cmd_run(const char *venv_dir, const char *binary, std::span<char *const> args, std::span<char *const> env,
+            bool apply_defaults, std::optional<std::uint32_t> signal_mask) {
     mm_venv venv;
     if (auto st = mm_venv_open(venv_dir, venv); st != mm_venv_status::ok) {
-        std::println(stderr, "error: {}", mm_venv_status_str(st));
+        std::println(stderr, "error: {}: {}", mm_venv_status_str(st), venv.manifest_error);
         return 1;
     }
 
-    const mm_launch_request req{.venv = &venv, .executable_path = binary, .argv = args, .env = env};
+    const mm_launch_request req{.venv = &venv, .executable_path = binary, .argv = args, .env = env,
+                                .apply_venv_env = apply_defaults, .initial_signal_mask = signal_mask};
     const mm_runtime_status st = mm_runtime_launch(req);
     std::println(stderr, "run: {}", mm_runtime_status_str(st));
     return st == mm_runtime_status::ok ? 0 : 1;
+}
+
+int cmd_audit(const char *venv_dir, const char *binary, std::span<char *const> env) {
+    mm_venv venv;
+    if (auto st = mm_venv_open(venv_dir, venv); st != mm_venv_status::ok) {
+        std::println(stderr, "error: {}: {}", mm_venv_status_str(st), venv.manifest_error); return 1;
+    }
+    mm_import_audit report;
+    const mm_launch_request request{.venv = &venv, .executable_path = binary, .env = env};
+    if (auto st = mm_runtime_audit(request, report); st != mm_runtime_status::ok) {
+        std::println(stderr, "audit: {}", mm_runtime_status_str(st)); return 1;
+    }
+    const auto field = [](std::string_view value) {
+        std::string result;
+        for (char c : value) {
+            switch (c) {
+            case '\\': result += "\\\\"; break;
+            case '\t': result += "\\t"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            default: result += c;
+            }
+        }
+        return result;
+    };
+    std::println("resolution\timage\tdependency\tsymbol\tbind\tweak\tprovider");
+    std::size_t missing = 0, generated = 0, weak = 0, missing_dylibs = 0;
+    for (const auto &entry : report.imports) {
+        const char *resolution;
+        switch (entry.resolution) {
+        case mm_import_resolution::guest: resolution = "guest"; break;
+        case mm_import_resolution::host: resolution = "host"; break;
+        case mm_import_resolution::resolver: resolution = "resolver"; ++generated; break;
+        case mm_import_resolution::own: resolution = "own"; break;
+        case mm_import_resolution::weak_missing: resolution = "weak-null"; ++weak; break;
+        default: resolution = "missing"; ++missing;
+        }
+        std::println("{}\t{}\t{}\t{}\t{}\t{}\t{}", resolution, field(entry.image), field(entry.dependency), field(entry.symbol),
+                     entry.lazy ? "lazy" : "nonlazy", entry.weak ? "yes" : "no", field(entry.provider));
+    }
+    for (const auto &entry : report.missing_dependencies) {
+        if (!entry.weak) ++missing_dylibs;
+        std::println("{}\t{}\t{}\t\t\t{}\t", entry.weak ? "weak-dylib" : "missing-dylib", field(entry.image), field(entry.dependency), entry.weak ? "yes" : "no");
+    }
+    std::println(stderr, "audit: {} guest images, {} host libraries, {} bind slots; {} missing imports, {} resolver results, {} weak-null, {} missing required dylibs",
+                 report.guest_images, report.host_libraries, report.imports.size(), missing, generated, weak, missing_dylibs);
+    std::println(stderr, "audit: guest initializers/main were not executed; resolver and host results do not prove API/ABI compatibility");
+    return missing || missing_dylibs ? 2 : 0;
+}
+
+int cmd_env(int argc, char **argv) {
+    mm_venv venv;
+    if (const auto status=mm_venv_open(argv[2], venv); status!=mm_venv_status::ok) {
+        std::println(stderr, "error: {}: {}", mm_venv_status_str(status), venv.manifest_error); return 1;
+    }
+    const std::string_view action=argc>3 ? argv[3] : "list";
+    if (action=="list" && argc<=4) {
+        mm_json::object settings;
+        for (const auto &[name, value] : venv.env) settings.emplace(name, value ? mm_json(*value) : mm_json{});
+        std::print("{}", mm_json_serialize(mm_json(std::move(settings)))); return 0;
+    }
+    mm_venv_status status;
+    if (action=="set" && argc==6) status=mm_venv_update_environment(venv, argv[4], std::string_view(argv[5]));
+    else if (action=="unset" && argc==5) status=mm_venv_update_environment(venv, argv[4], std::nullopt);
+    else if (action=="inherit" && argc==5) status=mm_venv_update_environment(venv, argv[4], std::nullopt, true);
+    else { std::println(stderr, "usage: machoman env <venv> [list|set NAME VALUE|unset NAME|inherit NAME]"); return 1; }
+    if (status!=mm_venv_status::ok) {
+        std::println(stderr, "error: {}: {}", mm_venv_status_str(status), venv.manifest_error); return 1;
+    }
+    return 0;
 }
 
 void usage(const char *argv0) {
@@ -290,9 +375,11 @@ void usage(const char *argv0) {
                  "usage:\n"
                  "  {0} inspect <arm64-macho-binary>\n"
                  "  {0} venv-init <venv-dir>\n"
+                 "  {0} env <venv-dir> [list|set NAME VALUE|unset NAME|inherit NAME]\n"
                  "  {0} install <venv-dir> <path-to-dmg>\n"
                  "  {0} translate [--stats] [--cache] <arm64-macho-binary>\n"
-                 "  {0} run [-e KEY=VALUE]... <venv-dir> <binary-within-venv> [args...]\n"
+                 "  {0} run [-e KEY=VALUE]... [--exact-env] [--argv0 NAME] <venv-dir> <binary-within-venv> [args...]\n"
+                 "  {0} audit [-e KEY=VALUE]... <venv-dir> <binary-within-venv>\n"
                  "  {0} disasm <arm64-macho-binary> <va> [count]\n\n"
                  "environment:\n"
                  "  -e KEY=VALUE   set a variable for the guest (-e KEY removes one)\n"
@@ -311,11 +398,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     const std::string_view cmd = argv[1];
+#if !defined(_WIN32)
+    if (cmd == "ipc-broker" && argc == 3) return mm_ipc::serve(argv[2]);
+#endif
 
     if (cmd == "inspect" && argc == 3)
         return cmd_inspect(argv[2]);
     if (cmd == "venv-init" && argc == 3)
         return cmd_venv_init(argv[2]);
+    if (cmd == "env" && argc >= 3) return cmd_env(argc, argv);
     if (cmd == "install" && argc == 4)
         return cmd_install(argv[2], argv[3], argv[0]);
     if (cmd == "translate") {
@@ -328,16 +419,37 @@ int main(int argc, char **argv) {
         }
         if (i == argc - 1) return cmd_translate(argv[i], stats, cache);
     }
-    if (cmd == "run") {
+    if (cmd == "run" || cmd == "audit") {
         /* `-e KEY=VALUE` assignments precede the venv; everything after the
          * binary belongs to the guest, options included. */
         std::vector<char *> env;
+        bool apply_defaults=true;
+        char *guest_argv0=nullptr;
+        std::optional<std::uint32_t> signal_mask;
         int i = 2;
-        for (; i + 1 < argc && std::string_view(argv[i]) == "-e"; i += 2)
-            env.push_back(argv[i + 1]);
-        if (argc - i >= 2)
-            return cmd_run(argv[i], argv[i + 1], std::span<char *const>(argv + i + 1, static_cast<std::size_t>(argc - i - 1)),
-                           std::span<char *const>(env));
+        while (i<argc) {
+            const std::string_view option(argv[i]);
+            if (option=="-e" && i+1<argc) { env.push_back(argv[i+1]); i+=2; }
+            else if (cmd=="run" && option=="--exact-env") { apply_defaults=false; ++i; }
+            else if (cmd=="run" && option=="--argv0" && i+1<argc) { guest_argv0=argv[i+1]; i+=2; }
+            else if (cmd=="run" && option=="--signal-mask" && i+1<argc) {
+                std::uint32_t mask;
+                const std::string_view value(argv[i+1]);
+                const auto parsed=std::from_chars(value.data(), value.data()+value.size(), mask);
+                if (parsed.ec!=std::errc{} || parsed.ptr!=value.data()+value.size()) {
+                    std::println(stderr, "error: invalid signal mask"); return 1;
+                }
+                signal_mask=mask; i+=2;
+            } else if (option=="--") { ++i; break; }
+            else break;
+        }
+        if (cmd == "audit" && argc - i == 2) return cmd_audit(argv[i], argv[i + 1], env);
+        if (cmd == "audit") { usage(argv[0]); return 1; }
+        if (argc - i >= 2) {
+            std::vector<char *> args(argv+i+1, argv+argc);
+            if (guest_argv0) args[0]=guest_argv0;
+            return cmd_run(argv[i], argv[i + 1], args, env, apply_defaults, signal_mask);
+        }
     }
     if (cmd == "disasm" && (argc == 4 || argc == 5))
         return cmd_disasm(argv[2], argv[3], argc == 5 ? argv[4] : nullptr);

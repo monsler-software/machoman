@@ -12,8 +12,10 @@
  * A host function that really returns two words writes the second one
  * itself, through mm_objc_return_words_hi.
  * AArch64 passes everything past x7 on the stack, so those words are
- * copied too: a host function of up to fourteen integer arguments then
- * gets all of them. CFStringGetBytes is one (its ninth argument is where
+ * copied too: a host function of up to fourteen word-sized integer arguments
+ * gets all of them. Named Darwin arm64 stack arguments have natural size and
+ * alignment: adapters with packed narrow arguments must read them using
+ * mm_darwin_arm64_stack_args. CFStringGetBytes takes words (its ninth is where
  * it writes the byte count), and a host function reading a stack slot the
  * guest never filled is the hardest kind of bug to see — it returns, and
  * the answer is garbage. Copying words the callee does not take is
@@ -31,6 +33,13 @@ mm_hostcall:
     mov  rbx, rdi              /* ctx */
     mov  r12, rsi              /* fn */
 
+    cmp qword ptr [rbx + 1048], 0
+    je .Larm_arguments
+    .irp n,0,1,2,3,4,5,6,7
+    movdqu xmm\n, [rbx + 384 + \n*16]
+    .endr
+    jmp .Larguments_loaded
+.Larm_arguments:
     movsd xmm0, qword ptr [rbx + 384 + 0*16]
     movsd xmm1, qword ptr [rbx + 384 + 1*16]
     movsd xmm2, qword ptr [rbx + 384 + 2*16]
@@ -39,6 +48,7 @@ mm_hostcall:
     movsd xmm5, qword ptr [rbx + 384 + 5*16]
     movsd xmm6, qword ptr [rbx + 384 + 6*16]
     movsd xmm7, qword ptr [rbx + 384 + 7*16]
+.Larguments_loaded:
 
     mov  rax, [rbx + 31*8]      /* guest sp: the arguments past x7 */
     push qword ptr [rax + 5*8]
@@ -60,12 +70,26 @@ mm_hostcall:
     add  rsp, 64
 
     mov  [rbx + 0*8], rax
+    cmp qword ptr [rbx + 1048], 0
+    je .Lreturn_integer_done
+    cmp qword ptr [rbx + 1312], 0
+    jne .Lnative_hi_override
+    mov [rbx + 912 + 2*8], rdx
+.Lnative_hi_override:
+    mov qword ptr [rbx + 1312], 0
+.Lreturn_integer_done:
 
     cmp  dword ptr [rbx + 904], 0 /* typed dispatcher already wrote FP results */
     je   .Lhost_fp_return
     mov  dword ptr [rbx + 904], 0
     jmp  .Lhost_return_done
 .Lhost_fp_return:
+    cmp qword ptr [rbx + 1048], 0
+    je .Larm_fp_return
+    movdqu [rbx + 384], xmm0
+    movdqu [rbx + 384 + 16], xmm1
+    jmp .Lhost_return_done
+.Larm_fp_return:
     movsd qword ptr [rbx + 384 + 0*16], xmm0
     movsd qword ptr [rbx + 384 + 1*16], xmm1
 .Lhost_return_done:

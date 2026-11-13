@@ -19,6 +19,12 @@ CommandBuffer::Impl::~Impl() {
     if (submitted && state != CommandBufferStatus::completed)
         vkWaitForFences(context->device, 1, &fence, VK_TRUE,
                         std::numeric_limits<std::uint64_t>::max());
+    for(auto frame:framebuffers) {
+        if(frame.framebuffer)vkDestroyFramebuffer(context->device,frame.framebuffer,nullptr);
+        if(frame.pass)vkDestroyRenderPass(context->device,frame.pass,nullptr);
+        if(frame.color)vkDestroyImageView(context->device,frame.color,nullptr);
+        if(frame.depth)vkDestroyImageView(context->device,frame.depth,nullptr);
+    }
     if (commands && fence && context->command_cache.size() < 32 &&
         vkResetCommandBuffer(commands, 0) == VK_SUCCESS &&
         vkResetFences(context->device, 1, &fence) == VK_SUCCESS &&

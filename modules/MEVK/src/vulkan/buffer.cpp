@@ -17,7 +17,7 @@ Buffer::Impl::~Impl() {
     }
     if (mapped) vkUnmapMemory(context->device, memory);
     if (buffer != VK_NULL_HANDLE) vkDestroyBuffer(context->device, buffer, nullptr);
-    if (memory != VK_NULL_HANDLE) vkFreeMemory(context->device, memory, nullptr);
+    if (memory != VK_NULL_HANDLE) {vkFreeMemory(context->device, memory, nullptr);context->allocated_bytes-=memory_bytes;}
 }
 
 Buffer::Buffer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -56,7 +56,7 @@ std::shared_ptr<Buffer> Context::create_buffer(std::uint64_t size, std::string& 
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.size = buffer->padded_size;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (!vk_check(vkCreateBuffer(impl_->device, &info, nullptr, &buffer->buffer),
                   "vkCreateBuffer", error)) return nullptr;
@@ -84,6 +84,7 @@ std::shared_ptr<Buffer> Context::create_buffer(std::uint64_t size, std::string& 
     allocation.memoryTypeIndex = memory_type;
     if (!vk_check(vkAllocateMemory(impl_->device, &allocation, nullptr, &buffer->memory),
                   "vkAllocateMemory", error)) return nullptr;
+    impl_->allocated_bytes+=buffer->memory_bytes;
     if (!vk_check(vkBindBufferMemory(impl_->device, buffer->buffer, buffer->memory, 0),
                   "vkBindBufferMemory", error)) return nullptr;
     if (!vk_check(vkMapMemory(impl_->device, buffer->memory, 0, VK_WHOLE_SIZE, 0, &buffer->mapped),

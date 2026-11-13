@@ -12,6 +12,7 @@
  * program that is only asking for a nicety. */
 #include "internal.h"
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
@@ -237,6 +238,20 @@ void free_darwin_addrinfo(darwin_addrinfo *list) {
 } // namespace
 
 extern "C" {
+
+/* The address bytes match, but AF_INET6 does not. Passing Darwin's 30 to
+ * libc yields -1/EAFNOSUPPORT even for a DNS name; callers that use a
+ * nonzero result to detect IP literals then misclassify it as IPv6. */
+int darwin_inet_pton(int, const char *, void *) DARWIN(inet_pton);
+int darwin_inet_pton(int family, const char *text, void *address) {
+    if (family != d_AF_INET && family != d_AF_INET6) { errno = EAFNOSUPPORT; return -1; }
+    return ::inet_pton(family_to_host(family), text, address);
+}
+const char *darwin_inet_ntop(int, const void *, char *, socklen_t) DARWIN(inet_ntop);
+const char *darwin_inet_ntop(int family, const void *address, char *text, socklen_t size) {
+    if (family != d_AF_INET && family != d_AF_INET6) { errno = EAFNOSUPPORT; return nullptr; }
+    return ::inet_ntop(family_to_host(family), address, text, size);
+}
 
 int darwin_getaddrinfo(const char *name, const char *service, const darwin_addrinfo *hints,
                        darwin_addrinfo **result) DARWIN(getaddrinfo);

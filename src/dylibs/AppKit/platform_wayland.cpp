@@ -14,6 +14,7 @@
 #include "xdg-foreign-v2-client-protocol.h"
 #endif
 #include "platform_events.h"
+#include "clipboard_wayland.h"
 #include "app_icon.h"
 #include "native_menu.h"
 #include "metal_presentation.h"
@@ -134,6 +135,8 @@ namespace {
 /* ---- the connection ------------------------------------------------------ */
 
 struct display_state {
+    wayland_clipboard clipboard;
+    std::recursive_mutex event_mu;
     wl_display *display = nullptr;
     wl_registry *registry = nullptr;
     wl_compositor *compositor = nullptr;
@@ -275,6 +278,7 @@ void pointer_motion(void *, wl_pointer *, std::uint32_t, wl_fixed_t x, wl_fixed_
 }
 void pointer_button(void *, wl_pointer *, std::uint32_t serial, std::uint32_t, std::uint32_t button, std::uint32_t pressed) {
     display_state &s = state();
+    if (pressed) s.clipboard.input(serial);
     /* linux/input-event-codes.h: BTN_LEFT 0x110, BTN_RIGHT 0x111, BTN_MIDDLE 0x112 */
     const int index = button == 0x111 ? 1 : button == 0x112 ? 2 : 0;
     platform_event e;
@@ -339,9 +343,10 @@ void keyboard_keymap(void *, wl_keyboard *, std::uint32_t format, std::int32_t f
     }
     close(fd);
 }
-void keyboard_enter(void *, wl_keyboard *, std::uint32_t, wl_surface *surface, wl_array *) {
+void keyboard_enter(void *, wl_keyboard *, std::uint32_t serial, wl_surface *surface, wl_array *) {
     display_state &s = state();
     s.keyboard_window = window_of_surface(surface);
+    s.clipboard.input(serial);
     platform_event e;
     e.kind = event_kind::focus_in;
     e.window = s.keyboard_window;
@@ -352,10 +357,12 @@ void keyboard_leave(void *, wl_keyboard *, std::uint32_t, wl_surface *surface) {
     e.kind = event_kind::focus_out;
     e.window = window_of_surface(surface);
     state().keyboard_window = nullptr;
+    state().clipboard.unfocus();
     push(e);
 }
 void keyboard_key(void *, wl_keyboard *, std::uint32_t serial, std::uint32_t, std::uint32_t key, std::uint32_t pressed) {
     display_state &s = state();
+    if (pressed) s.clipboard.input(serial);
     const std::uint32_t code = key + 8; /* evdev -> xkb */
     platform_event e;
     e.kind = pressed ? event_kind::key_down : event_kind::key_up;
@@ -465,6 +472,7 @@ const xdg_toplevel_icon_manager_v1_listener icon_listener = {icon_size, icon_don
 
 void registry_global(void *, wl_registry *registry, std::uint32_t name, const char *interface, std::uint32_t version) {
     display_state &s = state();
+    s.clipboard.global(registry, name, interface, version);
     const std::string_view i(interface);
     if (i == wl_compositor_interface.name)
         s.compositor = static_cast<wl_compositor *>(wl_registry_bind(registry, name, &wl_compositor_interface, std::min(version, 4u)));
@@ -746,8 +754,9 @@ bool init_egl(display_state &s) {
 
 bool connect() {
     display_state &s = state();
-    if (s.display) return true;
+    std::lock_guard lock(s.event_mu);
     if (s.failed) return false;
+    if (s.display) return true;
     if (std::getenv("MACHOMAN_APPKIT_HEADLESS")) { s.failed = true; return false; }
 
     s.display = wl_display_connect(nullptr);
@@ -756,6 +765,7 @@ bool connect() {
     s.registry = wl_display_get_registry(s.display);
     wl_registry_add_listener(s.registry, &registry_listener, nullptr);
     wl_display_roundtrip(s.display); /* globals */
+    s.clipboard.setup(s.display, s.seat);
     wl_display_roundtrip(s.display); /* seat capabilities, output mode */
 
     if (!s.compositor || !s.wm_base) {
@@ -779,6 +789,21 @@ bool connect() {
 id platform_window_owner(platform_window *w) { return w ? w->owner : nullptr; }
 
 bool platform::available() { return connect(); }
+
+clipboard_snapshot platform::clipboard_types() {
+    auto &s = state(); std::lock_guard lock(s.event_mu);
+    if (!connect()) return {};
+    dispatch_wayland(s.display, 0);
+    return s.clipboard.snapshot();
+}
+bool platform::clipboard_read(const std::string &type, std::string &bytes) {
+    auto &s = state(); std::lock_guard lock(s.event_mu);
+    return connect() && s.clipboard.read(type, bytes);
+}
+void platform::clipboard_write(const clipboard_data &data) {
+    auto &s = state(); std::lock_guard lock(s.event_mu);
+    if (connect()) s.clipboard.write(data);
+}
 
 platform_window *platform::create_window(id ns_window, rect frame, const std::string &title, bool decorated, bool resizable,
                                           platform_window *popup_parent, rect popup_anchor, std::uint32_t popup_serial) {
@@ -1182,6 +1207,7 @@ bool platform::present_metal(platform_window *w, const void *layer, rect frame,
 
 bool platform::next_event(platform_event &out, double timeout_seconds) {
     display_state &s = state();
+    std::lock_guard event_lock(s.event_mu);
     if (!s.display) {
         if (timeout_seconds > 0) usleep(static_cast<unsigned>(timeout_seconds * 1e6));
         return false;
@@ -1191,16 +1217,10 @@ bool platform::next_event(platform_event &out, double timeout_seconds) {
         std::lock_guard lock(s.queue_mu);
         queued = !s.queue.empty();
     }
-    /* Wayland's read cycle: prepare, poll, read, dispatch. */
-    while (wl_display_prepare_read(s.display) != 0) wl_display_dispatch_pending(s.display);
-    wl_display_flush(s.display);
-    pollfd pfd{wl_display_get_fd(s.display), POLLIN, 0};
     /* Service protocol traffic (including compositor pings) even when
      * input is buffered; a slow guest redraw can otherwise starve it. */
     const int ms = queued ? 0 : timeout_seconds < 0 ? -1 : static_cast<int>(timeout_seconds * 1000);
-    if (poll(&pfd, 1, ms) > 0 && (pfd.revents & POLLIN)) wl_display_read_events(s.display);
-    else wl_display_cancel_read(s.display);
-    wl_display_dispatch_pending(s.display);
+    dispatch_wayland(s.display, ms);
     check_protocol_error();
 
     { std::lock_guard lock(s.surface_mu);
@@ -1234,6 +1254,10 @@ double platform::screen_refresh() { connect(); return state().refresh.load(); }
 void *platform::create_gl_context(platform_window *, void *share) {
     if (!connect()) return nullptr;
     display_state &s = state();
+    // EGL's selected client API belongs to the calling thread. connect()
+    // may have initialized the display on a different thread; new threads
+    // otherwise default to OpenGL ES, which does not match our GL config.
+    if (!eglBindAPI(EGL_OPENGL_API)) return nullptr;
     /* An app built against legacy OpenGL (which Live uses, relying on glBegin/glMatrixMode)
      * needs a compatibility / default context. */
     EGLContext ctx = eglCreateContext(s.egl_display, s.egl_config,
@@ -1250,6 +1274,10 @@ void *platform::create_gl_context(platform_window *, void *share) {
         ctx = eglCreateContext(s.egl_display, s.egl_config,
                                share ? static_cast<EGLContext>(share) : EGL_NO_CONTEXT, attribs);
     }
+    if (ctx == EGL_NO_CONTEXT) {
+        std::fprintf(stderr, "AppKit: eglCreateContext failed: error=0x%x display=%p config=%p api=0x%x\n",
+                     eglGetError(), s.egl_display, s.egl_config, eglQueryAPI());
+    }
     return ctx == EGL_NO_CONTEXT ? nullptr : ctx;
 }
 
@@ -1260,6 +1288,7 @@ void platform::destroy_gl_context(void *ctx) {
 bool platform::make_current(void *ctx, platform_window *w) {
     display_state &s = state();
     if (!s.display) return false;
+    if (!eglBindAPI(EGL_OPENGL_API)) return false;
     if (!ctx) return eglMakeCurrent(s.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (w) ensure_egl_surface(w);
 #ifdef MM_APPKIT_EVILCOCOA
@@ -1273,8 +1302,9 @@ bool platform::make_current(void *ctx, platform_window *w) {
 void platform::present_cocoa(platform_window *w, const std::vector<evilcocoa::item> &items) {
     auto &s = state();
     if (!w || !s.display || w->guest_gl || !w->metal_layers.empty() || !w->visible) return;
+    if (!eglBindAPI(EGL_OPENGL_API)) return;
     const int width = std::max(1, int(w->frame.w)), height = std::max(1, int(w->frame.h));
-    if (w->cocoa_renderer && w->cocoa_items == items && w->cocoa_width == width && w->cocoa_height == height) return;
+    if (w->cocoa_renderer && !w->cocoa_renderer->animating() && w->cocoa_items == items && w->cocoa_width == width && w->cocoa_height == height) return;
     if (!ensure_egl_surface(w)) return;
     const auto previous = eglGetCurrentContext();
     const auto draw = eglGetCurrentSurface(EGL_DRAW), read = eglGetCurrentSurface(EGL_READ);

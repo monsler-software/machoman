@@ -56,7 +56,11 @@ static void appkit_ctor() __attribute__((constructor));
 static void appkit_ctor() {
     ak::set_api(mm_objc_host_api());
     ak::register_responder();
+    ak::register_pasteboard();
     ak::register_views();
+    ak::register_text_view();
+    ak::register_stack_view();
+    ak::register_webview();
     ak::register_application();
     ak::register_file_panels();
     ak::register_window_controller();

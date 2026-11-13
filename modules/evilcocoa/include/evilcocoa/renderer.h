@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -41,6 +42,7 @@ struct item {
     kind type = kind::label;
     rect frame, clip;
     std::string text, placeholder, font_family="Sans";
+    std::optional<std::array<float,4>> text_color;
     double font_size = 13, value = 0, knob = .25;
     alignment align = alignment::left;
     image_scaling scaling = image_scaling::fit;
@@ -64,6 +66,7 @@ class renderer {
     renderer(const renderer &) = delete;
     renderer &operator=(const renderer &) = delete;
     void draw(std::span<const item> items, int width, int height, double scale = 1);
+    bool animating() const;
 };
 } // namespace evilcocoa
 #endif

@@ -12,6 +12,7 @@ endif()
 
 add_library(machoman_core STATIC
     src/common/macho.cpp
+    src/common/json.cpp
     src/venv/venv.cpp
     src/venv/install.cpp
     src/translator/arm64_decoder.cpp
@@ -24,8 +25,10 @@ add_library(machoman_core STATIC
     src/translator/translator_simd_half.cpp
     src/translator/translator_fp.cpp
     src/runtime/loader.cpp
+    src/runtime/environment.cpp
     src/runtime/translation_cache.cpp
     src/runtime/hostcall_x86_64.S
+    src/runtime/native_x86_64.S
     src/runtime/syscall_table.cpp
 )
 target_include_directories(machoman_core PUBLIC include)
@@ -41,6 +44,15 @@ add_executable(machoman src/cli/main.cpp)
 target_link_libraries(machoman PRIVATE machoman_core)
 find_package(Threads REQUIRED)
 target_link_libraries(machoman_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+if(NOT WIN32)
+    add_library(machoman_ipc STATIC src/ipc/kernel.cpp src/ipc/transport.cpp)
+    target_include_directories(machoman_ipc PUBLIC include)
+    target_link_libraries(machoman_ipc PUBLIC Threads::Threads)
+    target_compile_options(machoman_ipc PRIVATE -Wall -Wextra -Wconversion)
+    set_target_properties(machoman_ipc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(machoman PRIVATE machoman_ipc)
+endif()
 
 enable_testing()
 
@@ -70,8 +82,23 @@ endif()
 # Host dylibs: real shared objects the runtime dlopen()s in place of Darwin
 # libraries, laid out like a macOS root under build/dylibs/.
 if(NOT WIN32)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/modules/libresolv/ns_name.c")
+        add_subdirectory(src/dylibs/libresolv)
+    endif()
     add_library(libSystem SHARED src/dylibs/libSystem/libSystem.cpp src/dylibs/libSystem/filesystem.cpp src/dylibs/libSystem/stdio.cpp src/dylibs/libSystem/xlocale.cpp src/dylibs/libSystem/callbacks.cpp src/dylibs/libSystem/kqueue.cpp src/dylibs/libSystem/commoncrypto.cpp src/dylibs/libSystem/malloc_zone.cpp src/dylibs/libSystem/socket.cpp)
-    target_link_libraries(libSystem PRIVATE machoman_core)
+    target_link_libraries(libSystem PRIVATE machoman_core machoman_ipc)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/ulock.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/xattr.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/uuid.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/passwd.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/sysinfo.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/proc_info.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/mach_ports.cpp src/dylibs/libSystem/mach_tasks.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/mach_messages.cpp src/dylibs/libSystem/mach_bootstrap.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/mach_memory.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/mach_host.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/processes.cpp src/dylibs/libSystem/shared_memory.cpp)
+    target_sources(libSystem PRIVATE src/dylibs/libSystem/environment.cpp)
     target_compile_options(libSystem PRIVATE -Wall -Wextra -fvisibility=hidden)
     set_target_properties(libSystem PROPERTIES
         PREFIX "" OUTPUT_NAME "libSystem.B.dylib" SUFFIX ".so"
@@ -87,11 +114,16 @@ if(NOT WIN32)
     # os_log handles participate in Objective-C reference counting.
     target_link_libraries(libSystem PRIVATE libobjc)
 
+    add_subdirectory(src/dylibs/swiftCore)
+
     # CoreFoundation + Foundation: one object, since the types are the same
     # (toll-free bridging) and both frameworks' install names point at it.
     add_library(Foundation SHARED
-        src/dylibs/Foundation/strings.cpp src/dylibs/Foundation/collections.cpp
+        src/dylibs/Foundation/strings.cpp src/dylibs/Foundation/collections.cpp src/dylibs/Foundation/index_set.cpp
         src/dylibs/Foundation/plists.cpp src/dylibs/Foundation/misc.cpp src/dylibs/Foundation/task.cpp src/dylibs/Foundation/dispatch.cpp
+        src/dylibs/Foundation/dispatch_data.cpp
+        src/dylibs/Foundation/cookies.cpp
+        src/dylibs/Foundation/url_request.cpp
         src/dylibs/Foundation/key_value.cpp src/dylibs/Foundation/threading.cpp
         src/dylibs/Foundation/geometry.cpp
         src/dylibs/Foundation/formatting.cpp
@@ -108,6 +140,12 @@ if(NOT WIN32)
         COMMAND ${CMAKE_COMMAND} -E create_symlink
             "../../../CoreFoundation.framework/Versions/A/CoreFoundation.so"
             "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation.so")
+    # New SDKs bind NSURLRequest through CFNetwork's re-export.
+    add_custom_command(TARGET Foundation POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CFNetwork.framework/Versions/A"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+            "../../../CoreFoundation.framework/Versions/A/CoreFoundation.so"
+            "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CFNetwork.framework/Versions/A/CFNetwork.so")
 
     if(TARGET mevk)
         add_subdirectory(modules/MEVK/src/metal)
@@ -119,6 +157,10 @@ if(NOT WIN32)
         src/dylibs/AppKit/appkit_main.cpp src/dylibs/AppKit/responder.cpp
         src/dylibs/AppKit/views.cpp src/dylibs/AppKit/controls.cpp src/dylibs/AppKit/application.cpp src/dylibs/AppKit/opengl.cpp
         src/dylibs/AppKit/layers.cpp
+        src/dylibs/AppKit/text_view.cpp
+        src/dylibs/AppKit/stack_view.cpp
+        src/dylibs/AppKit/webview.cpp
+        src/dylibs/AppKit/pasteboard.cpp
         src/dylibs/AppKit/bitmap_drawing.cpp
         src/dylibs/AppKit/app_icon.cpp
         src/dylibs/AppKit/icon_image.cpp
@@ -148,8 +190,18 @@ if(NOT WIN32)
         add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-shell-protocol.c"
             COMMAND ${MM_WAYLAND_SCANNER} private-code "${MM_XDG_XML}" "${MM_XDG_DIR}/xdg-shell-protocol.c"
             DEPENDS "${MM_XDG_XML}" VERBATIM)
-        list(APPEND MM_APPKIT_SOURCES src/dylibs/AppKit/platform_wayland.cpp
+        list(APPEND MM_APPKIT_SOURCES src/dylibs/AppKit/platform_wayland.cpp src/dylibs/AppKit/clipboard_wayland.cpp
              "${MM_XDG_DIR}/xdg-shell-protocol.c" "${MM_XDG_DIR}/xdg-shell-client-protocol.h")
+        set(MM_DATA_CONTROL_XML "${MM_WAYLAND_PROTOCOLS}/staging/ext-data-control/ext-data-control-v1.xml")
+        if(EXISTS "${MM_DATA_CONTROL_XML}")
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/ext-data-control-v1-client-protocol.h"
+                COMMAND ${MM_WAYLAND_SCANNER} client-header "${MM_DATA_CONTROL_XML}" "${MM_XDG_DIR}/ext-data-control-v1-client-protocol.h"
+                DEPENDS "${MM_DATA_CONTROL_XML}" VERBATIM)
+            add_custom_command(OUTPUT "${MM_XDG_DIR}/ext-data-control-v1-protocol.c"
+                COMMAND ${MM_WAYLAND_SCANNER} private-code "${MM_DATA_CONTROL_XML}" "${MM_XDG_DIR}/ext-data-control-v1-protocol.c"
+                DEPENDS "${MM_DATA_CONTROL_XML}" VERBATIM)
+            list(APPEND MM_APPKIT_SOURCES "${MM_XDG_DIR}/ext-data-control-v1-client-protocol.h" "${MM_XDG_DIR}/ext-data-control-v1-protocol.c")
+        endif()
         set(MM_FOREIGN_XML "${MM_WAYLAND_PROTOCOLS}/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml")
         if(EXISTS "${MM_FOREIGN_XML}")
             add_custom_command(OUTPUT "${MM_XDG_DIR}/xdg-foreign-v2-client-protocol.h"
@@ -176,6 +228,9 @@ if(NOT WIN32)
     endif()
     list(APPEND MM_APPKIT_SOURCES src/dylibs/symbol-synthesis/synthesise.cpp)
     add_library(AppKit SHARED ${MM_APPKIT_SOURCES})
+    if(MM_WAYLAND_FOUND AND EXISTS "${MM_DATA_CONTROL_XML}")
+        target_compile_definitions(AppKit PRIVATE MM_APPKIT_DATA_CONTROL=1)
+    endif()
     if(MM_GIO_FOUND)
         target_link_libraries(AppKit PRIVATE PkgConfig::MM_GIO)
         target_compile_definitions(AppKit PRIVATE MM_APPKIT_GIO=1)
@@ -231,6 +286,8 @@ if(NOT WIN32)
         set_property(TARGET AppKit APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:MEVK_Metal>")
         set_property(TARGET AppKit APPEND PROPERTY INSTALL_RPATH "$<TARGET_FILE_DIR:MEVK_Metal>")
     endif()
+
+    add_subdirectory(modules/WebKit)
 
     # Quartz re-exports AppKit, including NSApplicationMain.
     add_custom_command(TARGET AppKit POST_BUILD
@@ -342,9 +399,13 @@ if(NOT WIN32)
         AVFoundation:A CoreMedia:A VideoToolbox:A
         CoreGraphics:A Metal:A MetalKit:A GameController:A WebKit:A
         Security:A SystemConfiguration:A DiskArbitration:A IOKit:A
-        UniformTypeIdentifiers:A ImageIO:A)
+        UniformTypeIdentifiers:A ImageIO:A CoreML:A UserNotifications:A
+        ServiceManagement:A CoreHaptics:A ForceFeedback:A IOSurface:A Contacts:A)
     if(TARGET MEVK_Metal)
         list(REMOVE_ITEM MM_STUB_FRAMEWORKS Metal:A CoreGraphics:A)
+    endif()
+    if(TARGET WebKit)
+        list(REMOVE_ITEM MM_STUB_FRAMEWORKS WebKit:A)
     endif()
     set(MM_STUB_COMMANDS)
     foreach(entry IN LISTS MM_STUB_FRAMEWORKS)
@@ -399,6 +460,13 @@ if(NOT WIN32)
             COMMENT "Installing guest C++ runtimes into dylibs/usr/lib")
     else()
         message(WARNING "Guest C++ runtimes not built yet: run scripts/build-guest-runtimes.sh (needs a macOS SDK under third_party/sdk)")
+    endif()
+    set(MM_GUEST_X86_RT "${CMAKE_SOURCE_DIR}/third_party/guest-runtimes/x86_64/install/lib")
+    if(EXISTS "${MM_GUEST_X86_RT}/libc++.1.dylib")
+        add_custom_target(guest_runtimes_x86_64 ALL
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dylibs/x86_64/usr/lib"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory "${MM_GUEST_X86_RT}" "${CMAKE_BINARY_DIR}/dylibs/x86_64/usr/lib"
+            COMMENT "Installing native x86_64 guest C++ runtimes")
     endif()
 endif()
 

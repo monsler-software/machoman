@@ -9,6 +9,7 @@
  *   guest NSString subclasses, reached through -length/-getCharacters:range:
  * Every method reads characters through string_chars(). */
 #include "foundation.h"
+#include "machoman/guest_args.h"
 
 #include <algorithm>
 #include <cmath>
@@ -335,12 +336,13 @@ string_object *mutable_of(id s, const char *what) {
     return o;
 }
 
-/* ---- formatting (%@ and friends), arguments from the guest's stack ---- */
+/* ---- formatting (%@ and friends), Darwin anonymous arguments ---- */
 
-struct guest_args {
-    std::uint64_t p;
-    std::uint64_t u64() { std::uint64_t v; std::memcpy(&v, reinterpret_cast<const void *>(p), 8); p += 8; return v; }
-    double f64() { std::uint64_t v = u64(); double d; std::memcpy(&d, &v, 8); return d; }
+struct guest_args : mm_darwin_va_list {
+    explicit guest_args(std::uint64_t va) : mm_darwin_va_list(va, api()->current_context()) {}
+    explicit guest_args(const mm_darwin_va_list &a) : mm_darwin_va_list(a) {}
+    std::uint64_t u64() { return next_u64(); }
+    double f64() { return next_double(); }
 };
 
 std::u16string format_guest(std::u16string_view fmt, guest_args &a) {
@@ -401,7 +403,10 @@ std::u16string format_guest(std::u16string_view fmt, guest_args &a) {
             break;
         }
         case u'f': case u'F': case u'e': case u'E': case u'g': case u'G': case u'a': case u'A':
-            std::snprintf(buf, sizeof buf, (spec + static_cast<char>(conv)).c_str(), a.f64());
+            if (len == 2)
+                std::snprintf(buf, sizeof buf, (spec + "L" + static_cast<char>(conv)).c_str(), a.next_long_double());
+            else
+                std::snprintf(buf, sizeof buf, (spec + static_cast<char>(conv)).c_str(), a.f64());
             out += to_utf16(buf);
             break;
         case u'c': out.push_back(static_cast<char16_t>(a.u64() & 0xFF)); break;
@@ -424,10 +429,9 @@ std::u16string format_guest(std::u16string_view fmt, guest_args &a) {
     return out;
 }
 
-/* The anonymous arguments of an objc method call start at the guest SP. */
-guest_args args_after_registers() {
-    const mm_cpu_context *ctx = api()->current_context();
-    return {ctx ? ctx->x[31] : 0};
+/* self/selector/format, or allocator/options/format for CFString. */
+guest_args args_after_registers(unsigned named_integer_args = 3) {
+    return guest_args(mm_darwin_va_list::at_call_site(api()->current_context(), named_integer_args));
 }
 
 /* ---- comparison helpers -------------------------------------------------- */
@@ -796,7 +800,7 @@ std::uint64_t m_initWithFormatArguments(id self, SEL, id fmt, std::uint64_t va) 
     return ret(self);
 }
 std::uint64_t m_initWithFormatLocale(id self, SEL, id fmt, id) {
-    guest_args a = args_after_registers();
+    guest_args a = args_after_registers(4);
     init_target(self)->chars = format_guest(view(fmt), a);
     return ret(self);
 }
@@ -871,6 +875,15 @@ std::string describe(id o) {
     if (!d) return "(null)";
     if (is_string(d)) return to_utf8(d);
     return reinterpret_cast<const char *>(d); /* NSObject's C-string fallback */
+}
+
+std::string format_call_arguments(id fmt, unsigned named_integer_args) {
+    guest_args args = args_after_registers(named_integer_args);
+    return utf16_to_utf8(format_guest(view(fmt), args));
+}
+std::string format_va_arguments(id fmt, std::uint64_t va) {
+    guest_args args(va);
+    return utf16_to_utf8(format_guest(view(fmt), args));
 }
 
 void register_strings() {

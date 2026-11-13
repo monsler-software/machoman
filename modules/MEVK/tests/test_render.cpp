@@ -81,7 +81,7 @@ int main(int argc,char** argv) {
     check(sampled->replace(0,0,2,2,image,12,error),error);
     auto uploaded=read(sampled);check(uploaded.size()==16&&uploaded[0]==255&&uploaded[10]==255,"strided texture upload/readback");
     mevk::RenderBindings textured;textured.buffers[0]=bytes(*context,vertices,sizeof vertices);
-    textured.buffers[1]=bytes(*context,viewport,sizeof viewport);textured.textures[16]=sampled;
+    textured.buffers[1]=bytes(*context,viewport,sizeof viewport);textured.textures[32]=sampled;
     auto texture_pipeline=pipeline(*context,shaders,"TextureVertexShader","TextureFragmentShader");
     render(*context,target,texture_pipeline,textured);auto pixels=read(target);
     for(unsigned y=8;y<32;++y)for(unsigned x=8;x<32;++x) {

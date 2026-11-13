@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A wine-like compatibility layer for running macOS arm64 binaries on x86_64 Windows/Linux hosts. C++26 + CMake, no external dependencies. Mach-O parsing (incl. fat binaries), the venv layout, an AOT translator covering integer A64 + AdvSIMD integer and FP (99.8% of Ableton Live's `__text`; `machoman translate --stats <bin>` shows the rest), and a runtime that links guest images against both host shared objects (libSystem, libobjc) and real arm64 Mach-O dylibs (LLVM libc++/libc++abi/libunwind cross-built as guest code, an app bundle's own dylibs). `rg` and C++ programs with exceptions run end to end; Ableton Live runs its static initializers, `main`, NSApplication startup, its embedded Python and licensing, loads `MainMenu.nib` (its application delegate comes from there), talks to its extension host over a Unix socket, builds its view tree, creates its NSWindow and is inside `InitApplication`.
+A wine-like compatibility layer for running macOS arm64 binaries on x86_64 Windows/Linux hosts. C++26 + CMake, no external dependencies. Mach-O parsing (incl. fat binaries), the venv layout, an AOT translator covering integer A64 + AdvSIMD integer and FP (99.8% of Ableton Live's `__text`; `machoman translate --stats <bin>` shows the rest), and a runtime that links guest images against both host shared objects (libSystem, libobjc) and real arm64 Mach-O dylibs (LLVM libc++/libc++abi/libunwind cross-built as guest code, an app bundle's own dylibs). `rg` and C++ programs with exceptions run end to end;
 
 ## Build / test
 

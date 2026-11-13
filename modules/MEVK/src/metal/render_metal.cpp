@@ -653,7 +653,7 @@ std::uint64_t new_pipeline(id self, SEL, id descriptor, id *error) {
     for (std::size_t i = 1; i < colors->values.size(); ++i)
       if (as<PipelineColor>(colors->values[i].value)->format)
         extra = true;
-    if (extra || d->samples != 1 || (d->depth_format&&d->depth_format!=250&&d->depth_format!=252) || d->stencil_format ||
+    if (extra || d->samples != 1 || (d->depth_format&&d->depth_format!=250&&d->depth_format!=252&&d->depth_format!=260) || d->stencil_format ||
         color->format > UINT32_MAX ||
         color->src_rgb > 10 || color->dst_rgb > 10 || color->src_alpha > 10 ||
         color->dst_alpha > 10 || color->op_rgb > 4 || color->op_alpha > 4 ||

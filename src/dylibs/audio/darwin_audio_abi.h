@@ -9,8 +9,11 @@ using status = std::int32_t;
 constexpr std::uint32_t fourcc(char a, char b, char c, char d) {
     return (std::uint32_t(a) << 24) | (std::uint32_t(b) << 16) | (std::uint32_t(c) << 8) | std::uint32_t(d);
 }
+constexpr std::uint32_t tag(const char (&s)[5]) { return fourcc(s[0], s[1], s[2], s[3]); }
 inline constexpr status ok = 0, bad_size = fourcc('!', 's', 'i', 'z'),
-    illegal_operation = fourcc('n', 'o', 'p', 'e'), unsupported_format = fourcc('!', 'd', 'a', 't');
+    illegal_operation = fourcc('n', 'o', 'p', 'e'), unsupported_format = fourcc('!', 'd', 'a', 't'),
+    bad_object = fourcc('!', 'o', 'b', 'j'), bad_device = fourcc('!', 'd', 'e', 'v'),
+    unknown_property = fourcc('w', 'h', 'o', '?'), bad_parameter = -50;
 inline constexpr std::uint32_t linear_pcm = fourcc('l', 'p', 'c', 'm');
 inline constexpr std::uint32_t format_float = 1, format_big_endian = 2, format_signed_integer = 4,
     format_packed = 8, format_aligned_high = 16, format_non_interleaved = 32;
@@ -38,6 +41,7 @@ struct timestamp {
     std::uint32_t flags, reserved;
 };
 struct value_range { double minimum, maximum; };
+struct ranged_description { stream_description format; value_range sample_rate_range; };
 struct component_description { std::uint32_t type, subtype, manufacturer, flags, flags_mask; };
 struct render_callback { std::uint64_t function, refcon; };
 

@@ -22,6 +22,7 @@ FND_CLASS(NSSet); FND_CLASS(NSMutableSet); FND_CLASS(__NSSetM);
 FND_CLASS(NSData); FND_CLASS(NSMutableData); FND_CLASS(__NSDataM);
 FND_CLASS(NSValue); FND_CLASS(NSNumber); FND_CLASS(__NSCFNumber); FND_CLASS(__NSCFBoolean); FND_CLASS(NSConstantIntegerNumber);
 FND_CLASS(NSNull);
+FND_CLASS(NSConstantDictionary);
 FND_CLASS(NSConstantDoubleNumber);
 FND_CLASS(NSEnumerator);
 
@@ -95,7 +96,26 @@ array_object *arr(id a) {
     }
     return storage.get();
 }
-dict_object *dict(id d) { return as<dict_object>(d); }
+/* Recent Clang emits dictionary literals as isa, flags, count, keys,
+ * values. Adapt their immutable image storage just like NSConstantArray. */
+struct constant_dictionary { mm_objc_object base; std::uint64_t flags, count; id const *keys; id const *values; };
+dict_object *dict(id d) {
+    if (mm_objc_object_class(d) != FND_CLASS_REF(NSConstantDictionary)) return as<dict_object>(d);
+    static std::mutex mutex;
+    static std::unordered_map<id, std::unique_ptr<dict_object>> cache;
+    std::lock_guard lock(mutex);
+    auto &storage = cache[d];
+    if (!storage) {
+        auto *constant = as<constant_dictionary>(d);
+        storage = std::make_unique<dict_object>();
+        storage->base.isa = g_dict;
+        for (std::uint64_t i = 0; i < constant->count; ++i) {
+            storage->map.emplace(constant->keys[i], constant->values[i]);
+            storage->order.push_back(constant->keys[i]);
+        }
+    }
+    return storage.get();
+}
 
 template <typename T> T *mutable_of(id o, const char *what) {
     auto *t = as<T>(o);
@@ -637,7 +657,24 @@ std::uint64_t mn_increaseLengthBy(id self, SEL, std::uint64_t n) { auto &s = mut
 
 /* ---- NSNumber / NSValue ------------------------------------------------------ */
 
-number_object *num(id n) { return as<number_object>(n); }
+/* Integer literals store a pointer to the Objective-C type encoding,
+ * whereas dynamically allocated NSNumbers store the type byte inline. */
+struct constant_integer { mm_objc_object base; const char *type; std::uint64_t value; };
+number_object *num(id n) {
+    if (mm_objc_object_class(n) != FND_CLASS_REF(NSConstantIntegerNumber)) return as<number_object>(n);
+    static std::mutex mutex;
+    static std::unordered_map<id, std::unique_ptr<number_object>> cache;
+    std::lock_guard lock(mutex);
+    auto &storage = cache[n];
+    if (!storage) {
+        auto *constant = as<constant_integer>(n);
+        storage = std::make_unique<number_object>();
+        storage->base.isa = g_number;
+        storage->type = *constant->type;
+        storage->v.u = constant->value;
+    }
+    return storage.get();
+}
 bool num_is_float(number_object *n) { return n->type == 'f' || n->type == 'd'; }
 double num_double(number_object *n) { if (num_is_float(n)) return n->v.d; if (n->type == 'Q' || n->type == 'L' || n->type == 'I' || n->type == 'S' || n->type == 'C') return static_cast<double>(n->v.u); return static_cast<double>(n->v.i); }
 std::int64_t num_int(number_object *n) { if (num_is_float(n)) return static_cast<std::int64_t>(n->v.d); return n->v.i; }
@@ -932,6 +969,7 @@ void register_collections() {
     g_dict = mm_objc_define_class("NSDictionary", nsobject, sizeof(mm_objc_object), FND_CLASS_REF(NSDictionary), FND_META_REF(NSDictionary));
     g_mdict = mm_objc_define_class("NSMutableDictionary", g_dict, sizeof(mm_objc_object), FND_CLASS_REF(NSMutableDictionary), FND_META_REF(NSMutableDictionary));
     g_cdict = mm_objc_define_class("__NSDictionaryM", g_mdict, sizeof(dict_object), FND_CLASS_REF(__NSDictionaryM), FND_META_REF(__NSDictionaryM));
+    mm_objc_define_class("NSConstantDictionary", g_dict, sizeof(constant_dictionary), FND_CLASS_REF(NSConstantDictionary), FND_META_REF(NSConstantDictionary));
     register_lifecycle<dict_dtor>(g_cdict);
     register_cluster<dict_dtor>(g_dict, g_cdict, false);
     register_cluster<dict_dtor>(g_mdict, g_cdict, true);
@@ -1105,7 +1143,7 @@ void register_collections() {
     g_number = mm_objc_define_class("NSNumber", g_value, sizeof(number_object), FND_CLASS_REF(NSNumber), FND_META_REF(NSNumber));
     g_cnumber = mm_objc_define_class("__NSCFNumber", g_number, sizeof(number_object), FND_CLASS_REF(__NSCFNumber), FND_META_REF(__NSCFNumber));
     g_boolean = mm_objc_define_class("__NSCFBoolean", g_cnumber, sizeof(number_object), FND_CLASS_REF(__NSCFBoolean), FND_META_REF(__NSCFBoolean));
-    mm_objc_define_class("NSConstantIntegerNumber", g_cnumber, sizeof(number_object), FND_CLASS_REF(NSConstantIntegerNumber), FND_META_REF(NSConstantIntegerNumber));
+    mm_objc_define_class("NSConstantIntegerNumber", g_cnumber, sizeof(constant_integer), FND_CLASS_REF(NSConstantIntegerNumber), FND_META_REF(NSConstantIntegerNumber));
     g_constant_double=mm_objc_define_class("NSConstantDoubleNumber",g_number,sizeof(constant_double),FND_CLASS_REF(NSConstantDoubleNumber),FND_META_REF(NSConstantDoubleNumber));
     static auto double_value=[](id s,SEL){return as<constant_double>(s)->value;};
     static auto float_value=[](id s,SEL){return static_cast<float>(as<constant_double>(s)->value);};

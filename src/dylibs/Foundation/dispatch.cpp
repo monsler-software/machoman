@@ -13,7 +13,9 @@
  * ordering within a serial queue, concurrency between queues. */
 #include "foundation.h"
 #include "machoman/objc_framework.h"
+#include "machoman/dispatch_host.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,20 +24,64 @@
 #include <cstdlib>
 #include <deque>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace fnd {
+FND_CLASS(OS_dispatch_group);
 
 namespace {
+
+struct callback_scope;
+struct queued_callback {
+    std::shared_ptr<callback_scope> owner;
+    void *context;
+    void (*invoke)(void *), (*cancel)(void *);
+};
+struct callback_scope {
+    std::mutex mutex;
+    std::condition_variable idle;
+    bool stopped = false;
+    unsigned running = 0;
+    std::vector<queued_callback *> pending;
+};
+using scope_handle = std::shared_ptr<callback_scope>;
+struct dispatch_group;
+void group_leave(dispatch_group *);
 
 struct work_item {
     void *block = nullptr;                 /* retained guest block, or */
     void *function = nullptr;              /* a plain function... */
     void *context = nullptr;               /* ...with this context */
+    std::shared_ptr<queued_callback> owned{};
+    dispatch_group *group = nullptr;
 };
+
+void run_owned_callback(queued_callback &item) {
+    auto &owner = *item.owner;
+    void (*invoke)(void *);
+    void *context;
+    {
+        std::lock_guard lock(owner.mutex);
+        if (!item.invoke) return;
+        std::erase(owner.pending, &item);
+        ++owner.running;
+        invoke = item.invoke; context = item.context;
+        item.invoke = item.cancel = nullptr; item.context = nullptr;
+    }
+    struct completion {
+        callback_scope &owner;
+        ~completion() {
+            std::lock_guard lock(owner.mutex);
+            if (!--owner.running) owner.idle.notify_all();
+        }
+    } done{owner};
+    mmfw::autorelease_pool pool;
+    invoke(context);
+}
 
 /* The queue traffic is part of the window-system trace: a block that is
  * queued and never run is invisible otherwise. */
@@ -53,6 +99,11 @@ void call_function(void *fn, const std::uint64_t *args, int n) {
 }
 
 void run_item(const work_item &item) {
+    if (item.owned) { run_owned_callback(*item.owned); return; }
+    struct completion {
+        dispatch_group *group;
+        ~completion() { if (group) group_leave(group); }
+    } done{item.group};
     mmfw::autorelease_pool pool;
     if (item.block) {
         mm_objc_block_invoke(item.block, 0, nullptr);
@@ -131,6 +182,53 @@ std::vector<std::unique_ptr<dispatch_queue>> &created_queues() {
 }
 std::mutex &created_mutex() { static auto *m = new std::mutex; return *m; }
 
+struct dispatch_group {
+    mm_objc_object base;
+    std::mutex mutex;
+    std::condition_variable idle;
+    std::uint64_t count = 0, generation = 0;
+    std::vector<std::pair<dispatch_queue *, work_item>> notifications;
+};
+Class group_class() {
+    static auto *c = [] {
+        auto *result = mm_objc_define_class("OS_dispatch_group", cls("NSObject"), sizeof(dispatch_group),
+            FND_CLASS_REF(OS_dispatch_group), FND_META_REF(OS_dispatch_group));
+        register_lifecycle<dispatch_group>(result);
+        return result;
+    }();
+    return c;
+}
+void group_enter(dispatch_group *group) {
+    retain(reinterpret_cast<id>(group));
+    std::lock_guard lock(group->mutex);
+    ++group->count;
+}
+void group_leave(dispatch_group *group) {
+    std::vector<std::pair<dispatch_queue *, work_item>> ready;
+    {
+        std::lock_guard lock(group->mutex);
+        if (!group->count) {
+            std::fputs("dispatch: unbalanced dispatch_group_leave\n", stderr);
+            std::abort();
+        }
+        if (!--group->count) {
+            ++group->generation;
+            ready.swap(group->notifications);
+            group->idle.notify_all();
+        }
+    }
+    for (const auto &[queue, item] : ready) queue->push(item);
+    release(reinterpret_cast<id>(group));
+}
+void group_notify(dispatch_group *group, dispatch_queue *queue, work_item item) {
+    if (!queue) queue = &global_queue();
+    {
+        std::lock_guard lock(group->mutex);
+        if (group->count) { group->notifications.emplace_back(queue, std::move(item)); return; }
+    }
+    queue->push(item);
+}
+
 } // namespace
 
 /* Called by the run loop once per turn: the main queue's blocks run on
@@ -165,6 +263,45 @@ using namespace fnd;
 
 extern "C" {
 
+EXPORT void *mm_dispatch_scope_create() { return new scope_handle(std::make_shared<callback_scope>()); }
+EXPORT void mm_dispatch_scope_async(void *handle, void *queue, void *context,
+                                    void (*invoke)(void *), void (*cancel)(void *)) {
+    const auto owner = *static_cast<scope_handle *>(handle);
+    auto callback = std::make_shared<queued_callback>(queued_callback{owner, context, invoke, cancel});
+    {
+        std::lock_guard lock(owner->mutex);
+        if (!owner->stopped) {
+            owner->pending.push_back(callback.get());
+            work_item item; item.owned = std::move(callback);
+            (queue ? *static_cast<dispatch_queue *>(queue) : global_queue()).push(item);
+            return;
+        }
+    }
+    if (cancel) cancel(context);
+}
+EXPORT void mm_dispatch_scope_stop(void *handle) {
+    const auto owner = *static_cast<scope_handle *>(handle);
+    std::vector<std::pair<void (*)(void *), void *>> cancelled;
+    {
+        std::lock_guard lock(owner->mutex);
+        owner->stopped = true;
+        for (auto *item : owner->pending) {
+            if (item->cancel) cancelled.emplace_back(item->cancel, item->context);
+            item->invoke = item->cancel = nullptr; item->context = nullptr;
+        }
+        owner->pending.clear();
+    }
+    // Releasing a captured guest block can call back into the framework.
+    for (const auto &[cancel, context] : cancelled) cancel(context);
+    std::unique_lock lock(owner->mutex);
+    owner->idle.wait(lock, [&] { return owner->running == 0; });
+}
+EXPORT void mm_dispatch_scope_destroy(void *handle) {
+    if (!handle) return;
+    mm_dispatch_scope_stop(handle);
+    delete static_cast<scope_handle *>(handle);
+}
+
 /* dispatch_get_main_queue() is a macro over this symbol, so the guest
  * binds to the object itself rather than calling anything. */
 EXPORT dispatch_queue mm_dispatch_main_q __asm__("__dispatch_main_q");
@@ -174,6 +311,47 @@ dispatch_queue *darwin_dispatch_get_main_queue() { return &main_queue(); }
 
 dispatch_queue *darwin_dispatch_get_global_queue(long, unsigned long) DARWIN(dispatch_get_global_queue);
 dispatch_queue *darwin_dispatch_get_global_queue(long, unsigned long) { return &global_queue(); }
+
+dispatch_group *darwin_dispatch_group_create() DARWIN(dispatch_group_create);
+dispatch_group *darwin_dispatch_group_create() { return make<dispatch_group>(group_class()); }
+void darwin_dispatch_group_enter(dispatch_group *group) DARWIN(dispatch_group_enter);
+void darwin_dispatch_group_enter(dispatch_group *group) { group_enter(group); }
+void darwin_dispatch_group_leave(dispatch_group *group) DARWIN(dispatch_group_leave);
+void darwin_dispatch_group_leave(dispatch_group *group) { group_leave(group); }
+long darwin_dispatch_group_wait(dispatch_group *group, std::uint64_t timeout) DARWIN(dispatch_group_wait);
+long darwin_dispatch_group_wait(dispatch_group *group, std::uint64_t timeout) {
+    std::unique_lock lock(group->mutex);
+    if (!group->count) return 0;
+    if (!timeout) return 1;
+    const auto generation = group->generation;
+    auto done = [&] { return group->generation != generation; };
+    if (timeout == ~0ull) { group->idle.wait(lock, done); return 0; }
+    const auto deadline = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(
+        static_cast<std::int64_t>(std::min(timeout, std::uint64_t(std::numeric_limits<std::int64_t>::max())))));
+    return group->idle.wait_until(lock, deadline, done) ? 0 : 1;
+}
+void darwin_dispatch_group_async(dispatch_group *group, dispatch_queue *queue, void *block) DARWIN(dispatch_group_async);
+void darwin_dispatch_group_async(dispatch_group *group, dispatch_queue *queue, void *block) {
+    if (!block) return;
+    work_item item{retain(static_cast<id>(block)), nullptr, nullptr};
+    group_enter(group); item.group = group;
+    (queue ? *queue : global_queue()).push(item);
+}
+void darwin_dispatch_group_async_f(dispatch_group *group, dispatch_queue *queue, void *context, void *function) DARWIN(dispatch_group_async_f);
+void darwin_dispatch_group_async_f(dispatch_group *group, dispatch_queue *queue, void *context, void *function) {
+    if (!function) return;
+    work_item item{nullptr, function, context};
+    group_enter(group); item.group = group;
+    (queue ? *queue : global_queue()).push(item);
+}
+void darwin_dispatch_group_notify(dispatch_group *group, dispatch_queue *queue, void *block) DARWIN(dispatch_group_notify);
+void darwin_dispatch_group_notify(dispatch_group *group, dispatch_queue *queue, void *block) {
+    if (block) group_notify(group, queue, {retain(static_cast<id>(block)), nullptr, nullptr});
+}
+void darwin_dispatch_group_notify_f(dispatch_group *group, dispatch_queue *queue, void *context, void *function) DARWIN(dispatch_group_notify_f);
+void darwin_dispatch_group_notify_f(dispatch_group *group, dispatch_queue *queue, void *context, void *function) {
+    if (function) group_notify(group, queue, {nullptr, function, context});
+}
 
 dispatch_queue *darwin_dispatch_queue_create(const char *label, void *attr) DARWIN(dispatch_queue_create);
 dispatch_queue *darwin_dispatch_queue_create(const char *label, void *attr) {

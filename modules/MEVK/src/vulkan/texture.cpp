@@ -25,6 +25,7 @@ VkFormat pixel_format(std::uint32_t format) {
     case 93:return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
     case 250:return VK_FORMAT_D16_UNORM;
     case 252:return VK_FORMAT_D32_SFLOAT;
+    case 260:return VK_FORMAT_D32_SFLOAT_S8_UINT;
     case 130:return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;case 131:return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
     case 132:return VK_FORMAT_BC2_UNORM_BLOCK;case 133:return VK_FORMAT_BC2_SRGB_BLOCK;
     case 134:return VK_FORMAT_BC3_UNORM_BLOCK;case 135:return VK_FORMAT_BC3_SRGB_BLOCK;
@@ -125,14 +126,15 @@ std::shared_ptr<Texture> Context::create_texture(const TextureDescription& d,std
     VkFormatFeatureFlags required=0;
     if(usage&1u)required|=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
     if(usage&2u)required|=VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
-    const bool depth_format=format==250||format==252;
+    const bool depth_format=format==250||format==252||format==260;
     if(usage&4u)required|=depth_format?VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT:VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
     if((properties.optimalTilingFeatures&required)!=required){error="MEVK: texture format does not support requested usage";return nullptr;}
     auto texture=std::make_unique<Texture::Impl>();texture->context=impl_;texture->width=width;texture->height=height;
     texture->pixel_format=format;texture->format=vkformat;
-    texture->bytes_per_pixel=format==250?2u:format==252?4u:format<20?1u:format<40?2u:format<100?4u:format<120?8u:16u;
+    texture->bytes_per_pixel=format==250?2u:format==252?4u:format==260?8u:format<20?1u:format<40?2u:format<100?4u:format<120?8u:16u;
     if(compressed){texture->block_width=texture->block_height=4;texture->bytes_per_pixel=(format==130||format==131||format==140||format==141)?8u:16u;}
     texture->aspect=depth_format?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT;
+    if(format==260)texture->aspect|=VK_IMAGE_ASPECT_STENCIL_BIT;
     texture->storage=(usage&2u)!=0;
     texture->description=d;texture->layers=layers;
     std::unique_lock lock(impl_->mutex);
@@ -159,6 +161,8 @@ std::shared_ptr<Texture> Context::create_texture(const TextureDescription& d,std
     VkImageViewCreateInfo view{};view.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view.image=texture->image;view.viewType=d.type==5?VK_IMAGE_VIEW_TYPE_CUBE:d.type==7?VK_IMAGE_VIEW_TYPE_3D:d.type==3?VK_IMAGE_VIEW_TYPE_2D_ARRAY:VK_IMAGE_VIEW_TYPE_2D;view.format=vkformat;
     view.subresourceRange={texture->aspect,0,d.mips,0,layers};
+    // Sample the depth plane; render attachment views include both planes.
+    if(format==260)view.subresourceRange.aspectMask=VK_IMAGE_ASPECT_DEPTH_BIT;
     if(!vk_check(vkCreateImageView(impl_->device,&view,nullptr,&texture->view),"vkCreateImageView",error))return nullptr;
     if(texture->storage){view.subresourceRange.levelCount=1;if(!vk_check(vkCreateImageView(impl_->device,&view,nullptr,&texture->storage_view),"vkCreateImageView(storage)",error))return nullptr;}
     if(d.type==2&&d.mips==1&&(usage&4u)&&!depth_format) {
@@ -191,6 +195,7 @@ bool Texture::replace(std::uint32_t x,std::uint32_t y,std::uint32_t width,std::u
 bool Texture::replace(std::uint32_t x,std::uint32_t y,std::uint32_t z,std::uint32_t width,std::uint32_t height,std::uint32_t depth,
                       std::uint32_t mip,std::uint32_t slice,const void* bytes,std::uint64_t row_bytes,std::uint64_t image_bytes,std::string& error) {
     error.clear();
+    if(impl_->pixel_format==260){error="MEVK: packed depth/stencil CPU uploads are unsupported";return false;}
     auto stride=((std::uint64_t{width}+impl_->block_width-1)/impl_->block_width)*impl_->bytes_per_pixel;
     auto rows=(height+impl_->block_height-1)/impl_->block_height;
     if(mip>=impl_->description.mips||slice>=impl_->layers){error="MEVK: invalid texture mip or slice";return false;}
@@ -220,6 +225,7 @@ bool Texture::replace(std::uint32_t x,std::uint32_t y,std::uint32_t z,std::uint3
 bool Texture::read_pixels(std::vector<std::uint8_t>& pixels,std::string& error) {
     error.clear();pixels.clear();auto size=((std::uint64_t{impl_->width}+impl_->block_width-1)/impl_->block_width)*
         ((impl_->height+impl_->block_height-1)/impl_->block_height)*impl_->description.depth*impl_->layers*impl_->bytes_per_pixel;
+    if(impl_->pixel_format==260){error="MEVK: packed depth/stencil CPU readback is unsupported";return false;}
     Context context(impl_->context);auto staging=context.create_buffer(size,error);if(!staging)return false;
     auto command=context.create_command_buffer(error);if(!command)return false;
     {
@@ -241,6 +247,7 @@ bool CommandBuffer::copy_buffer_to_texture(const std::shared_ptr<Buffer>& source
     if(impl_->rendering||!source||!destination||source->impl_->context!=impl_->context||destination->impl_->context!=impl_->context)
         return impl_->fail("MEVK: buffer-to-texture copy requires compatible resources outside a render pass",error);
     auto& t=*destination->impl_;
+    if(t.pixel_format==260)return impl_->fail("MEVK: packed depth/stencil buffer uploads are unsupported",error);
     if(mip>=t.description.mips||slice>=t.layers)return impl_->fail("MEVK: invalid buffer-to-texture mip/slice",error);
     const std::array<std::uint32_t,3> extent={std::max(1u,t.width>>mip),std::max(1u,t.height>>mip),std::max(1u,t.description.depth>>mip)};
     for(unsigned i=0;i<3;++i)if(origin[i]>extent[i]||size[i]>extent[i]-origin[i])

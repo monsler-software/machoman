@@ -221,6 +221,7 @@ std::string format_call_arguments(id fmt, unsigned named_integer_args);
 std::string format_va_arguments(id fmt, std::uint64_t va);
 void register_collections();
 void register_plists();
+void register_json();
 void register_bundle();
 void register_runloop();
 void register_misc();

@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -84,6 +85,11 @@ struct kqueue_state {
 
 std::mutex g_queues_mu;
 std::unordered_map<int, std::shared_ptr<kqueue_state>> g_queues;
+
+bool trace_kqueue() {
+    const char *value = std::getenv("MACHOMAN_KQUEUE_TRACE");
+    return value && value[0] && std::strcmp(value, "0");
+}
 
 std::shared_ptr<kqueue_state> queue_for(int fd) {
     std::lock_guard lock(g_queues_mu);
@@ -300,6 +306,9 @@ int darwin_kevent64(int kq, const kevent64_s *changes, int nchanges, kevent64_s 
             std::lock_guard lock(q->mu);
             err = apply_change(*q, changes[i]);
         }
+        if (trace_kqueue()) std::fprintf(stderr, "[kqueue] change queue=%d ident=%llu filter=%d flags=0x%x fflags=0x%x data=%lld error=%d\n",
+            kq, static_cast<unsigned long long>(changes[i].ident), changes[i].filter, changes[i].flags, changes[i].fflags,
+            static_cast<long long>(changes[i].data), err);
         /* BSD reports a failed change through the event list. */
         if ((err || (changes[i].flags & EV_RECEIPT)) && events && produced < nevents) {
             events[produced] = changes[i];

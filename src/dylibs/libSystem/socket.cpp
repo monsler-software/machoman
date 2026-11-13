@@ -19,13 +19,39 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/uio.h>
+#include <new>
+#include <vector>
 
 namespace {
+
+void trace_message(const char *operation, int fd, const msghdr &message, int flags, ssize_t result) {
+    const int saved_errno = errno;
+    const char *enabled = std::getenv("MACHOMAN_SOCKET_TRACE");
+    if (enabled && enabled[0] && std::strcmp(enabled, "0")) {
+        char ip[INET6_ADDRSTRLEN] = "connected";
+        unsigned port = 0;
+        if (message.msg_name && message.msg_namelen >= sizeof(sa_family_t)) {
+            const auto *address = static_cast<const sockaddr *>(message.msg_name);
+            if (address->sa_family == AF_INET && message.msg_namelen >= sizeof(sockaddr_in)) {
+                const auto *a = reinterpret_cast<const sockaddr_in *>(address);
+                ::inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip); port = ntohs(a->sin_port);
+            } else if (address->sa_family == AF_INET6 && message.msg_namelen >= sizeof(sockaddr_in6)) {
+                const auto *a = reinterpret_cast<const sockaddr_in6 *>(address);
+                ::inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof ip); port = ntohs(a->sin6_port);
+            }
+        }
+        std::fprintf(stderr, "[socket] %s fd=%d address=%s port=%u iov=%zu control=%zu flags=0x%x result=%zd host_errno=%d\n",
+            operation, fd, ip, port, message.msg_iovlen, message.msg_controllen, flags, result, result < 0 ? saved_errno : 0);
+    }
+    errno = saved_errno;
+}
 
 constexpr int darwin_sol_socket = 0xFFFF;
 
@@ -42,8 +68,42 @@ enum : int {
  * no host equivalent; `handled` says it was dealt with here instead. */
 bool translate_option(int level, int name, int &host_level, int &host_name, bool &handled) {
     handled = false;
+    host_level = level;
+    if (level == IPPROTO_IP) {
+        switch (name) {
+        case 1: host_name = IP_OPTIONS; return true;
+        case 2: host_name = IP_HDRINCL; return true;
+        case 3: host_name = IP_TOS; return true;
+        case 4: host_name = IP_TTL; return true;
+        case 5: host_name = IP_RECVOPTS; return true;
+        case 9: host_name = IP_MULTICAST_IF; return true;
+        case 10: host_name = IP_MULTICAST_TTL; return true;
+        case 11: host_name = IP_MULTICAST_LOOP; return true;
+        case 12: host_name = IP_ADD_MEMBERSHIP; return true;
+        case 13: host_name = IP_DROP_MEMBERSHIP; return true;
+        case 24: host_name = IP_RECVTTL; return true;
+        case 26: host_name = IP_PKTINFO; return true;
+        case 27: host_name = IP_RECVTOS; return true;
+        default: return false;
+        }
+    }
+    if (level == IPPROTO_IPV6) {
+        switch (name) {
+        case 4: host_name = IPV6_UNICAST_HOPS; return true;
+        case 9: host_name = IPV6_MULTICAST_IF; return true;
+        case 10: host_name = IPV6_MULTICAST_HOPS; return true;
+        case 11: host_name = IPV6_MULTICAST_LOOP; return true;
+        case 12: host_name = IPV6_JOIN_GROUP; return true;
+        case 13: host_name = IPV6_LEAVE_GROUP; return true;
+        case 27: host_name = IPV6_V6ONLY; return true;
+        case 35: host_name = IPV6_RECVTCLASS; return true;
+        case 36: host_name = IPV6_TCLASS; return true;
+        case 37: host_name = IPV6_RECVHOPLIMIT; return true;
+        case 61: host_name = IPV6_RECVPKTINFO; return true;
+        default: return false;
+        }
+    }
     if (level != darwin_sol_socket) {
-        /* IPPROTO_* levels and their options match between the two. */
         host_level = level;
         host_name = name;
         return true;
@@ -130,12 +190,14 @@ socklen_t address_to_host(const void *from, socklen_t length, sockaddr_storage &
         return static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + n + 1);
     }
     case AF_INET: {
+        if (length < 16) return 0;
         auto &in4 = reinterpret_cast<sockaddr_in &>(out);
         std::memcpy(&in4.sin_port, bytes + 2, 2);      /* both are network order */
         std::memcpy(&in4.sin_addr, bytes + 4, 4);
         return sizeof(sockaddr_in);
     }
     case AF_INET6: {
+        if (length < 28) return 0;
         auto &in6 = reinterpret_cast<sockaddr_in6 &>(out);
         std::memcpy(&in6.sin6_port, bytes + 2, 2);
         std::memcpy(&in6.sin6_flowinfo, bytes + 4, 4);
@@ -188,6 +250,156 @@ void address_to_darwin(const sockaddr_storage &from, socklen_t from_length, void
     const socklen_t copied = std::min(size, *length);
     std::memcpy(out, buffer, copied);
     *length = size;
+}
+
+/* ---- message I/O -------------------------------------------------------- */
+
+/* Darwin uses int for iovlen, socklen_t for controllen, and four-byte
+ * alignment for control messages. Linux uses size_t and eight-byte
+ * alignment. Only the iovec itself has the same layout on both ABIs. */
+struct darwin_msghdr {
+    void *name;
+    socklen_t namelen;
+    iovec *iov;
+    int iovlen;
+    void *control;
+    socklen_t controllen;
+    int flags;
+};
+struct darwin_cmsghdr { std::uint32_t len; int level, type; };
+static_assert(sizeof(darwin_msghdr) == 48 && offsetof(darwin_msghdr, flags) == 44);
+static_assert(sizeof(darwin_cmsghdr) == 12);
+static_assert(sizeof(iovec) == 16 && offsetof(iovec, iov_len) == 8);
+constexpr std::size_t align_control(std::size_t n) { return (n + 3) & ~std::size_t(3); }
+
+struct message_flag { int darwin, host; };
+constexpr message_flag message_flags[] = {
+    {0x1, MSG_OOB}, {0x2, MSG_PEEK}, {0x4, MSG_DONTROUTE},
+    {0x8, MSG_EOR}, {0x10, MSG_TRUNC}, {0x20, MSG_CTRUNC},
+    {0x40, MSG_WAITALL}, {0x80, MSG_DONTWAIT}, {0x80000, MSG_NOSIGNAL},
+};
+bool flags_to_host(int flags, int &out) {
+    out = 0;
+    for (auto f : message_flags) { if (flags & f.darwin) out |= f.host; flags &= ~f.darwin; }
+    if (flags) { errno = ENOTSUP; return false; }
+    return true;
+}
+int flags_to_darwin(int flags) {
+    int out = 0;
+    for (auto f : message_flags) if (flags & f.host) out |= f.darwin;
+    return out;
+}
+bool message_to_host(const darwin_msghdr *guest, msghdr &host, sockaddr_storage &address) {
+    if (!guest) { errno = EFAULT; return false; }
+    if (guest->iovlen < 0) { errno = EINVAL; return false; }
+    if (guest->iovlen > 1024) { errno = EMSGSIZE; return false; }
+    if ((guest->iovlen && !guest->iov) || (guest->controllen && !guest->control)) { errno = EFAULT; return false; }
+    host.msg_iov = guest->iov;
+    host.msg_iovlen = static_cast<std::size_t>(guest->iovlen);
+    if (guest->name) { host.msg_name = &address; host.msg_namelen = sizeof address; }
+    return true;
+}
+
+bool control_type_to_host(int level, int type, int &host_level, int &host_type) {
+    host_level = level;
+    if (level == darwin_sol_socket) {
+        host_level = SOL_SOCKET;
+        if (type == 1) { host_type = SCM_RIGHTS; return true; }
+        if (type == 2) { host_type = SCM_TIMESTAMP; return true; }
+    } else if (level == IPPROTO_IP) {
+        if (type == 3) { host_type = IP_TOS; return true; }
+        if (type == 4) { host_type = IP_TTL; return true; }
+        if (type == 26) { host_type = IP_PKTINFO; return true; }
+    } else if (level == IPPROTO_IPV6) {
+        if (type == 36) { host_type = IPV6_TCLASS; return true; }
+        if (type == 46) { host_type = IPV6_PKTINFO; return true; }
+        if (type == 47) { host_type = IPV6_HOPLIMIT; return true; }
+    }
+    errno = ENOPROTOOPT; return false;
+}
+bool control_type_to_darwin(int level, int type, int &guest_level, int &guest_type) {
+    guest_level = level;
+    if (level == SOL_SOCKET) {
+        guest_level = darwin_sol_socket;
+        if (type == SCM_RIGHTS) { guest_type = 1; return true; }
+        if (type == SCM_TIMESTAMP) { guest_type = 2; return true; }
+    } else if (level == IPPROTO_IP) {
+        if (type == IP_TOS) { guest_type = 27; return true; }
+        if (type == IP_TTL) { guest_type = 24; return true; }
+        if (type == IP_PKTINFO) { guest_type = 26; return true; }
+    } else if (level == IPPROTO_IPV6) {
+        if (type == IPV6_TCLASS) { guest_type = 36; return true; }
+        if (type == IPV6_PKTINFO) { guest_type = 46; return true; }
+        if (type == IPV6_HOPLIMIT) { guest_type = 47; return true; }
+    }
+    return false;
+}
+
+bool control_to_host(const darwin_msghdr &guest, std::vector<std::uint8_t> &out) {
+    const auto *data = static_cast<const std::uint8_t *>(guest.control);
+    for (std::size_t at = 0; at < guest.controllen;) {
+        const std::size_t remaining = guest.controllen - at;
+        if (remaining < sizeof(darwin_cmsghdr)) { errno = EINVAL; return false; }
+        darwin_cmsghdr header;
+        std::memcpy(&header, data + at, sizeof header);
+        if (header.len < sizeof header || header.len > remaining) { errno = EINVAL; return false; }
+        int level, type;
+        if (!control_type_to_host(header.level, header.type, level, type)) return false;
+        const std::size_t size = header.len - sizeof header;
+        const auto start = out.size(); out.resize(start + CMSG_SPACE(size));
+        cmsghdr host{}; host.cmsg_len = CMSG_LEN(size); host.cmsg_level = level; host.cmsg_type = type;
+        std::memcpy(out.data() + start, &host, sizeof host);
+        std::memcpy(out.data() + start + CMSG_LEN(0), data + at + sizeof header, size);
+        if (align_control(header.len) >= remaining) break;
+        at += align_control(header.len);
+    }
+    return true;
+}
+
+void close_rights(const cmsghdr &header, const std::uint8_t *payload, std::size_t size, std::size_t retained) {
+    if (header.cmsg_level != SOL_SOCKET || header.cmsg_type != SCM_RIGHTS) return;
+    for (std::size_t at = retained; at + sizeof(int) <= size; at += sizeof(int)) {
+        int fd; std::memcpy(&fd, payload + at, sizeof fd); ::close(fd);
+    }
+}
+void control_to_darwin(const msghdr &host, darwin_msghdr &guest) {
+    const auto *data = static_cast<const std::uint8_t *>(host.msg_control);
+    auto *out = static_cast<std::uint8_t *>(guest.control);
+    const std::size_t capacity = guest.controllen;
+    std::size_t used = 0;
+    for (std::size_t at = 0; at + sizeof(cmsghdr) <= host.msg_controllen;) {
+        cmsghdr header; std::memcpy(&header, data + at, sizeof header);
+        if (header.cmsg_len < CMSG_LEN(0) || header.cmsg_len > host.msg_controllen - at) { guest.flags |= 0x20; break; }
+        const auto *payload = data + at + CMSG_LEN(0);
+        const std::size_t original_size = header.cmsg_len - CMSG_LEN(0);
+        std::size_t size = original_size;
+        int level, type;
+        bool supported = control_type_to_darwin(header.cmsg_level, header.cmsg_type, level, type);
+        std::uint8_t ttl = 0;
+        if (header.cmsg_level == IPPROTO_IP && header.cmsg_type == IP_TTL && size == sizeof(int)) {
+            int value; std::memcpy(&value, payload, sizeof value); ttl = static_cast<std::uint8_t>(value); payload = &ttl; size = 1;
+        }
+        const bool rights = header.cmsg_level == SOL_SOCKET && header.cmsg_type == SCM_RIGHTS;
+        const std::size_t remaining = capacity - used;
+        if (rights && remaining >= sizeof(darwin_cmsghdr)) {
+            size = std::min(size, ((remaining - sizeof(darwin_cmsghdr)) / sizeof(int)) * sizeof(int));
+            if (!size) supported = false;
+        }
+        if (supported && sizeof(darwin_cmsghdr) + size <= remaining) {
+            darwin_cmsghdr guest_header{static_cast<std::uint32_t>(sizeof(darwin_cmsghdr) + size), level, type};
+            std::memcpy(out + used, &guest_header, sizeof guest_header);
+            std::memcpy(out + used + sizeof guest_header, payload, size);
+            const auto written = std::min(align_control(guest_header.len), remaining);
+            std::memset(out + used + guest_header.len, 0, written - guest_header.len);
+            used += written;
+            if (rights && size < original_size) { guest.flags |= 0x20; close_rights(header, payload, original_size, size); }
+        } else {
+            guest.flags |= 0x20;
+            close_rights(header, payload, original_size, 0);
+        }
+        at += CMSG_ALIGN(header.cmsg_len);
+    }
+    guest.controllen = static_cast<socklen_t>(used);
 }
 
 /* Darwin places ai_canonname before ai_addr; Linux reverses them. Returning
@@ -372,21 +584,71 @@ int darwin_getpeername(int fd, void *address, socklen_t *length) {
 
 ssize_t darwin_sendto(int fd, const void *buffer, std::size_t n, int flags, const void *address, socklen_t length) DARWIN(sendto);
 ssize_t darwin_sendto(int fd, const void *buffer, std::size_t n, int flags, const void *address, socklen_t length) {
-    if (!address) return ::send(fd, buffer, n, flags);
+    int host_flags;
+    if (!flags_to_host(flags, host_flags)) return -1;
+    if (!address) return ::send(fd, buffer, n, host_flags);
     sockaddr_storage host{};
     const socklen_t host_length = address_to_host(address, length, host);
     if (!host_length) { errno = EAFNOSUPPORT; return -1; }
-    return ::sendto(fd, buffer, n, flags, reinterpret_cast<const sockaddr *>(&host), host_length);
+    return ::sendto(fd, buffer, n, host_flags, reinterpret_cast<const sockaddr *>(&host), host_length);
 }
 
 ssize_t darwin_recvfrom(int fd, void *buffer, std::size_t n, int flags, void *address, socklen_t *length) DARWIN(recvfrom);
 ssize_t darwin_recvfrom(int fd, void *buffer, std::size_t n, int flags, void *address, socklen_t *length) {
-    if (!address) return ::recv(fd, buffer, n, flags);
+    int host_flags;
+    if (!flags_to_host(flags, host_flags)) return -1;
+    if (!address) return ::recv(fd, buffer, n, host_flags);
+    if (!length) { errno = EFAULT; return -1; }
     sockaddr_storage host{};
     socklen_t host_length = sizeof host;
-    const ssize_t received = ::recvfrom(fd, buffer, n, flags, reinterpret_cast<sockaddr *>(&host), &host_length);
+    const ssize_t received = ::recvfrom(fd, buffer, n, host_flags, reinterpret_cast<sockaddr *>(&host), &host_length);
     if (received >= 0) address_to_darwin(host, host_length, address, length);
     return received;
+}
+
+ssize_t darwin_send(int fd, const void *buffer, std::size_t n, int flags) DARWIN(send);
+ssize_t darwin_send(int fd, const void *buffer, std::size_t n, int flags) { return darwin_sendto(fd, buffer, n, flags, nullptr, 0); }
+ssize_t darwin_recv(int fd, void *buffer, std::size_t n, int flags) DARWIN(recv);
+ssize_t darwin_recv(int fd, void *buffer, std::size_t n, int flags) { return darwin_recvfrom(fd, buffer, n, flags, nullptr, nullptr); }
+
+ssize_t darwin_sendmsg(int fd, const darwin_msghdr *guest, int flags) DARWIN(sendmsg);
+ssize_t darwin_sendmsg(int fd, const darwin_msghdr *guest, int flags) {
+    int host_flags; msghdr host{}; sockaddr_storage address{};
+    if (!flags_to_host(flags, host_flags) || !message_to_host(guest, host, address)) return -1;
+    if (guest->name) {
+        host.msg_namelen = address_to_host(guest->name, guest->namelen, address);
+        if (!host.msg_namelen) { errno = EAFNOSUPPORT; return -1; }
+    }
+    try {
+        std::vector<std::uint8_t> control;
+        if (!control_to_host(*guest, control)) return -1;
+        if (!control.empty()) { host.msg_control = control.data(); host.msg_controllen = control.size(); }
+        const ssize_t result = ::sendmsg(fd, &host, host_flags);
+        trace_message("sendmsg", fd, host, host_flags, result);
+        return result;
+    } catch (const std::bad_alloc &) { errno = ENOMEM; return -1; }
+}
+ssize_t darwin_recvmsg(int fd, darwin_msghdr *guest, int flags) DARWIN(recvmsg);
+ssize_t darwin_recvmsg(int fd, darwin_msghdr *guest, int flags) {
+    int host_flags; msghdr host{}; sockaddr_storage address{};
+    if (!flags_to_host(flags, host_flags) || !message_to_host(guest, host, address)) return -1;
+    try {
+        /* Enough space for the larger Linux headers/alignment. Any rights
+         * that cannot fit the guest buffer are closed during conversion. */
+        std::vector<std::uint8_t> control;
+        if (guest->controllen) {
+            control.resize(static_cast<std::size_t>(guest->controllen) * 2 + sizeof(cmsghdr));
+            host.msg_control = control.data(); host.msg_controllen = control.size();
+        }
+        const ssize_t result = ::recvmsg(fd, &host, host_flags);
+        trace_message("recvmsg", fd, host, host_flags, result);
+        if (result < 0) return result;
+        guest->flags = flags_to_darwin(host.msg_flags);
+        if (guest->name) address_to_darwin(address, host.msg_namelen, guest->name, &guest->namelen);
+        else guest->namelen = 0;
+        control_to_darwin(host, *guest);
+        return result;
+    } catch (const std::bad_alloc &) { errno = ENOMEM; return -1; }
 }
 
 int darwin_setsockopt(int fd, int level, int name, const void *value, socklen_t length) DARWIN(setsockopt);

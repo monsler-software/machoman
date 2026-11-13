@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
+#include <unistd.h>
 #include <mutex>
 #include <unordered_map>
 
@@ -51,6 +53,7 @@ struct storage_object {
     std::mutex mutex;
     std::vector<id> cookies;
     std::uint64_t policy = 0; // NSHTTPCookieAcceptPolicyAlways
+    std::string path;
     ~storage_object() { for (id cookie : cookies) release(cookie); }
 };
 std::string lower(std::string_view s) {
@@ -253,14 +256,120 @@ void notify(id storage, id name) {
     id center = obj(send(reinterpret_cast<id>(cls("NSNotificationCenter")), "defaultCenter"));
     send(center, "postNotificationName:object:", ret(name), ret(storage));
 }
+bool expired(const cookie_object *cookie);
+bool store_cookie(storage_object *storage, id cookie);
+std::string storage_name(std::string_view name) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : name) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-') out += static_cast<char>(c);
+        else { out += '_'; out += hex[c >> 4]; out += hex[c & 15]; }
+    }
+    return out;
+}
+id persistent_storage(std::string_view name) {
+    auto *storage = make<storage_object>(storage_class);
+    std::filesystem::path directory;
+    if (const char *override = mm_host_getenv(api(), "MACHOMAN_COOKIE_STORAGE_DIR"); override && override[0]) directory = override;
+    else if (const char *venv = mm_host_venv(api()); venv && venv[0]) {
+        // Removable/FUSE venv filesystems may ignore Unix permissions. Keep
+        // authentication cookies in the user's private data directory, with
+        // a separate profile for each canonical venv.
+        const char *home = mm_host_getenv(api(), "HOME");
+        if (home && home[0]) {
+            std::error_code error;
+            auto root = std::filesystem::weakly_canonical(venv, error);
+            const std::string identity = error ? std::string(venv) : root.string();
+            std::uint64_t hash = 14695981039346656037ull;
+            for (unsigned char c : identity) { hash ^= c; hash *= 1099511628211ull; }
+            directory = std::filesystem::path(home) / ".local/share/machoman/cookies" / std::to_string(hash);
+        }
+    }
+    if (directory.empty()) return reinterpret_cast<id>(storage);
+    storage->path = (directory / (storage_name(name) + ".plist")).string();
+    if (FILE *file = std::fopen(storage->path.c_str(), "rb")) {
+        std::string bytes; char buffer[4096];
+        for (std::size_t n; (n = std::fread(buffer, 1, sizeof buffer, file));) {
+            bytes.append(buffer, n);
+            if (bytes.size() > 16 * 1024 * 1024) { bytes.clear(); break; }
+        }
+        std::fclose(file);
+        id parsed = plist_parse(bytes, nullptr);
+        if (is_array(parsed)) for (id saved : array_storage(parsed)) {
+            if (!is_dictionary(saved)) continue;
+            id expiry = property(saved, "Expires");
+            if (!is_number(expiry) || !std::isfinite(number_double(expiry))) continue;
+            id properties = obj(send(saved, "mutableCopy"));
+            id date = date_from_epoch(number_double(expiry));
+            dictionary_set(properties, constant_string("Expires"), date); release(date);
+            if (id cookie = new_cookie(properties)) {
+                if (!as<cookie_object>(cookie)->session) store_cookie(storage, cookie);
+                release(cookie);
+            }
+            release(properties);
+        }
+        release(parsed);
+    }
+    return reinterpret_cast<id>(storage);
+}
+void persist(storage_object *storage) {
+    if (storage->path.empty()) return;
+    std::vector<id> entries;
+    for (id cookie : storage->cookies) {
+        const auto *c = as<cookie_object>(cookie);
+        if (c->session || expired(c) || !std::isfinite(c->expires)) continue;
+        id properties = dictionary_create(true);
+        std::vector<id> keys; dictionary_keys(c->properties, keys);
+        for (id key : keys) {
+            id value = dictionary_get(c->properties, key);
+            if (is_string(value) || is_number(value)) dictionary_set(properties, key, value);
+        }
+        put(properties,"Name",c->name); put(properties,"Value",c->value);
+        put(properties,"Domain",c->domain); put(properties,"Path",c->path);
+        // Max-Age is relative to receipt. Save its absolute expiry so loading
+        // the jar never extends a login's lifetime.
+        dictionary_remove(properties, constant_string("Max-Age"));
+        // NSDate is not a supported plist value in this layer yet. Keep the
+        // absolute epoch as a number on disk and restore NSDate when loading.
+        id epoch = number_from_double(c->expires);
+        dictionary_set(properties, constant_string("Expires"), epoch); release(epoch);
+        entries.push_back(properties);
+    }
+    id array = array_create(entries.data(), static_cast<CFIndex>(entries.size()), false);
+    for (id entry : entries) release(entry);
+    std::string bytes; bool written = plist_write_xml(array, bytes); release(array);
+    if (!written) return;
+    std::error_code error;
+    const auto directory = std::filesystem::path(storage->path).parent_path();
+    std::filesystem::create_directories(directory, error);
+    if (!error) std::filesystem::permissions(directory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, error);
+    if (error) { std::fprintf(stderr, "cookies: cannot create persistent storage: %s\n", error.message().c_str()); return; }
+    std::string temporary = storage->path + ".tmp-XXXXXX";
+    int fd = ::mkstemp(temporary.data());
+    if (fd < 0) { std::fprintf(stderr, "cookies: cannot create persistent cookie file\n"); return; }
+    FILE *file = ::fdopen(fd, "wb");
+    if (file) {
+        written = std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size() && std::fflush(file) == 0 && ::fsync(fd) == 0;
+        if (std::fclose(file) != 0) written = false;
+    } else { ::close(fd); written = false; }
+    if (!written || std::rename(temporary.c_str(), storage->path.c_str()) != 0) {
+        ::unlink(temporary.c_str());
+        std::fprintf(stderr, "cookies: cannot save persistent cookie file\n");
+    }
+}
 std::uint64_t shared_storage(id, SEL) {
-    static id storage = reinterpret_cast<id>(make<storage_object>(storage_class)); return ret(storage);
+    static id storage = [] {
+        id bundle = obj(send(reinterpret_cast<id>(cls("NSBundle")), "mainBundle"));
+        std::string name = to_utf8(obj(send(bundle, "bundleIdentifier")));
+        return persistent_storage("app." + (name.empty() ? std::string("default") : name));
+    }();
+    return ret(storage);
 }
 std::uint64_t group_storage(id, SEL, id group) {
     static std::mutex mutex; static std::unordered_map<std::string, id> stores;
     std::lock_guard lock(mutex);
     auto &storage = stores[to_utf8(group)];
-    if (!storage) storage = reinterpret_cast<id>(make<storage_object>(storage_class));
+    if (!storage) storage = persistent_storage("group." + to_utf8(group));
     return ret(storage);
 }
 bool expired(const cookie_object *cookie) { return cookie->has_expiry && cookie->expires <= now(); }
@@ -300,7 +409,7 @@ bool store_cookie(storage_object *storage, id cookie) {
 }
 std::uint64_t storage_set(id self, SEL, id cookie) {
     bool changed; auto *storage = as<storage_object>(self);
-    { std::lock_guard lock(storage->mutex); changed = storage->policy != 1 && store_cookie(storage, cookie); }
+    { std::lock_guard lock(storage->mutex); changed = storage->policy != 1 && store_cookie(storage, cookie); if (changed) persist(storage); }
     if (changed) notify(self, NSHTTPCookieManagerCookiesChangedNotification_);
     return 0;
 }
@@ -316,6 +425,7 @@ std::uint64_t storage_set_many(id self, SEL, id cookies, id url, id main_url) {
             if (!domain_matches(origin.host, c->domain, c->host_only) || (storage->policy == 2 && !domain_matches(main.host, c->domain, false))) continue;
             changed |= store_cookie(storage, cookie);
         }
+        if (changed) persist(storage);
     }
     if (changed) notify(self, NSHTTPCookieManagerCookiesChangedNotification_);
     return 0;
@@ -332,6 +442,7 @@ std::uint64_t storage_delete(id self, SEL, id cookie) {
             if (o->name != name || o->domain != domain || o->path != path) return false;
             release(old); return true;
         }) != 0;
+        if (changed) persist(storage);
     }
     if (changed) notify(self, NSHTTPCookieManagerCookiesChangedNotification_);
     return 0;

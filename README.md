@@ -1,7 +1,14 @@
 # machoman
 
-A wine-like compatibility layer for running macOS **arm64 CLI** binaries on
-Windows and Linux **x86_64** hosts. Written in C++26 + CMake.
+A wine-like compatibility layer for running macOS **arm64** and **x86_64** binaries on
+Linux **x86_64** hosts. Written in C++26 + CMake.
+
+Currently runs:
+- GrandPerspective (fully)
+- Roblox (Login worx; crashes on play attempt)
+- Ableton Live 12 Suite (Partially; no audio)
+- Some CLI Applications
+nothing else were tested
 
 Three layers, matching the three build/run stages a translated program
 goes through:
@@ -149,22 +156,32 @@ arm64 macOS run with iostreams, locales, virtual dispatch and exceptions
   or straight into the instance variable; an action sets target/action.
   This is what gives an app that sets no delegate in code — Ableton Live
   is one — its `NSApplicationDelegate`.
-- **The frameworks around them**: CoreMIDI/CoreAudio/AudioToolbox
-  (`src/dylibs/audio/`) answer with no devices but real handles, so audio
-  setup completes; Carbon/ApplicationServices/CoreServices
+- **The frameworks around them**: CoreMIDI (`src/dylibs/audio/`) provides
+  client and port handles but does not yet expose MIDI endpoints;
+  Carbon/ApplicationServices/CoreServices
   (`src/dylibs/carbon/`) cover the keyboard state, text input sources and
   event-loop timers a modern Cocoa app still calls; Accelerate
   (`src/dylibs/accelerate/`) is a real vDSP: FFTs (split-complex, packed
   real), vector arithmetic and the `vv*` transcendentals;
   `/usr/lib/libiconv.2.dylib` is glibc's iconv under Apple's names.
-- **PCM engine** (`src/dylibs/audio/engine.cpp`): preallocated float32
-  planar/interleaved buffers, variable block sizes, stop/quiescence and
-  silence on callback failure. An offline null adapter and ARM64 guest
-  sample test exercise the Darwin audio ABI. Host API v3 prepares callbacks
-  on their processing thread with a persistent guest identity/stack and
-  returns faults without aborting the process. Physical PipeWire output,
-  HAL devices and AudioUnit output are still pending; the null adapter is
-  never advertised as a default audio device.
+- **CoreAudio and PipeWire** (`src/dylibs/audio/`): the HAL enumerates real
+  PipeWire output nodes, their names and channel counts, exposes device/stream
+  properties, and reports hotplug and default-output changes. HAL IOProcs and
+  the AUHAL, Default Output and System Output AudioUnits send float32 PCM to
+  PipeWire. Default units follow desktop routing; AUHAL and IOProcs use the
+  selected device. Planar/interleaved conversion and buffering use preallocated
+  storage, including fixed HAL blocks when the graph quantum differs.
+  Host API v3 keeps a persistent guest thread/stack for ARM64 and native x86_64
+  callbacks, silences failed renders, and stops callbacks before teardown.
+  Isolated PipeWire integration tests capture actual samples, validate channel
+  order and exercise routing, errors and shutdown without playing on hardware.
+  Input/capture, MIDI transport, effects and third-party AudioUnit factories
+  remain unimplemented. CMake enables the backend when `libpipewire-0.3`
+  development files (>= 0.3.50) are available; `-DMACHOMAN_PIPEWIRE=OFF` omits
+  it. `MACHOMAN_AUDIO_BACKEND=none` forces no-device behavior, and
+  `MACHOMAN_AUDIO_TRACE=1` traces properties and stream state changes.
+  Without a server or backend, no physical devices are advertised; the null
+  adapter is reserved for offline engine tests.
 - **Stub frameworks** (`src/dylibs/symbol-synthesis/`): one object standing
   in for every framework that is not implemented yet, installed under each
   of their paths. It defines nothing; the runtime asks it for each bind

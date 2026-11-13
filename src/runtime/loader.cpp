@@ -750,20 +750,22 @@ public:
         return {};
     }
 
-    /* Address of `symbol` (a bind name, "$suffix" stripped) as seen from
+    /* Address of `symbol` as seen from
      * `image` through dylib `ordinal`. Guest definitions win within the
      * named library; otherwise every image and host library is searched,
-     * since umbrella frameworks re-export what other libraries define. */
+     * since umbrella frameworks re-export what other libraries define.
+     * Exact versioned exports precede the compatibility spelling without
+     * a $suffix; some APIs export only the versioned spelling. */
     void lookup(guest_image &image, int ordinal, std::string_view symbol, bool lazy, std::uint64_t &guest, void *&host,
                 bool *from_resolver = nullptr) {
         guest = 0;
         host = nullptr;
         if (from_resolver) *from_resolver = false;
-        const std::string name = strip_variant(symbol);
+        auto lookup_definition = [&](const std::string &name) {
         if (ordinal >= 1 && static_cast<std::size_t>(ordinal) <= image.deps.size()) {
             const dependency &d = image.deps[static_cast<std::size_t>(ordinal) - 1];
             std::vector<const guest_image *> seen;
-            if (d.guest && (guest = guest_lookup(*d.guest, name, seen))) return;
+            if (d.guest && (guest = guest_lookup(*d.guest, name, seen))) return true;
             if (d.host) {
                 void *h = host_lookup(*d.host, name);
                 /* dlsym also searches the library's dependencies, so a
@@ -778,30 +780,27 @@ public:
                     for (auto &g : images_)
                         if (auto it = g->exports.find(name); it != g->exports.end()) {
                             guest = it->second;
-                            return;
+                            return true;
                         }
                 }
-                if (h) { host = h; return; }
-            }
-            /* A host library may synthesise symbols it does not define
-             * statically (a framework stub deriving constants and stub
-             * functions from the name). Only the library the bind actually
-             * names is asked, so a stub never shadows another library. */
-            if (d.host && (host = host_synthesise(*d.host, name, lazy))) {
-                if (from_resolver) *from_resolver = true;
-                return;
+                if (h) { host = h; return true; }
             }
         } else if (ordinal == 0) { /* BIND_SPECIAL_DYLIB_SELF */
             std::vector<const guest_image *> seen;
-            if ((guest = guest_lookup(image, name, seen))) return;
+            if ((guest = guest_lookup(image, name, seen))) return true;
         } else if (ordinal == -1 && !images_.empty()) { /* MAIN_EXECUTABLE */
             std::vector<const guest_image *> seen;
-            if ((guest = guest_lookup(*images_[0], name, seen))) return;
+            if ((guest = guest_lookup(*images_[0], name, seen))) return true;
         }
         for (auto &g : images_)
-            if (auto it = g->exports.find(name); it != g->exports.end()) { guest = it->second; return; }
+            if (auto it = g->exports.find(name); it != g->exports.end()) { guest = it->second; return true; }
         for (auto &h : host_libs_)
-            if ((host = host_lookup(*h, name))) return;
+            if ((host = host_lookup(*h, name))) return true;
+        return false;
+        };
+        if (lookup_definition(std::string(symbol))) return;
+        const std::string name = strip_variant(symbol);
+        if (name != symbol && lookup_definition(name)) return;
         /* Last: a host library may synthesise a symbol nothing defines (a
          * framework stub deriving a constant or a reporting function from
          * the name). Only the library the bind names is asked, and only
@@ -2208,7 +2207,9 @@ int guest_process::api_prepare_guest_callback(std::uint64_t fn_va, std::size_t s
     guest_process *p = g_process;
     if (!p) return 78;
     if (g_current || (g_callback_binding && g_callback_binding->active)) return 16;
-    if (!api_is_guest_code(fn_va) || !mm_runtime_code::translation_of(fn_va) || stack_size > 8 * 1024 * 1024) return 22;
+    /* is_guest_code validates translated ARM64 entries and native x86_64
+     * executable ranges. Native callbacks do not have a translation entry. */
+    if (!api_is_guest_code(fn_va) || stack_size > 8 * 1024 * 1024) return 22;
     stack_size = std::max<std::size_t>(stack_size, 512 * 1024);
     if (g_callback_binding && (g_callback_binding->process != p || g_callback_binding->thread->stack.size() * 8 < stack_size)) return 22;
     if (!g_callback_binding) {
@@ -2219,7 +2220,8 @@ int guest_process::api_prepare_guest_callback(std::uint64_t fn_va, std::size_t s
         thread->finished = true;
         auto binding = std::make_unique<callback_binding>();
         binding->process = p; binding->thread = thread.get();
-        for (const auto &image : p->linker_.images()) binding->codes.push_back(image->runtime.get());
+        for (const auto &image : p->linker_.images())
+            if (image->runtime) binding->codes.push_back(image->runtime.get());
         {
             std::lock_guard lock(p->threads_mu_);
             thread->id = p->next_thread_id_++;

@@ -2440,6 +2440,7 @@ static void foundation_ctor() {
     register_formatting();
     register_key_value();
     register_plists();
+    register_json();
     register_task();
 }
 

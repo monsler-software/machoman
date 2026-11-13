@@ -60,6 +60,15 @@ if(TARGET machoman_audio_engine)
     set_tests_properties(audio_engine PROPERTIES TIMEOUT 10)
 endif()
 
+if(TARGET Foundation)
+    add_executable(test_dispatch_host test_dispatch_host.cpp)
+    target_link_libraries(test_dispatch_host PRIVATE Foundation Threads::Threads)
+    target_include_directories(test_dispatch_host PRIVATE "${CMAKE_SOURCE_DIR}/include")
+    set_target_properties(test_dispatch_host PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreFoundation.framework/Versions/A")
+    add_test(NAME dispatch_host_callbacks COMMAND test_dispatch_host)
+    set_tests_properties(dispatch_host_callbacks PROPERTIES TIMEOUT 10)
+endif()
 
 
 add_executable(test_translation_cache test_translation_cache.cpp)
@@ -329,6 +338,21 @@ if(MM_TEST_MACOS_SDK AND TARGET Foundation)
         set_tests_properties(guest_http_cookies_${MM_COOKIE_ARCH} PROPERTIES TIMEOUT 20
             PASS_REGULAR_EXPRESSION "Cocoa HTTP cookie parsing, request headers and storage passed")
     endforeach()
+    find_program(MM_COOKIE_TEST_PYTHON python3 REQUIRED)
+    foreach(MM_COOKIE_PERSIST_ARCH IN ITEMS arm64 x86_64)
+        set(MM_COOKIE_PERSIST_BINARY "${MM_SMOKE_VENV}/bin/cookie-persistence-${MM_COOKIE_PERSIST_ARCH}")
+        add_custom_command(OUTPUT "${MM_COOKIE_PERSIST_BINARY}"
+            COMMAND ${MM_TEST_CLANG} --target=${MM_COOKIE_PERSIST_ARCH}-apple-macos12
+                -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld -O2 -framework Foundation
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest_cookie_persistence.m" -o "${MM_COOKIE_PERSIST_BINARY}"
+            DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_cookie_persistence.m VERBATIM)
+        add_custom_target(guest_cookie_persistence_${MM_COOKIE_PERSIST_ARCH}_binary ALL DEPENDS "${MM_COOKIE_PERSIST_BINARY}")
+        add_test(NAME guest_cookie_persistence_${MM_COOKIE_PERSIST_ARCH}
+            COMMAND ${MM_COOKIE_TEST_PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/run_cookie_persistence.py"
+                $<TARGET_FILE:machoman> "${MM_SMOKE_VENV}" cookie-persistence-${MM_COOKIE_PERSIST_ARCH})
+        set_tests_properties(guest_cookie_persistence_${MM_COOKIE_PERSIST_ARCH} PROPERTIES TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "Persistent cookies, attributes, expiry, deletion and private storage passed")
+    endforeach()
     foreach(MM_URL_ARCH IN ITEMS arm64 x86_64)
         set(MM_URL_BINARY "${MM_SMOKE_VENV}/bin/file-urls-${MM_URL_ARCH}")
         add_custom_command(OUTPUT "${MM_URL_BINARY}"
@@ -341,6 +365,32 @@ if(MM_TEST_MACOS_SDK AND TARGET Foundation)
             COMMAND $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" file-urls-${MM_URL_ARCH})
         set_tests_properties(guest_file_urls_${MM_URL_ARCH} PROPERTIES TIMEOUT 20
             PASS_REGULAR_EXPRESSION "Darwin file URL constructors and base resolution passed")
+    endforeach()
+    foreach(MM_JSON_ARCH IN ITEMS arm64 x86_64)
+        set(MM_JSON_BINARY "${MM_SMOKE_VENV}/bin/json-${MM_JSON_ARCH}")
+        add_custom_command(OUTPUT "${MM_JSON_BINARY}"
+            COMMAND ${MM_TEST_CLANG} --target=${MM_JSON_ARCH}-apple-macos12
+                -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld -O2 -framework Foundation
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest_json.m" -o "${MM_JSON_BINARY}"
+            DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_json.m VERBATIM)
+        add_custom_target(guest_json_${MM_JSON_ARCH}_binary ALL DEPENDS "${MM_JSON_BINARY}")
+        add_test(NAME guest_json_${MM_JSON_ARCH}
+            COMMAND $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" json-${MM_JSON_ARCH})
+        set_tests_properties(guest_json_${MM_JSON_ARCH} PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "Cocoa JSON parsing, writing and errors passed")
+    endforeach()
+    foreach(MM_SOCKET_ARCH IN ITEMS arm64 x86_64)
+        set(MM_SOCKET_BINARY "${MM_SMOKE_VENV}/bin/socket-messages-${MM_SOCKET_ARCH}")
+        add_custom_command(OUTPUT "${MM_SOCKET_BINARY}"
+            COMMAND ${MM_TEST_CLANG} --target=${MM_SOCKET_ARCH}-apple-macos12
+                -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld -O2
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest_socket_messages.c" -o "${MM_SOCKET_BINARY}"
+            DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_socket_messages.c VERBATIM)
+        add_custom_target(guest_socket_messages_${MM_SOCKET_ARCH}_binary ALL DEPENDS "${MM_SOCKET_BINARY}")
+        add_test(NAME guest_socket_messages_${MM_SOCKET_ARCH}
+            COMMAND $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" socket-messages-${MM_SOCKET_ARCH})
+        set_tests_properties(guest_socket_messages_${MM_SOCKET_ARCH} PROPERTIES TIMEOUT 15
+            PASS_REGULAR_EXPRESSION "Darwin socket messages, flags, ancillary data and errors passed")
     endforeach()
     foreach(MM_FORMAT_ARCH IN ITEMS arm64 x86_64)
         set(MM_FORMAT_BINARY "${MM_SMOKE_VENV}/bin/string-format-${MM_FORMAT_ARCH}")
@@ -691,6 +741,55 @@ if(MM_TEST_MACOS_SDK AND TARGET Foundation)
     set_tests_properties(guest_audio_null PROPERTIES
         PASS_REGULAR_EXPRESSION "CoreAudio ARM64 ABI, sine samples.*fault recovery passed"
         TIMEOUT 30)
+
+    foreach(MM_DISPATCH_GROUP_ARCH IN ITEMS arm64 x86_64)
+        set(MM_DISPATCH_GROUP_BINARY "${MM_SMOKE_VENV}/bin/dispatch-groups-${MM_DISPATCH_GROUP_ARCH}")
+        add_custom_command(OUTPUT "${MM_DISPATCH_GROUP_BINARY}"
+            COMMAND ${MM_TEST_CLANG} --target=${MM_DISPATCH_GROUP_ARCH}-apple-macos12
+                -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld -O2 -fblocks -framework Foundation
+                "${CMAKE_CURRENT_SOURCE_DIR}/guest_dispatch_groups.c" -o "${MM_DISPATCH_GROUP_BINARY}"
+            DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_dispatch_groups.c VERBATIM)
+        add_custom_target(guest_dispatch_groups_${MM_DISPATCH_GROUP_ARCH}_binary ALL DEPENDS "${MM_DISPATCH_GROUP_BINARY}")
+        add_test(NAME guest_dispatch_groups_${MM_DISPATCH_GROUP_ARCH}
+            COMMAND $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" dispatch-groups-${MM_DISPATCH_GROUP_ARCH})
+        set_tests_properties(guest_dispatch_groups_${MM_DISPATCH_GROUP_ARCH} PROPERTIES TIMEOUT 15
+            PASS_REGULAR_EXPRESSION "Dispatch groups, deadlines, captured notifications and retention passed")
+    endforeach()
+
+    if(TARGET audio)
+        if(MACHOMAN_PIPEWIRE AND MM_PIPEWIRE_FOUND)
+            find_program(MM_TEST_PIPEWIRE pipewire)
+            find_package(Python3 QUIET COMPONENTS Interpreter)
+            if(MM_TEST_PIPEWIRE AND Python3_Interpreter_FOUND)
+                add_executable(audio_pipewire_sink audio_pipewire_sink.cpp)
+                target_link_libraries(audio_pipewire_sink PRIVATE PkgConfig::MM_PIPEWIRE)
+                target_compile_options(audio_pipewire_sink PRIVATE -Wall -Wextra)
+            endif()
+        endif()
+        foreach(MM_AUDIO_ARCH IN ITEMS arm64 x86_64)
+            set(MM_AUDIO_OUTPUT_BINARY "${MM_SMOKE_VENV}/bin/audio-output-${MM_AUDIO_ARCH}")
+            add_custom_command(OUTPUT "${MM_AUDIO_OUTPUT_BINARY}"
+                COMMAND ${MM_TEST_CLANG} --target=${MM_AUDIO_ARCH}-apple-macos12
+                    -isysroot "${MM_TEST_MACOS_SDK}" -fuse-ld=lld -O2 -fblocks
+                    -framework CoreAudio -framework AudioUnit -framework AudioToolbox -framework CoreFoundation
+                    "${CMAKE_CURRENT_SOURCE_DIR}/guest_audio_output.c" -o "${MM_AUDIO_OUTPUT_BINARY}"
+                DEPENDS "${MM_SMOKE_VENV}/machoman-venv.json" guest_audio_output.c VERBATIM)
+            add_custom_target(guest_audio_output_${MM_AUDIO_ARCH}_binary ALL DEPENDS "${MM_AUDIO_OUTPUT_BINARY}")
+            add_test(NAME guest_audio_no_devices_${MM_AUDIO_ARCH}
+                COMMAND ${CMAKE_COMMAND} -E env MACHOMAN_AUDIO_BACKEND=none
+                    $<TARGET_FILE:machoman> run "${MM_SMOKE_VENV}" audio-output-${MM_AUDIO_ARCH} none)
+            set_tests_properties(guest_audio_no_devices_${MM_AUDIO_ARCH} PROPERTIES TIMEOUT 20
+                PASS_REGULAR_EXPRESSION "CoreAudio no-device and AudioUnit validation passed")
+            if(TARGET audio_pipewire_sink)
+                add_test(NAME guest_audio_pipewire_${MM_AUDIO_ARCH}
+                    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/run_pipewire_test.py"
+                        "${MM_TEST_PIPEWIRE}" $<TARGET_FILE:audio_pipewire_sink>
+                        $<TARGET_FILE:machoman> "${MM_SMOKE_VENV}" audio-output-${MM_AUDIO_ARCH})
+                set_tests_properties(guest_audio_pipewire_${MM_AUDIO_ARCH} PROPERTIES TIMEOUT 50
+                    PASS_REGULAR_EXPRESSION "PipeWire captured both PCM paths, channel layout and default-device routing")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 if(MM_GIO_FOUND)

@@ -6,6 +6,7 @@ namespace {
 struct parser {
     std::string_view input;
     std::size_t at = 0;
+    bool allow_duplicate_keys = false;
     [[noreturn]] void fail(const char *message) const {
         throw std::runtime_error(std::string(message) + " at byte " + std::to_string(at));
     }
@@ -89,7 +90,8 @@ struct parser {
             if (!take('}')) do {
                 space(); if (at == input.size() || input[at]!='"') fail("object key must be a string");
                 auto key=string(); expect(':'); auto val=parse(depth+1);
-                if (!out.emplace(std::move(key), std::move(val)).second) fail("duplicate object key");
+                if (allow_duplicate_keys) out.insert_or_assign(std::move(key), std::move(val));
+                else if (!out.emplace(std::move(key), std::move(val)).second) fail("duplicate object key");
                 if (take('}')) return mm_json(std::move(out));
                 expect(',');
             } while (true);
@@ -158,9 +160,9 @@ std::string serialize(const mm_json &value, unsigned depth) {
     return out+']';
 }
 }
-bool mm_json_parse(std::string_view source, mm_json &out, std::string &error) {
+bool mm_json_parse(std::string_view source, mm_json &out, std::string &error, bool allow_duplicate_keys) {
     try {
-        parser p{source}; auto value=p.parse(); p.space();
+        parser p{source, 0, allow_duplicate_keys}; auto value=p.parse(); p.space();
         if (p.at != source.size()) p.fail("trailing JSON data");
         out=std::move(value); error.clear(); return true;
     } catch (const std::runtime_error &e) { error=e.what(); return false; }

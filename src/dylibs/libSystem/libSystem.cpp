@@ -84,10 +84,29 @@ int to_darwin_errno(int e) {
     case EINPROGRESS:  return 36;
     case EALREADY:     return 37;
     case ENOTSOCK:     return 38;
+    case EDESTADDRREQ: return 39;
+    case EMSGSIZE: return 40;
+    case EPROTOTYPE: return 41;
+    case ENOPROTOOPT: return 42;
+    case EPROTONOSUPPORT: return 43;
+    case ESOCKTNOSUPPORT: return 44;
+    case EPFNOSUPPORT: return 46;
     case EAFNOSUPPORT: return 47;
     case EADDRINUSE:   return 48;
+    case EADDRNOTAVAIL: return 49;
+    case ENETDOWN: return 50;
+    case ENETUNREACH: return 51;
+    case ENETRESET: return 52;
+    case ECONNABORTED: return 53;
     case ECONNRESET:   return 54;
+    case ENOBUFS: return 55;
+    case EISCONN: return 56;
+    case ENOTCONN: return 57;
+    case ESHUTDOWN: return 58;
+    case ETOOMANYREFS: return 59;
     case ECONNREFUSED: return 61;
+    case EHOSTDOWN: return 64;
+    case EHOSTUNREACH: return 65;
     case EILSEQ:       return 92;
     case ECANCELED:    return 89;
     default:           return e <= 34 ? e : 45;
@@ -110,10 +129,30 @@ int from_darwin_errno(int e) {
     case 36: return EINPROGRESS;
     case 37: return EALREADY;
     case 38: return ENOTSOCK;
+    case 39: return EDESTADDRREQ;
+    case 40: return EMSGSIZE;
+    case 41: return EPROTOTYPE;
+    case 42: return ENOPROTOOPT;
+    case 43: return EPROTONOSUPPORT;
+    case 44: return ESOCKTNOSUPPORT;
+    case 46: return EPFNOSUPPORT;
     case 47: return EAFNOSUPPORT;
     case 48: return EADDRINUSE;
+    case 49: return EADDRNOTAVAIL;
+    case 50: return ENETDOWN;
+    case 51: return ENETUNREACH;
+    case 52: return ENETRESET;
+    case 53: return ECONNABORTED;
     case 54: return ECONNRESET;
+    case 55: return ENOBUFS;
+    case 56: return EISCONN;
+    case 57: return ENOTCONN;
+    case 58: return ESHUTDOWN;
+    case 59: return ETOOMANYREFS;
     case 61: return ECONNREFUSED;
+    case 64: return EHOSTDOWN;
+    case 65: return EHOSTUNREACH;
+    case 102: return ENOTSUP;
     case 92: return EILSEQ;
     case 89: return ECANCELED;
     default: return e;
@@ -359,6 +398,8 @@ int *darwin_error() {
 }
 
 int darwin_strerror_r(int errnum, char *buf, std::size_t len) DARWIN(strerror_r);
+char *darwin_strerror(int errnum) DARWIN(strerror);
+char *darwin_strerror(int errnum) { return std::strerror(from_darwin_errno(errnum)); }
 int darwin_strerror_r(int errnum, char *buf, std::size_t len) {
     std::snprintf(buf, len, "%s", std::strerror(from_darwin_errno(errnum)));
     return 0;

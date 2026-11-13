@@ -59,9 +59,9 @@ std::shared_ptr<RenderPipeline> Context::create_render_pipeline(const ShaderFunc
     std::uint32_t format,const BlendState& blend,std::string& error,const VertexInput* vertices,std::uint32_t depth_format) {
     error.clear();
     if(vertex.stage!=ShaderStage::vertex||fragment.stage!=ShaderStage::fragment||vertex.spirv.empty()||fragment.spirv.empty()||
-       mevk::pixel_format(format)==VK_FORMAT_UNDEFINED||format==250||format==252||blend.source_rgb>10||blend.destination_rgb>10||blend.source_alpha>10||
+       mevk::pixel_format(format)==VK_FORMAT_UNDEFINED||format==250||format==252||format==260||blend.source_rgb>10||blend.destination_rgb>10||blend.source_alpha>10||
        blend.destination_alpha>10||blend.rgb_operation>4||blend.alpha_operation>4||blend.write_mask>15||
-       (depth_format&&depth_format!=250&&depth_format!=252)){error="MEVK: unsupported render pipeline shaders, format or blend state";return nullptr;}
+       (depth_format&&depth_format!=250&&depth_format!=252&&depth_format!=260)){error="MEVK: unsupported render pipeline shaders, format or blend state";return nullptr;}
     auto pipeline=std::make_unique<RenderPipeline::Impl>();pipeline->context=impl_;pipeline->pixel_format=format;pipeline->blend=blend;
     pipeline->depth_format=depth_format;
     VkFormatProperties format_properties{};vkGetPhysicalDeviceFormatProperties(impl_->physical_device,mevk::pixel_format(format),&format_properties);
@@ -174,7 +174,7 @@ bool CommandBuffer::begin_render(const std::shared_ptr<Texture>& target,bool cle
     auto depth_texture=depth?depth->texture:nullptr;
     if(depth_texture) {
         const auto& d=*depth_texture->impl_;
-        if(d.context!=impl_->context||d.aspect!=VK_IMAGE_ASPECT_DEPTH_BIT||depth->mip>=d.description.mips||depth->slice>=d.layers||
+        if(d.context!=impl_->context||!(d.aspect&VK_IMAGE_ASPECT_DEPTH_BIT)||depth->mip>=d.description.mips||depth->slice>=d.layers||
            std::max(1u,d.width>>depth->mip)!=width||std::max(1u,d.height>>depth->mip)!=height||
            (d.description.usage&&!(d.description.usage&4u))||!std::isfinite(depth->value)||depth->value<0||depth->value>1)
             return impl_->fail("MEVK: incompatible depth attachment, dimensions or clear value",error);

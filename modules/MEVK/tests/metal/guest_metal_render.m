@@ -266,8 +266,10 @@ int main(int argc, char **argv) {
     id<MTLDepthStencilState> depth_state = [device newDepthStencilStateWithDescriptor:depth_state_descriptor];
     check(depth_state && depth_state_descriptor.depthCompareFunction == MTLCompareFunctionAlways &&
               depth_state_descriptor.depthWriteEnabled, "depth state creation and descriptor properties");
+    const MTLPixelFormat depth_formats[] = {MTLPixelFormatDepth32Float, MTLPixelFormatDepth32Float_Stencil8};
+    for (unsigned depth_index = 0; depth_index < 2; ++depth_index) {
     MTLTextureDescriptor *pass_depth_descriptor = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:64 height:64 mipmapped:NO];
+        texture2DDescriptorWithPixelFormat:depth_formats[depth_index] width:64 height:64 mipmapped:NO];
     pass_depth_descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     pass_depth_descriptor.storageMode = MTLStorageModeManaged;
     id<MTLTexture> pass_depth_texture = [device newTextureWithDescriptor:pass_depth_descriptor];
@@ -275,7 +277,7 @@ int main(int argc, char **argv) {
     MTLRenderPipelineDescriptor *depth_pd = [[MTLRenderPipelineDescriptor alloc] init];
     depth_pd.vertexFunction = vertex; depth_pd.fragmentFunction = fragment;
     depth_pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    depth_pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    depth_pd.depthAttachmentPixelFormat = depth_formats[depth_index];
     depth_pd.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor];
     id<MTLRenderPipelineState> depth_pipeline = [device newRenderPipelineStateWithDescriptor:depth_pd error:&error];
     check(depth_pipeline && !error, "pipeline with vertex descriptor and depth format");
@@ -300,11 +302,19 @@ int main(int argc, char **argv) {
     [depth_encoder setFragmentBytes:color length:sizeof color atIndex:0];
     [depth_encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
     [depth_encoder endEncoding]; finish(depth_command);
+    if (depth_index == 0) {
     float depth_readback[64 * 64];
     [pass_depth_texture getBytes:depth_readback bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
     check(depth_readback[16 * 64 + 16] != 0.5f && depth_readback[0] == 0.5f,
           "guest depth pass clear, compare and writes produce distinct depth values");
+    } else {
+      unsigned char combined_pixels[64 * 64 * 4];
+      pixels(target, combined_pixels);
+      check(combined_pixels[0] == 255 && combined_pixels[(16 * 64 + 16) * 4] != 255,
+            "combined depth/stencil texture supports depth rendering and color output");
+    }
     [depth_pipeline release]; [depth_pd release]; [pass_depth_texture release];
+    }
     [depth_state release]; [depth_state_descriptor release];
     id<MTLCommandBuffer> unretained = [queue commandBufferWithUnretainedReferences];
     check(unretained && !unretained.retainedReferences,

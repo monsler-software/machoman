@@ -21,6 +21,12 @@ struct cycle {
 /* Adapter-owned transport buffers are interleaved float32 for this first
  * increment. Guest layout conversion belongs to the common engine. */
 using output_process = darwin::status (*)(void *, const cycle &, std::span<float>) noexcept;
+struct worker_hooks {
+    /* Called on the processing thread, outside process(), before the first
+     * cycle and after the last one. Prepared guest callbacks are thread-bound. */
+    darwin::status (*prepare)(void *) = nullptr;
+    void (*finish)(void *) = nullptr;
+};
 class output_backend {
 public:
     virtual ~output_backend() = default;

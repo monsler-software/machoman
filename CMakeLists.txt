@@ -127,6 +127,7 @@ if(NOT WIN32)
         src/dylibs/Foundation/key_value.cpp src/dylibs/Foundation/threading.cpp
         src/dylibs/Foundation/geometry.cpp
         src/dylibs/Foundation/formatting.cpp
+        src/dylibs/Foundation/json.cpp
         src/dylibs/symbol-synthesis/synthesise.cpp)
     target_include_directories(Foundation PRIVATE src/dylibs/symbol-synthesis)
     target_link_libraries(Foundation PRIVATE machoman_core libobjc)
@@ -313,16 +314,29 @@ if(NOT WIN32)
             "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL.so")
 
 
-    # Shared PCM engine for the framework facades and platform transports.
-    # The null driver is offline only; physical device enumeration waits for
-    # the PipeWire start/render/stop path.
+    option(MACHOMAN_PIPEWIRE "Enable PipeWire audio output when available" ON)
+    if(MACHOMAN_PIPEWIRE AND PkgConfig_FOUND)
+        pkg_check_modules(MM_PIPEWIRE QUIET IMPORTED_TARGET libpipewire-0.3>=0.3.50)
+    endif()
+    add_library(machoman_audio_pipewire STATIC src/dylibs/audio/backend_pipewire.cpp)
+    target_link_libraries(machoman_audio_pipewire PUBLIC machoman_audio_engine)
+    target_compile_options(machoman_audio_pipewire PRIVATE -Wall -Wextra -Wconversion)
+    set_target_properties(machoman_audio_pipewire PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MACHOMAN_PIPEWIRE AND MM_PIPEWIRE_FOUND)
+        target_link_libraries(machoman_audio_pipewire PRIVATE PkgConfig::MM_PIPEWIRE)
+        target_compile_definitions(machoman_audio_pipewire PRIVATE MM_AUDIO_PIPEWIRE=1)
+    endif()
+
     add_library(audio SHARED src/dylibs/audio/coremidi.cpp src/dylibs/audio/coreaudio_hal.cpp
-        src/dylibs/audio/audiounit.cpp src/dylibs/symbol-synthesis/synthesise.cpp)
-    target_link_libraries(audio PRIVATE machoman_core libobjc)
+        src/dylibs/audio/audiounit.cpp src/dylibs/audio/output_session.cpp
+        src/dylibs/audio/property_listeners.cpp src/dylibs/audio/notification_dispatch.cpp
+        src/dylibs/symbol-synthesis/synthesise.cpp)
+    target_link_libraries(audio PRIVATE machoman_core libobjc Foundation machoman_audio_pipewire)
     target_include_directories(audio PRIVATE src/dylibs/symbol-synthesis)
     target_compile_options(audio PRIVATE -Wall -Wextra -fvisibility=hidden)
     set_target_properties(audio PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR}/dylibs/usr/lib" INSTALL_RPATH "${CMAKE_BINARY_DIR}/dylibs/usr/lib"
+        BUILD_RPATH "${CMAKE_BINARY_DIR}/dylibs/usr/lib;${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreFoundation.framework/Versions/A"
+        INSTALL_RPATH "${CMAKE_BINARY_DIR}/dylibs/usr/lib;${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreFoundation.framework/Versions/A"
         PREFIX "" OUTPUT_NAME "CoreMIDI" SUFFIX ".so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dylibs/System/Library/Frameworks/CoreMIDI.framework/Versions/A")
     foreach(fw CoreAudio AudioToolbox AudioUnit CoreAudioKit)

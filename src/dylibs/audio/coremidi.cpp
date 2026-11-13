@@ -2,6 +2,8 @@
  * CoreAudio HAL and AudioComponent APIs live in separate source files. */
 #include "machoman/objc_framework.h"
 #include "synthesise.h"
+#include "coreaudio_hal.h"
+#include "notification_dispatch.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +42,13 @@ struct MIDIPacketList {
 } // namespace
 
 extern "C" {
+
+__attribute__((visibility("default"))) void machoman_dylib_quiesce() {
+    mm::audio::quiesce_audio_listeners();
+    mm::audio::quiesce_audio_hal();
+    mm::audio::quiesce_audio_units();
+    mm::audio::quiesce_audio_notifications();
+}
 
 /* ---- CoreMIDI ------------------------------------------------------------ */
 
